@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lb-ternary", "crates/lb-convert"]
+members = ["crates/lb-ternary", "crates/lb-convert", "crates/lb-model"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,6 +19,9 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 lb-ternary = { path = "crates/lb-ternary" }
 lb-convert = { path = "crates/lb-convert" }
+lb-model = { path = "crates/lb-model" }
+burn = { version = "=0.22.1", default-features = false, features = ["std", "flex", "extension"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 
 [profile.release]
 opt-level = 3
