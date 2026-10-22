@@ -92,6 +92,8 @@ fn gemm_token_tiles() {
         case(23, 384, m, 1000 + m as u64);
     }
     case(48, 2560, 5, 77);
+    // even block count (no odd tail) with several token tiles and an odd row count
+    case(37, 2560, 13, 78);
 }
 
 #[test]

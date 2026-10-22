@@ -163,8 +163,14 @@ pub fn ternary_gemm_multi(ws: &[TernaryView<'_>], x: &QuantActs, kernel: Kernel,
                 tasks.push((*w, ci * chunk, inv.as_slice(), dst));
             }
         }
+        // AVX-512: register-tiled kernel over 2 rows x 4 tokens on re-laid-out activations
+        let paired = matches!(kernel, Kernel::Avx512 | Kernel::Avx512Vnni).then(|| PairedActs::new(x));
         tasks.into_par_iter().for_each(|(w, r0, inv, dst)| {
             let rows = dst.len() / m;
+            if let Some(p) = &paired {
+                tile_rows(w, r0, rows, x, p, inv, dst);
+                return;
+            }
             let mut acc = vec![0i32; m];
             for r in 0..rows {
                 dot_row(kernel, w.row(r0 + r), x, &mut acc);
@@ -196,6 +202,83 @@ fn check(w: &TernaryView<'_>, x: &QuantActs) {
 fn chunk_rows(n: usize) -> usize {
     let threads = rayon::current_num_threads().max(1);
     (n / (threads * 4)).clamp(8, 256)
+}
+
+/// Activations re-laid out for the AVX-512 tile kernel so that one 64-byte load matches
+/// one `decode512` lane group: for token `t` and block pair `bb` (blocks `2bb`, `2bb+1`),
+/// 64-byte group `k` (0..4) holds `x[t, 2bb*128 + 32k ..][..32]` then
+/// `x[t, (2bb+1)*128 + 32k ..][..32]`. An odd last block stays in `QuantActs::q`.
+struct PairedActs {
+    data: Vec<i8>,
+    /// Bytes per token (`pairs * 256`).
+    stride: usize,
+    pairs: usize,
+}
+
+impl PairedActs {
+    fn new(x: &QuantActs) -> Self {
+        let pairs = x.kp / BLOCK / 2;
+        let stride = pairs * 2 * BLOCK;
+        let mut data = vec![0i8; x.m * stride];
+        for t in 0..x.m {
+            let src = x.row(t);
+            let dst = &mut data[t * stride..(t + 1) * stride];
+            for bb in 0..pairs {
+                for k in 0..4 {
+                    let d = &mut dst[bb * 256 + k * 64..bb * 256 + k * 64 + 64];
+                    let b0 = 2 * bb * BLOCK + k * 32;
+                    d[..32].copy_from_slice(&src[b0..b0 + 32]);
+                    d[32..].copy_from_slice(&src[b0 + BLOCK..b0 + BLOCK + 32]);
+                }
+            }
+        }
+        Self { data, stride, pairs }
+    }
+}
+
+/// Prefill rows `r0 .. r0 + rows` of `w` for all tokens into `dst` (`[row][token]`) with
+/// the 2-row x 4-token AVX-512BW tile. Same integer dot and scaling as `dot_row`.
+fn tile_rows(w: TernaryView<'_>, r0: usize, rows: usize, x: &QuantActs, p: &PairedActs, inv: &[f32], dst: &mut [f32]) {
+    let m = x.m;
+    let mut r = 0;
+    while r < rows {
+        let rr = (rows - r).min(2);
+        let rws = [w.row(r0 + r), w.row(r0 + r + rr - 1)];
+        let mut t = 0;
+        while t < m {
+            let tt = (m - t).min(4);
+            let mut acc = [[0i32; 4]; 2];
+            tile_dispatch(rr, tt, &rws, x, p, t, &mut acc);
+            for i in 0..rr {
+                for j in 0..tt {
+                    let d = acc[i][j] - x.sum[t + j];
+                    dst[(r + i) * m + t + j] = d as f32 * inv[t + j];
+                }
+            }
+            t += tt;
+        }
+        r += rr;
+    }
+}
+
+#[allow(unused_variables)]
+fn tile_dispatch(rr: usize, tt: usize, rws: &[&[u8]; 2], x: &QuantActs, p: &PairedActs, t0: usize, acc: &mut [[i32; 4]; 2]) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use x86::tile_avx512bw as k;
+        match (rr, tt) {
+            (2, 4) => k::<2, 4>(rws, x, p, t0, acc),
+            (2, 3) => k::<2, 3>(rws, x, p, t0, acc),
+            (2, 2) => k::<2, 2>(rws, x, p, t0, acc),
+            (2, 1) => k::<2, 1>(rws, x, p, t0, acc),
+            (1, 4) => k::<1, 4>(rws, x, p, t0, acc),
+            (1, 3) => k::<1, 3>(rws, x, p, t0, acc),
+            (1, 2) => k::<1, 2>(rws, x, p, t0, acc),
+            _ => k::<1, 1>(rws, x, p, t0, acc),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unreachable!("tile kernel is x86-only");
 }
 
 /// Exact `sum_k w[k] * x_q[t,k]` for every token `t` of `x`, for one packed row.
@@ -376,6 +459,78 @@ mod x86 {
         }
         for t in 0..T {
             acc[t] = _mm512_reduce_add_epi32(a[t]) + hsum256(tail[t]);
+        }
+    }
+
+    /// Codes of lane group `S/2` (S = 0, 2, 4, 6) from 64 raw packed bytes.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn codes<const S: u32>(raw: __m512i) -> __m512i {
+        _mm512_and_si512(_mm512_srli_epi16::<S>(raw), _mm512_set1_epi8(3))
+    }
+
+    /// `acc[r][t] = sum_k code[r][k] * x[t0 + t, k]` (code dot, before the `-sum(x)`
+    /// correction) for `R` rows x `T` tokens. Codes are decoded once per row and each
+    /// activation load serves all `R` rows; `maddubs` pair sums are accumulated in i16 over
+    /// the 4 lane groups of a block pair (<= 4 * 508, no saturation) like the other kernels.
+    #[target_feature(enable = "avx512f,avx512bw,avx2")]
+    pub unsafe fn tile_avx512bw<const R: usize, const T: usize>(
+        rws: &[&[u8]; 2],
+        x: &QuantActs,
+        p: &PairedActs,
+        t0: usize,
+        acc: &mut [[i32; 4]; 2],
+    ) {
+        let pairs = p.pairs;
+        let nb = x.kp / BLOCK;
+        for r in 0..R {
+            assert_eq!(rws[r].len(), nb * BLOCK_BYTES);
+        }
+        assert!(t0 + T <= x.m && p.data.len() >= (t0 + T) * p.stride);
+        let ones = _mm512_set1_epi16(1);
+        let xp = p.data.as_ptr().add(t0 * p.stride);
+        let mut a = [[_mm512_setzero_si512(); T]; R];
+        for bb in 0..pairs {
+            let mut raw = [_mm512_setzero_si512(); R];
+            for r in 0..R {
+                raw[r] = _mm512_loadu_si512(rws[r].as_ptr().add(bb * 2 * BLOCK_BYTES) as *const __m512i);
+            }
+            let mut s = [[_mm512_setzero_si512(); T]; R];
+            let xb = xp.add(bb * 256);
+            macro_rules! group {
+                ($k:expr, $shift:expr) => {
+                    let mut c = [_mm512_setzero_si512(); R];
+                    for r in 0..R {
+                        c[r] = codes::<$shift>(raw[r]);
+                    }
+                    for t in 0..T {
+                        let xv = _mm512_loadu_si512(xb.add(t * p.stride + $k * 64) as *const __m512i);
+                        for r in 0..R {
+                            s[r][t] = _mm512_add_epi16(s[r][t], _mm512_maddubs_epi16(c[r], xv));
+                        }
+                    }
+                };
+            }
+            group!(0, 0);
+            group!(1, 2);
+            group!(2, 4);
+            group!(3, 6);
+            for r in 0..R {
+                for t in 0..T {
+                    a[r][t] = _mm512_add_epi32(a[r][t], _mm512_madd_epi16(s[r][t], ones));
+                }
+            }
+        }
+        for r in 0..R {
+            for t in 0..T {
+                let mut v = _mm512_reduce_add_epi32(a[r][t]);
+                if nb % 2 == 1 {
+                    let b = nb - 1;
+                    let c = decode256(rws[r].as_ptr().add(b * BLOCK_BYTES));
+                    v += hsum256(block_avx2(&c, x.q.as_ptr().add((t0 + t) * x.kp + b * BLOCK)));
+                }
+                acc[r][t] = v;
+            }
         }
     }
 

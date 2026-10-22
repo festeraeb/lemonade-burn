@@ -38,7 +38,7 @@ fn main() {
                     .collect();
                 let (t, sc) = ternarize_absmean(&w);
                 let p = PackedTernary::from_ternary(rows, cols, &t, sc);
-                for m in [1usize, 16] {
+                for m in [1usize, 16, 64] {
                     let x: Vec<f32> = (0..m * cols).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
                     let qa = quantize_acts(&x, m, cols);
                     let mut out = vec![0f32; m * rows];
