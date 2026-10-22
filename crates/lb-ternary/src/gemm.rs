@@ -199,9 +199,13 @@ fn check(w: &TernaryView<'_>, x: &QuantActs) {
     assert_eq!(padded_cols(w.cols), x.kp);
 }
 
+/// Rows per parallel task: about `LB_TASKS_PER_THREAD` (default 8) tasks per thread.
+/// Measured on c4 (20 threads): 1 per thread was ~10% slower in decode, 2..16 within noise.
 fn chunk_rows(n: usize) -> usize {
+    static PER: OnceLock<usize> = OnceLock::new();
+    let per = *PER.get_or_init(|| std::env::var("LB_TASKS_PER_THREAD").ok().and_then(|v| v.parse().ok()).unwrap_or(8));
     let threads = rayon::current_num_threads().max(1);
-    (n / (threads * 4)).clamp(8, 256)
+    n.div_ceil(threads * per).clamp(8, 1 << 20)
 }
 
 /// Activations re-laid out for the AVX-512 tile kernel so that one 64-byte load matches
