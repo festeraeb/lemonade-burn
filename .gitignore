@@ -1,0 +1,3 @@
+/target
+*.npy
+__pycache__/
