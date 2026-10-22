@@ -174,3 +174,21 @@ fn multi_matches_separate_bit_for_bit() {
         }
     }
 }
+
+/// Long rows with all-(+1) weights and all-127 activations through the prefill (m > 1)
+/// path: the tile kernel's widened i16 partials must not overflow.
+#[test]
+fn prefill_extreme_long_rows() {
+    let (rows, cols, m) = (3, 6912 * 2, 5);
+    let p = PackedTernary::from_ternary(rows, cols, &vec![1i8; rows * cols], 1.0);
+    for sign in [1.0f32, -1.0] {
+        let x = vec![sign; m * cols];
+        let qa = quantize_acts(&x, m, cols);
+        for kernel in Kernel::available() {
+            let mut out = vec![0f32; m * rows];
+            ternary_gemm(p.view(), &qa, kernel, &mut out);
+            let want = sign * 127.0 * cols as f32 / 127.0;
+            assert!(out.iter().all(|&o| o == want), "{kernel:?} {sign}: {:?} want {want}", &out[..3]);
+        }
+    }
+}

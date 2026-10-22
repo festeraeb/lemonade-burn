@@ -244,13 +244,15 @@ impl PairedActs {
 /// the 2-row x 4-token AVX-512BW tile. Same integer dot and scaling as `dot_row`.
 fn tile_rows(w: TernaryView<'_>, r0: usize, rows: usize, x: &QuantActs, p: &PairedActs, inv: &[f32], dst: &mut [f32]) {
     let m = x.m;
-    let mut r = 0;
-    while r < rows {
-        let rr = (rows - r).min(2);
-        let rws = [w.row(r0 + r), w.row(r0 + r + rr - 1)];
-        let mut t = 0;
-        while t < m {
-            let tt = (m - t).min(4);
+    // token tile outer: its activations (4 x row width) stay in L1 while the task's
+    // weight rows stream from L2, instead of re-streaming all tokens per row pair
+    let mut t = 0;
+    while t < m {
+        let tt = (m - t).min(4);
+        let mut r = 0;
+        while r < rows {
+            let rr = (rows - r).min(2);
+            let rws = [w.row(r0 + r), w.row(r0 + r + rr - 1)];
             let mut acc = [[0i32; 4]; 2];
             tile_dispatch(rr, tt, &rws, x, p, t, &mut acc);
             for i in 0..rr {
@@ -259,9 +261,9 @@ fn tile_rows(w: TernaryView<'_>, r0: usize, rows: usize, x: &QuantActs, p: &Pair
                     dst[(r + i) * m + t + j] = d as f32 * inv[t + j];
                 }
             }
-            t += tt;
+            r += rr;
         }
-        r += rr;
+        t += tt;
     }
 }
 
@@ -476,7 +478,7 @@ mod x86 {
     /// `acc[r][t] = sum_k code[r][k] * x[t0 + t, k]` (code dot, before the `-sum(x)`
     /// correction) for `R` rows x `T` tokens. Codes are decoded once per row and each
     /// activation load serves all `R` rows; `maddubs` pair sums are accumulated in i16 over
-    /// the 4 lane groups of a block pair (<= 4 * 508, no saturation) like the other kernels.
+    /// up to 8 block pairs (bound below) before widening to i32.
     #[target_feature(enable = "avx512f,avx512bw,avx2")]
     pub unsafe fn tile_avx512bw<const R: usize, const T: usize>(
         rws: &[&[u8]; 2],
@@ -494,36 +496,45 @@ mod x86 {
         let ones = _mm512_set1_epi16(1);
         let xp = p.data.as_ptr().add(t0 * p.stride);
         let mut a = [[_mm512_setzero_si512(); T]; R];
-        for bb in 0..pairs {
-            let mut raw = [_mm512_setzero_si512(); R];
-            for r in 0..R {
-                raw[r] = _mm512_loadu_si512(rws[r].as_ptr().add(bb * 2 * BLOCK_BYTES) as *const __m512i);
-            }
+        // i16 partial sums are widened to i32 every PAIRS_PER_WIDEN block pairs: a pair
+        // adds at most 4 * 2 * 3 * 127 = 3048 per lane (even for the never-emitted code
+        // 3), so 8 pairs stay below 32767 and one `madd` serves 8 pairs instead of one.
+        const PAIRS_PER_WIDEN: usize = 8;
+        let mut bb0 = 0;
+        while bb0 < pairs {
+            let bb1 = (bb0 + PAIRS_PER_WIDEN).min(pairs);
             let mut s = [[_mm512_setzero_si512(); T]; R];
-            let xb = xp.add(bb * 256);
-            macro_rules! group {
-                ($k:expr, $shift:expr) => {
-                    let mut c = [_mm512_setzero_si512(); R];
-                    for r in 0..R {
-                        c[r] = codes::<$shift>(raw[r]);
-                    }
-                    for t in 0..T {
-                        let xv = _mm512_loadu_si512(xb.add(t * p.stride + $k * 64) as *const __m512i);
+            for bb in bb0..bb1 {
+                let mut raw = [_mm512_setzero_si512(); R];
+                for r in 0..R {
+                    raw[r] = _mm512_loadu_si512(rws[r].as_ptr().add(bb * 2 * BLOCK_BYTES) as *const __m512i);
+                }
+                let xb = xp.add(bb * 256);
+                macro_rules! group {
+                    ($k:expr, $shift:expr) => {
+                        let mut c = [_mm512_setzero_si512(); R];
                         for r in 0..R {
-                            s[r][t] = _mm512_add_epi16(s[r][t], _mm512_maddubs_epi16(c[r], xv));
+                            c[r] = codes::<$shift>(raw[r]);
                         }
-                    }
-                };
+                        for t in 0..T {
+                            let xv = _mm512_loadu_si512(xb.add(t * p.stride + $k * 64) as *const __m512i);
+                            for r in 0..R {
+                                s[r][t] = _mm512_add_epi16(s[r][t], _mm512_maddubs_epi16(c[r], xv));
+                            }
+                        }
+                    };
+                }
+                group!(0, 0);
+                group!(1, 2);
+                group!(2, 4);
+                group!(3, 6);
             }
-            group!(0, 0);
-            group!(1, 2);
-            group!(2, 4);
-            group!(3, 6);
             for r in 0..R {
                 for t in 0..T {
                     a[r][t] = _mm512_add_epi32(a[r][t], _mm512_madd_epi16(s[r][t], ones));
                 }
             }
+            bb0 = bb1;
         }
         for r in 0..R {
             for t in 0..T {
