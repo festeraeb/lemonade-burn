@@ -174,3 +174,41 @@ fn multi_matches_separate_bit_for_bit() {
         }
     }
 }
+
+/// Decode on the spinning pool: bit-identical to `ternary_gemm_multi` (rayon) for several
+/// matrices, pool sizes and kernels.
+#[test]
+fn pool_gemv_matches_rayon_bit_for_bit() {
+    use lb_ternary::{ternary_gemm_multi, ternary_gemv_pool, SharedBytes, SharedTernary, SpinPool};
+    use std::sync::Arc;
+    let cols = 384 + 128;
+    let mut rng = Rng(777);
+    let mats: Vec<SharedTernary> = [(300usize, 0.9f32), (64, 1.7), (129, 0.4)]
+        .iter()
+        .map(|&(rows, sc)| {
+            let t: Vec<i8> = (0..rows * cols).map(|_| (rng.next() % 3) as i8 - 1).collect();
+            let p = PackedTernary::from_ternary(rows, cols, &t, sc);
+            let data: SharedBytes = Arc::new(p.data);
+            SharedTernary { data, rows, cols, scale: sc }
+        })
+        .collect();
+    let x: Vec<f32> = (0..cols).map(|i| if i % 41 == 0 { rng.f() * 25.0 } else { rng.f() }).collect();
+    let qa = Arc::new(quantize_acts(&x, 1, cols));
+    for kernel in Kernel::available() {
+        let views: Vec<_> = mats.iter().map(|m| m.view()).collect();
+        let mut bufs: Vec<Vec<f32>> = mats.iter().map(|m| vec![0f32; m.rows]).collect();
+        {
+            let mut outs: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+            ternary_gemm_multi(&views, &qa, kernel, &mut outs);
+        }
+        for threads in [1usize, 2, 7] {
+            let pool = SpinPool::new(threads, std::time::Duration::from_micros(100));
+            for _ in 0..3 {
+                let got = ternary_gemv_pool(&pool, &mats, qa.clone(), kernel);
+                for (g, e) in got.iter().zip(&bufs) {
+                    assert!(g.iter().zip(e).all(|(a, b)| a.to_bits() == b.to_bits()), "{kernel:?} threads {threads}");
+                }
+            }
+        }
+    }
+}

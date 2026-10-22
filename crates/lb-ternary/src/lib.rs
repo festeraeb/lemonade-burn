@@ -5,13 +5,16 @@
 //! * [`quant`]: per-token absmax int8 activation quantization (`ActQuant`).
 //! * [`gemm`]: int8 x ternary GEMV/GEMM with scalar, AVX2 and AVX-512 (BW / VNNI) paths,
 //!   selected at runtime.
+//! * [`pool`]: persistent spinning worker pool for the many small decode regions.
 //! * [`bf16`]: f32 x bf16 GEMV used for the (unquantized, tied) LM head.
 
 pub mod bf16;
 pub mod gemm;
 pub mod pack;
+pub mod pool;
 pub mod quant;
 
-pub use gemm::{ternary_gemm, ternary_gemm_i32, ternary_gemm_multi, Kernel};
+pub use gemm::{ternary_gemm, ternary_gemm_i32, ternary_gemm_multi, ternary_gemv_pool, Kernel, SharedBytes, SharedTernary};
+pub use pool::SpinPool;
 pub use pack::{PackedTernary, TernaryView, BLOCK, BLOCK_BYTES};
 pub use quant::{quantize_acts, QuantActs};

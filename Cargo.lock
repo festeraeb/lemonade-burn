@@ -3853,6 +3853,7 @@ dependencies = [
  "anyhow",
  "burn",
  "burn-flex",
+ "burn-std",
  "clap",
  "lb-convert",
  "lb-ternary",

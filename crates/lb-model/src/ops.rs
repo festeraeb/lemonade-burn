@@ -11,9 +11,11 @@ use burn::backend::tensor::{FloatTensor, IntTensor};
 use burn::backend::{backend_extension, Backend, Dispatch, Flex};
 use burn::tensor::{DType, Int, Shape, Tensor, TensorData};
 use burn_flex::FlexTensor;
-use lb_ternary::{quant::quantize_acts_into, QuantActs, TernaryView};
+use burn_std::Bytes;
+use lb_ternary::{quant::quantize_acts_into, QuantActs, SharedBytes, SharedTernary, SpinPool, TernaryView};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 #[backend_extension(Flex)]
@@ -111,17 +113,51 @@ impl TernaryBackend for Flex {
         let (n, k2) = dims2(w.layout().shape());
         assert_eq!(k, k2);
         let xs: &[f32] = x.as_slice::<f32>().expect("contiguous f32");
-        let wb = w.bytes();
-        // bf16 storage is 2-byte aligned plain little-endian u16 bit patterns
-        let ws: &[u16] = unsafe { std::slice::from_raw_parts(wb.as_ptr() as *const u16, wb.len() / 2) };
-        let mut out = vec![0f32; m * n];
         let kernel = lb_ternary::Kernel::detect();
+        if m == 1 && use_spin_pool() {
+            let w16: Arc<dyn AsRef<[u16]> + Send + Sync> = Arc::new(Bf16Storage(w.data_arc()));
+            let out = lb_ternary::bf16::bf16_gemv_pool(SpinPool::global(), w16, n, k, Arc::new(xs.to_vec()), kernel);
+            let r = FlexTensor::from_data(TensorData::new(out, [m, n]));
+            PROF_BF16_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            return r;
+        }
+        let ws: &[u16] = bf16_bits(w.bytes());
+        let mut out = vec![0f32; m * n];
         for i in 0..m {
             lb_ternary::bf16::bf16_gemv(ws, n, k, &xs[i * k..(i + 1) * k], &mut out[i * n..(i + 1) * n], kernel);
         }
         let r = FlexTensor::from_data(TensorData::new(out, [m, n]));
         PROF_BF16_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         r
+    }
+}
+
+/// Single-token ops run on the spinning [`SpinPool`] unless `LB_POOL=rayon`.
+fn use_spin_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LB_POOL").map(|v| v != "rayon").unwrap_or(true))
+}
+
+/// bf16 storage viewed as its u16 bit patterns.
+fn bf16_bits(b: &[u8]) -> &[u16] {
+    // bf16 storage is 2-byte aligned plain little-endian u16 bit patterns
+    unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len() / 2) }
+}
+
+/// A Burn tensor's shared storage, as owned bytes for pool tasks (whole buffer; the
+/// tensors passed here are contiguous at offset 0, checked by the callers).
+struct TensorStorage(Arc<Bytes>);
+impl AsRef<[u8]> for TensorStorage {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// bf16 tensor storage as u16 bit patterns for pool tasks.
+struct Bf16Storage(Arc<Bytes>);
+impl AsRef<[u16]> for Bf16Storage {
+    fn as_ref(&self) -> &[u16] {
+        bf16_bits(&self.0)
     }
 }
 
@@ -145,17 +181,28 @@ fn flex_ternary_multi(x: FlexTensor, packed: Vec<FlexTensor>, scales: &[f32], co
             TernaryView::new(rows, cols, p.as_slice::<u8>().expect("contiguous u8"), scale)
         })
         .collect();
-    let mut bufs: Vec<Vec<f32>> = views.iter().map(|v| vec![0f32; m * v.rows]).collect();
-    QBUF.with(|q| {
-        let mut q = q.borrow_mut();
+    let kernel = lb_ternary::Kernel::detect();
+    let bufs: Vec<Vec<f32>> = if m == 1 && use_spin_pool() {
         let tq = Instant::now();
+        let mut q = QuantActs::default();
         quantize_acts_into(xs, m, k, &mut q);
         let tg = Instant::now();
-        let mut outs: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
-        lb_ternary::ternary_gemm_multi(&views, &q, lb_ternary::Kernel::detect(), &mut outs);
+        let mats: Vec<SharedTernary> = packed
+            .iter()
+            .zip(&views)
+            .map(|(p, v)| {
+                let data: SharedBytes = Arc::new(TensorStorage(p.data_arc()));
+                assert_eq!(data.as_ref().as_ref().len(), v.data.len(), "packed tensor must own its whole buffer");
+                SharedTernary { data, rows: v.rows, cols, scale: v.scale }
+            })
+            .collect();
+        let out = lb_ternary::ternary_gemv_pool(SpinPool::global(), &mats, Arc::new(q), kernel);
         PROF_QUANT_NS.fetch_add((tg - tq).as_nanos() as u64, Ordering::Relaxed);
         PROF_GEMM_NS.fetch_add(tg.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    });
+        out
+    } else {
+        flex_gemm_rayon(xs, m, k, &views, kernel)
+    };
     let r: Vec<FlexTensor> = bufs
         .into_iter()
         .zip(&views)
@@ -168,6 +215,23 @@ fn flex_ternary_multi(x: FlexTensor, packed: Vec<FlexTensor>, scales: &[f32], co
     }
     PROF_TERNARY_CALLS.fetch_add(1, Ordering::Relaxed);
     r
+}
+
+/// Rayon path (prefill, or `LB_POOL=rayon`): quantize into the thread-local buffer, then
+/// one fused GEMM.
+fn flex_gemm_rayon(xs: &[f32], m: usize, k: usize, views: &[TernaryView<'_>], kernel: lb_ternary::Kernel) -> Vec<Vec<f32>> {
+    let mut bufs: Vec<Vec<f32>> = views.iter().map(|v| vec![0f32; m * v.rows]).collect();
+    QBUF.with(|q| {
+        let mut q = q.borrow_mut();
+        let tq = Instant::now();
+        quantize_acts_into(xs, m, k, &mut q);
+        let tg = Instant::now();
+        let mut outs: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+        lb_ternary::ternary_gemm_multi(views, &q, kernel, &mut outs);
+        PROF_QUANT_NS.fetch_add((tg - tq).as_nanos() as u64, Ordering::Relaxed);
+        PROF_GEMM_NS.fetch_add(tg.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    });
+    bufs
 }
 
 /// High-level wrapper: `x[m, cols] -> [m, rows]`.
