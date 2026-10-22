@@ -18,6 +18,10 @@ fn main() {
         quant_probe();
         return;
     }
+    if std::env::var("KB_MODEL").is_ok() {
+        model_decode(&threads);
+        return;
+    }
     if std::env::var("KB_STREAM").is_ok() {
         stream(&threads);
         return;
@@ -138,5 +142,54 @@ fn quant_probe() {
             s = s.wrapping_add(f(std::hint::black_box(&x), &mut q).1);
         }
         println!("quantize_row {name:<10} k={k}: {:.2} us/row ({s})", t0.elapsed().as_secs_f64() / n as f64 * 1e6);
+    }
+}
+
+/// `KB_MODEL=1`: decode-like sequence over 30 layers of BitNet 2B4T-shaped matrices
+/// (distinct, cold weights, 520 MB), grouped like the model (q/k/v fused, o, gate/up
+/// fused, down = 120 parallel regions per token), with the activation quantization in
+/// between. Reports ms per token-equivalent and effective weight bandwidth.
+fn model_decode(threads: &[usize]) {
+    use lb_ternary::ternary_gemm_multi;
+    let shapes: [&[(usize, usize)]; 4] = [&[(2560, 2560), (640, 2560), (640, 2560)], &[(2560, 2560)], &[(6912, 2560), (6912, 2560)], &[(2560, 6912)]];
+    let mut layers: Vec<Vec<Vec<PackedTernary>>> = Vec::new();
+    let mut bytes = 0usize;
+    for l in 0..30 {
+        let mut groups = Vec::new();
+        for g in shapes.iter() {
+            let mats: Vec<PackedTernary> = g
+                .iter()
+                .map(|&(rows, cols)| {
+                    let t: Vec<i8> = (0..rows * cols).map(|i| (((i + l * 7) * 2654435761usize) >> 13) as i8 % 2).collect();
+                    let p = PackedTernary::from_ternary(rows, cols, &t, 1.0);
+                    bytes += p.data.len();
+                    p
+                })
+                .collect();
+            groups.push(mats);
+        }
+        layers.push(groups);
+    }
+    let x6912: Vec<f32> = (0..6912).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+    let k = Kernel::detect();
+    for &nt in threads {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(nt).build().unwrap();
+        pool.install(|| {
+            for rep in 0..5 {
+                let t0 = Instant::now();
+                for l in &layers {
+                    for g in l {
+                        let cols = g[0].cols;
+                        let qa = quantize_acts(&x6912[..cols], 1, cols);
+                        let views: Vec<_> = g.iter().map(|p| p.view()).collect();
+                        let mut bufs: Vec<Vec<f32>> = g.iter().map(|p| vec![0f32; p.rows]).collect();
+                        let mut outs: Vec<&mut [f32]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+                        ternary_gemm_multi(&views, &qa, k, &mut outs);
+                    }
+                }
+                let dt = t0.elapsed().as_secs_f64();
+                println!("threads {nt:>2} rep {rep} | model-like decode, 120 regions | {:>6.2} ms/token | {:>6.2} GB/s", dt * 1e3, bytes as f64 / dt / 1e9);
+            }
+        });
     }
 }

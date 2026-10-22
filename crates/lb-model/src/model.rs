@@ -9,7 +9,8 @@
 //! `TernaryBackend` extension; everything else is ordinary Burn tensor ops on the Flex
 //! backend. Note: the MLP is gated ReLU^2, not SwiGLU.
 
-use crate::ops::{bf16_linear, ternary_linear, ternary_linear2, ternary_linear3};
+use crate::ops::{bf16_linear, bf16_linear_numa, ternary_linear, ternary_linear2, ternary_linear3, ternary_linear_numa_n};
+use lb_ternary::numa::NodePools;
 use anyhow::{bail, Context, Result};
 use burn::tensor::activation::{relu, softmax};
 use burn::tensor::{Bool, DType, Device, Int, Tensor, TensorCreationOptions, TensorData};
@@ -41,7 +42,10 @@ impl Config {
 }
 
 pub struct TernaryLinear {
+    /// Packed rows; with a two-socket split, only the first rows (placed on node 0).
     pub packed: Tensor<2, Int>,
+    /// Two-socket split: the remaining rows, placed on node 1 (see `lb_ternary::numa`).
+    pub packed_node1: Option<Tensor<2, Int>>,
     pub scale: f32,
     pub rows: usize,
     pub cols: usize,
@@ -49,7 +53,13 @@ pub struct TernaryLinear {
 
 impl TernaryLinear {
     pub fn forward(&self, x: Tensor<2>) -> Tensor<2> {
-        ternary_linear(x, &self.packed, self.scale, self.cols)
+        match &self.packed_node1 {
+            Some(p1) => {
+                let [y] = ternary_linear_numa_n(x, [(&self.packed, p1)], [self.scale], self.cols);
+                y
+            }
+            None => ternary_linear(x, &self.packed, self.scale, self.cols),
+        }
     }
 }
 
@@ -57,13 +67,44 @@ impl TernaryLinear {
 /// and one parallel region. Bit-identical to calling `forward` on each.
 fn forward3(x: Tensor<2>, a: &TernaryLinear, b: &TernaryLinear, c: &TernaryLinear) -> [Tensor<2>; 3] {
     assert!(a.cols == b.cols && b.cols == c.cols);
+    if let (Some(a1), Some(b1), Some(c1)) = (&a.packed_node1, &b.packed_node1, &c.packed_node1) {
+        return ternary_linear_numa_n(x, [(&a.packed, a1), (&b.packed, b1), (&c.packed, c1)], [a.scale, b.scale, c.scale], a.cols);
+    }
     ternary_linear3(x, [&a.packed, &b.packed, &c.packed], [a.scale, b.scale, c.scale], a.cols)
 }
 
 /// gate/up as one fused op, like [`forward3`].
 fn forward2(x: Tensor<2>, a: &TernaryLinear, b: &TernaryLinear) -> [Tensor<2>; 2] {
     assert_eq!(a.cols, b.cols);
+    if let (Some(a1), Some(b1)) = (&a.packed_node1, &b.packed_node1) {
+        return ternary_linear_numa_n(x, [(&a.packed, a1), (&b.packed, b1)], [a.scale, b.scale], a.cols);
+    }
     ternary_linear2(x, [&a.packed, &b.packed], [a.scale, b.scale], a.cols)
+}
+
+/// Copy `bytes` (a `[rows, row_bytes]` matrix) into Burn tensor(s). With `LB_NUMA` set the
+/// rows are split and each part is copied by a thread of its node, so its pages live
+/// there (first touch); returns `(node-0 or whole, node-1 part)`.
+fn place_rows(bytes: &[u8], rows: usize, row_bytes: usize, elem: usize, dtype: DType) -> (TensorData, Option<TensorData>) {
+    let make = |b: Vec<u8>, r: usize| TensorData::from_bytes_vec(b, [r, row_bytes / elem], dtype);
+    match NodePools::global() {
+        Some(np) => {
+            let s = np.split_rows(rows).clamp(1, rows - 1);
+            let d0 = np.place(0, &bytes[..s * row_bytes]);
+            let d1 = np.place(1, &bytes[s * row_bytes..]);
+            (make(d0, s), Some(make(d1, rows - s)))
+        }
+        None => (make(bytes.to_vec(), rows), None),
+    }
+}
+
+/// Run `f` (a tensor construction) on the thread pool of `node` when `LB_NUMA` is set, so
+/// that if Burn copies the buffer the copy is also first-touched on that node.
+fn on_node<R: Send>(node: usize, f: impl FnOnce() -> R + Send) -> R {
+    match NodePools::global() {
+        Some(np) => np.install(node, f),
+        None => f(),
+    }
 }
 
 pub struct Layer {
@@ -87,6 +128,8 @@ pub struct BitNet {
     pub final_norm: Tensor<1>,
     /// Tied embedding / LM head, bf16 `[vocab, hidden]`.
     pub lm_head: Tensor<2>,
+    /// Two-socket split of the LM head: rows placed on node 1 (`lm_head` holds the rest).
+    pub lm_head_node1: Option<Tensor<2>>,
     /// Host copy of the embedding table (bf16 bits) for token lookup.
     embed: Vec<u16>,
     cos: Vec<f32>,
@@ -132,9 +175,11 @@ impl BitNet {
             let scale = f32::from_le_bytes(s.data()[..4].try_into()?);
             let (rows, rb) = (q.shape()[0], q.shape()[1]);
             let cols = rb * 4; // all BitNet 2B4T dims are multiples of 128 (no padding)
-            let data = TensorData::from_bytes_vec(q.data().to_vec(), [rows, rb], DType::U8);
-            let packed = Tensor::<2, Int>::from_data(data, TensorCreationOptions::new(device.clone()).with_dtype(DType::U8));
-            Ok(TernaryLinear { packed, scale, rows, cols })
+            let opts = || TensorCreationOptions::new(device.clone()).with_dtype(DType::U8);
+            let (d0, d1) = place_rows(q.data(), rows, rb, 1, DType::U8);
+            let packed = on_node(0, || Tensor::<2, Int>::from_data(d0, opts()));
+            let packed_node1 = d1.map(|d| on_node(1, || Tensor::<2, Int>::from_data(d, opts())));
+            Ok(TernaryLinear { packed, packed_node1, scale, rows, cols })
         };
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -160,10 +205,10 @@ impl BitNet {
             bail!("embed_tokens: unexpected dtype/shape");
         }
         let embed: Vec<u16> = emb.data().chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        let lm_head = Tensor::<2>::from_data(
-            TensorData::from_bytes_vec(emb.data().to_vec(), [cfg.vocab_size, cfg.hidden_size], DType::BF16),
-            TensorCreationOptions::new(device.clone()).with_dtype(DType::BF16),
-        );
+        let head_opts = || TensorCreationOptions::new(device.clone()).with_dtype(DType::BF16);
+        let (h0, h1) = place_rows(emb.data(), cfg.vocab_size, cfg.hidden_size * 2, 2, DType::BF16);
+        let lm_head = on_node(0, || Tensor::<2>::from_data(h0, head_opts()));
+        let lm_head_node1 = h1.map(|d| on_node(1, || Tensor::<2>::from_data(d, head_opts())));
 
         // RoPE tables as transformers computes them: inv_freq in f32, freqs = pos * inv_freq (f32)
         let hd = cfg.head_dim();
@@ -183,7 +228,7 @@ impl BitNet {
                 }
             }
         }
-        Ok(Self { cfg, device: device.clone(), layers, final_norm, lm_head, embed, cos, sin, rope_len })
+        Ok(Self { cfg, device: device.clone(), layers, final_norm, lm_head, lm_head_node1, embed, cos, sin, rope_len })
     }
 
     pub fn new_cache(&self) -> KvCache {
@@ -322,7 +367,10 @@ impl BitNet {
         cache.len = total;
         let x = if all_logits { x } else { x.slice([m - 1..m, 0..self.cfg.hidden_size]) };
         let x = self.rms_norm(x, &self.final_norm);
-        bf16_linear(x, &self.lm_head)
+        match &self.lm_head_node1 {
+            Some(h1) => bf16_linear_numa(x, &self.lm_head, h1),
+            None => bf16_linear(x, &self.lm_head),
+        }
     }
 }
 

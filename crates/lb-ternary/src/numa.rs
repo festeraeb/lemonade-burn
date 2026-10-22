@@ -11,7 +11,10 @@ use rayon::ThreadPool;
 use std::sync::OnceLock;
 
 pub struct NodePools {
-    pools: Vec<ThreadPool>,
+    /// Node 0's pool; `None` means node 0 runs on rayon's global pool (pinned to node 0),
+    /// which avoids one cross-pool hop per operation.
+    pool0: Option<ThreadPool>,
+    pool1: ThreadPool,
     /// Fraction of rows placed on node 0 (the rest on node 1).
     pub share: f64,
 }
@@ -47,26 +50,50 @@ fn pin_current_thread(cpus: &[usize]) {
 }
 
 impl NodePools {
-    /// One pool per CPU set, one thread per CPU, each thread restricted to its set.
-    pub fn new(sets: &[Vec<usize>], share: f64) -> Self {
-        assert!(sets.len() == 2, "NodePools supports exactly two nodes");
-        let pools = sets
-            .iter()
-            .enumerate()
-            .map(|(n, cpus)| {
-                let c = cpus.clone();
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(cpus.len())
-                    .thread_name(move |i| format!("lb-node{n}-{i}"))
-                    .start_handler(move |_| pin_current_thread(&c))
-                    .build()
-                    .expect("build node pool")
-            })
-            .collect();
-        Self { pools, share: share.clamp(0.0, 1.0) }
+    fn builder(n: usize, cpus: &[usize]) -> rayon::ThreadPoolBuilder {
+        let c = cpus.to_vec();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cpus.len())
+            .thread_name(move |i| format!("lb-node{n}-{i}"))
+            .start_handler(move |_| pin_current_thread(&c))
     }
 
-    /// The process-wide pools from `LB_NUMA` / `LB_NUMA_SHARE`, if set.
+    /// Two private pools, one thread per CPU, each thread restricted to its set.
+    pub fn new(sets: &[Vec<usize>], share: f64) -> Self {
+        assert!(sets.len() == 2, "NodePools supports exactly two nodes");
+        let pool0 = Some(Self::builder(0, &sets[0]).build().expect("build node pool"));
+        let pool1 = Self::builder(1, &sets[1]).build().expect("build node pool");
+        Self { pool0, pool1, share: share.clamp(0.0, 1.0) }
+    }
+
+    /// Like [`Self::new`] but node 0 becomes rayon's global pool (falls back to a private
+    /// pool if the global pool already exists).
+    fn new_with_global(sets: &[Vec<usize>], share: f64) -> Self {
+        let pool1 = Self::builder(1, &sets[1]).build().expect("build node pool");
+        let pool0 = match Self::builder(0, &sets[0]).build_global() {
+            Ok(()) => None,
+            Err(e) => {
+                eprintln!("lb-ternary numa: global rayon pool already built ({e}); using a private node-0 pool");
+                Some(Self::builder(0, &sets[0]).build().expect("build node pool"))
+            }
+        };
+        Self { pool0, pool1, share: share.clamp(0.0, 1.0) }
+    }
+
+    /// Run `f` on node `node`'s pool.
+    pub fn install<R: Send>(&self, node: usize, f: impl FnOnce() -> R + Send) -> R {
+        match (node, &self.pool0) {
+            (0, Some(p)) => p.install(f),
+            // global pool: run here (the caller is the node-0 pinned main thread); its
+            // parallel loops use the global = node-0 pool
+            (0, None) => f(),
+            _ => self.pool1.install(f),
+        }
+    }
+
+    /// The process-wide pools from `LB_NUMA` / `LB_NUMA_SHARE`, if set. The thread that
+    /// first calls this (the model loader / main thread, which runs the non-GEMM ops) is
+    /// restricted to node 0's CPUs.
     pub fn global() -> Option<&'static NodePools> {
         static P: OnceLock<Option<NodePools>> = OnceLock::new();
         P.get_or_init(|| {
@@ -80,13 +107,10 @@ impl NodePools {
                 }
             };
             let share = std::env::var("LB_NUMA_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
-            Some(NodePools::new(&sets, share))
+            pin_current_thread(&sets[0]);
+            Some(NodePools::new_with_global(&sets, share))
         })
         .as_ref()
-    }
-
-    pub fn pool(&self, node: usize) -> &ThreadPool {
-        &self.pools[node]
     }
 
     /// Rows of an `n`-row matrix that go to node 0.
@@ -96,10 +120,12 @@ impl NodePools {
 
     /// Copy `src` into a new buffer whose pages are first touched (allocated) on `node`.
     pub fn place<T: Clone + Send + Sync>(&self, node: usize, src: &[T]) -> Vec<T> {
-        self.pools[node].install(|| src.to_vec())
+        self.install(node, || src.to_vec())
     }
 
-    /// Run `a` on node 0's pool and `b` on node 1's pool concurrently.
+    /// Run `a` on node 0 and `b` on node 1's pool concurrently. `b` is injected into node
+    /// 1's pool straight from the calling thread; `a` runs on the calling thread (its
+    /// parallel loops go to node 0's pool), then the call waits for `b`.
     pub fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
     where
         A: FnOnce() -> RA + Send,
@@ -107,7 +133,12 @@ impl NodePools {
         RA: Send,
         RB: Send,
     {
-        self.pools[0].install(|| rayon::join(a, || self.pools[1].install(b)))
+        let mut rb = None;
+        let ra = self.pool1.in_place_scope(|s| {
+            s.spawn(|_| rb = Some(b()));
+            self.install(0, a)
+        });
+        (ra, rb.expect("node 1 task finished"))
     }
 }
 
