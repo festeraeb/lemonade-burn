@@ -6,10 +6,12 @@
 //! * [`gemm`]: int8 x ternary GEMV/GEMM with scalar, AVX2 and AVX-512 (BW / VNNI) paths,
 //!   selected at runtime.
 //! * [`bf16`]: f32 x bf16 GEMV used for the (unquantized, tied) LM head.
+//! * [`q8head`]: opt-in int8 LM head (per-row scale); not bit-exact with the bf16 head.
 
 pub mod bf16;
 pub mod gemm;
 pub mod pack;
+pub mod q8head;
 pub mod quant;
 
 pub use gemm::{ternary_gemm, ternary_gemm_i32, Kernel};
