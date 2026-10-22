@@ -18,10 +18,8 @@
 
 use crate::pack::{padded_cols, TernaryView, BLOCK, BLOCK_BYTES};
 use crate::quant::QuantActs;
-use crate::pool::SpinPool;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kernel {
@@ -204,78 +202,10 @@ fn check(w: &TernaryView<'_>, x: &QuantActs) {
 /// Rows per parallel task: about `LB_TASKS_PER_THREAD` (default 8) tasks per thread.
 /// Measured on c4 (20 threads): 1 per thread was ~10% slower in decode, 2..16 within noise.
 fn chunk_rows(n: usize) -> usize {
-    chunk_rows_for(n, rayon::current_num_threads())
-}
-
-fn chunk_rows_for(n: usize, threads: usize) -> usize {
     static PER: OnceLock<usize> = OnceLock::new();
     let per = *PER.get_or_init(|| std::env::var("LB_TASKS_PER_THREAD").ok().and_then(|v| v.parse().ok()).unwrap_or(8));
-    n.div_ceil(threads.max(1) * per).clamp(8, 1 << 20)
-}
-
-/// A shared, owned byte buffer (e.g. a Burn tensor's storage) that pool tasks can hold.
-pub type SharedBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
-
-/// A packed ternary matrix in a [`SharedBytes`] buffer (see [`TernaryView`]).
-#[derive(Clone)]
-pub struct SharedTernary {
-    pub data: SharedBytes,
-    pub rows: usize,
-    pub cols: usize,
-    pub scale: f32,
-}
-
-impl SharedTernary {
-    pub fn view(&self) -> TernaryView<'_> {
-        TernaryView::new(self.rows, self.cols, (*self.data).as_ref(), self.scale)
-    }
-}
-
-/// Single-token GEMV for several matrices sharing `x` (`x.m == 1`) on a [`SpinPool`].
-/// Returns one output vector per matrix. Per-row arithmetic is exactly that of
-/// [`ternary_gemm_multi`] (same `dot_row`, same `1 / (s_a * s_w)`), so results are
-/// bit-identical; only the scheduling differs.
-pub fn ternary_gemv_pool(pool: &SpinPool, mats: &[SharedTernary], x: Arc<QuantActs>, kernel: Kernel) -> Vec<Vec<f32>> {
-    assert_eq!(x.m, 1, "ternary_gemv_pool is for single-token decode");
-    for w in mats {
-        check(&w.view(), &x);
-    }
-    let total: usize = mats.iter().map(|w| w.rows).sum();
-    let chunk = chunk_rows_for(total, pool.threads());
-    // (matrix, first row, end row, offset in the concatenated output)
-    let mut chunks: Vec<(usize, usize, usize, usize)> = Vec::new();
-    let mut off = 0;
-    for (mi, w) in mats.iter().enumerate() {
-        let mut r = 0;
-        while r < w.rows {
-            let e = (r + chunk).min(w.rows);
-            chunks.push((mi, r, e, off + r));
-            r = e;
-        }
-        off += w.rows;
-    }
-    let n_chunks = chunks.len();
-    let out: Arc<Vec<AtomicU32>> = Arc::new((0..total).map(|_| AtomicU32::new(0)).collect());
-    let ctx = Arc::new((mats.to_vec(), chunks));
-    let (o, xa) = (out.clone(), x.clone());
-    pool.run(n_chunks, move |i| {
-        let (mats, chunks) = &*ctx;
-        let (mi, r0, r1, off) = chunks[i];
-        let view = mats[mi].view();
-        let inv = 1.0 / (xa.scale[0] * view.scale);
-        let mut acc = [0i32; 1];
-        for r in r0..r1 {
-            dot_row(kernel, view.row(r), &xa, &mut acc);
-            o[off + r - r0].store((acc[0] as f32 * inv).to_bits(), Ordering::Relaxed);
-        }
-    });
-    let mut res = Vec::with_capacity(mats.len());
-    let mut off = 0;
-    for w in mats {
-        res.push(out[off..off + w.rows].iter().map(|v| f32::from_bits(v.load(Ordering::Relaxed))).collect());
-        off += w.rows;
-    }
-    res
+    let threads = rayon::current_num_threads().max(1);
+    n.div_ceil(threads * per).clamp(8, 1 << 20)
 }
 
 /// Activations re-laid out for the AVX-512 tile kernel so that one 64-byte load matches

@@ -3,10 +3,7 @@
 //! 128256 x 2560 is larger than all ternary layers together.
 
 use crate::gemm::Kernel;
-use crate::pool::SpinPool;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 
 #[inline]
 pub fn bf16_to_f32(b: u16) -> f32 {
@@ -25,30 +22,6 @@ pub fn bf16_gemv(w: &[u16], rows: usize, cols: usize, x: &[f32], out: &mut [f32]
             *o = dot(kernel, &w[r * cols..(r + 1) * cols], x);
         }
     });
-}
-
-/// [`bf16_gemv`] on a [`SpinPool`] with owned, shared inputs; bit-identical per row
-/// (the same `dot` over the same row, only scheduling differs).
-pub fn bf16_gemv_pool(
-    pool: &SpinPool,
-    w: Arc<dyn AsRef<[u16]> + Send + Sync>,
-    rows: usize,
-    cols: usize,
-    x: Arc<Vec<f32>>,
-    kernel: Kernel,
-) -> Vec<f32> {
-    assert_eq!((*w).as_ref().len(), rows * cols);
-    assert_eq!(x.len(), cols);
-    let chunk = 256;
-    let out: Arc<Vec<AtomicU32>> = Arc::new((0..rows).map(|_| AtomicU32::new(0)).collect());
-    let o = out.clone();
-    pool.run(rows.div_ceil(chunk), move |ci| {
-        let ws = (*w).as_ref();
-        for r in ci * chunk..((ci + 1) * chunk).min(rows) {
-            o[r].store(dot(kernel, &ws[r * cols..(r + 1) * cols], &x).to_bits(), Ordering::Relaxed);
-        }
-    });
-    out.iter().map(|v| f32::from_bits(v.load(Ordering::Relaxed))).collect()
 }
 
 #[inline]
@@ -159,22 +132,6 @@ mod tests {
             for r in 0..rows {
                 assert!((out[r] as f64 - refv[r]).abs() < 1e-4, "{k:?} row {r}");
             }
-        }
-    }
-
-    #[test]
-    fn pool_matches_rayon_bit_for_bit() {
-        let (rows, cols) = (700, 2560);
-        let w: Vec<u16> = (0..rows * cols).map(|i| ((i * 2654435761usize) >> 9) as u16 & 0xbfff).collect();
-        let x: Vec<f32> = (0..cols).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
-        let w = Arc::new(w);
-        let x = Arc::new(x);
-        for k in Kernel::available() {
-            let mut expect = vec![0f32; rows];
-            bf16_gemv(&w, rows, cols, &x, &mut expect, k);
-            let pool = SpinPool::new(4, std::time::Duration::from_micros(100));
-            let got = bf16_gemv_pool(&pool, w.clone(), rows, cols, x.clone(), k);
-            assert!(got.iter().zip(&expect).all(|(a, b)| a.to_bits() == b.to_bits()), "{k:?}");
         }
     }
 }

@@ -15,7 +15,6 @@ lb-ternary.workspace = true
 lb-convert.workspace = true
 burn.workspace = true
 burn-flex = "=0.22.1"
-burn-std = "=0.22.1"
 tokenizers.workspace = true
 safetensors.workspace = true
 memmap2.workspace = true
