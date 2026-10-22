@@ -9,7 +9,7 @@
 //! `TernaryBackend` extension; everything else is ordinary Burn tensor ops on the Flex
 //! backend. Note: the MLP is gated ReLU^2, not SwiGLU.
 
-use crate::ops::{bf16_linear, ternary_linear};
+use crate::ops::{bf16_linear, ternary_linear, ternary_linear2, ternary_linear3};
 use anyhow::{bail, Context, Result};
 use burn::tensor::activation::{relu, softmax};
 use burn::tensor::{Bool, DType, Device, Int, Tensor, TensorCreationOptions, TensorData};
@@ -51,6 +51,19 @@ impl TernaryLinear {
     pub fn forward(&self, x: Tensor<2>) -> Tensor<2> {
         ternary_linear(x, &self.packed, self.scale, self.cols)
     }
+}
+
+/// q/k/v (or any three linears sharing `x`) as one fused op: one activation quantization
+/// and one parallel region. Bit-identical to calling `forward` on each.
+fn forward3(x: Tensor<2>, a: &TernaryLinear, b: &TernaryLinear, c: &TernaryLinear) -> [Tensor<2>; 3] {
+    assert!(a.cols == b.cols && b.cols == c.cols);
+    ternary_linear3(x, [&a.packed, &b.packed, &c.packed], [a.scale, b.scale, c.scale], a.cols)
+}
+
+/// gate/up as one fused op, like [`forward3`].
+fn forward2(x: Tensor<2>, a: &TernaryLinear, b: &TernaryLinear) -> [Tensor<2>; 2] {
+    assert_eq!(a.cols, b.cols);
+    ternary_linear2(x, [&a.packed, &b.packed], [a.scale, b.scale], a.cols)
 }
 
 pub struct Layer {
@@ -272,9 +285,10 @@ impl BitNet {
         let mut x = self.embed(tokens);
         for (li, l) in self.layers.iter().enumerate() {
             let n1 = self.rms_norm(x.clone(), &l.input_norm);
-            let q = l.q.forward(n1.clone()).reshape([m, nh, hd]).swap_dims(0, 1);
-            let k = l.k.forward(n1.clone()).reshape([m, kvh, hd]).swap_dims(0, 1);
-            let v = l.v.forward(n1).reshape([m, kvh, hd]).swap_dims(0, 1);
+            let [q, k, v] = forward3(n1, &l.q, &l.k, &l.v);
+            let q = q.reshape([m, nh, hd]).swap_dims(0, 1);
+            let k = k.reshape([m, kvh, hd]).swap_dims(0, 1);
+            let v = v.reshape([m, kvh, hd]).swap_dims(0, 1);
             let q = Self::apply_rope(q, &cos, &sin);
             let k = Self::apply_rope(k, &cos, &sin);
 
@@ -300,8 +314,8 @@ impl BitNet {
             x = x + l.o.forward(attn);
 
             let n2 = self.rms_norm(x.clone(), &l.post_attn_norm);
-            let g = relu(l.gate.forward(n2.clone())).square();
-            let u = l.up.forward(n2);
+            let [g, u] = forward2(n2, &l.gate, &l.up);
+            let g = relu(g).square();
             let a = self.rms_norm(g * u, &l.ffn_sub_norm);
             x = x + l.down.forward(a);
         }

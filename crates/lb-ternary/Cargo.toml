@@ -10,6 +10,7 @@ description = "Ternary (BitNet b1.58) packed weights, int8 activation quantizati
 rayon.workspace = true
 
 [dev-dependencies]
+rayon.workspace = true
 
 [[bench]]
 name = "kbench"

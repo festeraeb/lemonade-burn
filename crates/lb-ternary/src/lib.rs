@@ -12,6 +12,6 @@ pub mod gemm;
 pub mod pack;
 pub mod quant;
 
-pub use gemm::{ternary_gemm, ternary_gemm_i32, Kernel};
+pub use gemm::{ternary_gemm, ternary_gemm_i32, ternary_gemm_multi, Kernel};
 pub use pack::{PackedTernary, TernaryView, BLOCK, BLOCK_BYTES};
 pub use quant::{quantize_acts, QuantActs};

@@ -1,5 +1,5 @@
 //! Simple timed microbenchmark (no criterion): `cargo bench -p lb-ternary --bench kbench`.
-//! Env: `KB_THREADS` (comma list, default "1,<all>"), `KB_ITERS` (default auto ~0.3 s).
+//! Env: `KB_QUANT=1` (quantizer probe), `KB_STREAM=1` (DRAM read ceiling), `KB_THREADS` (comma list, default "1,<all>"), `KB_ITERS` (default auto ~0.3 s).
 //! Reports per-call time, weight bandwidth (packed bytes / time) and int8 GOPS.
 
 use lb_ternary::pack::ternarize_absmean;
@@ -14,6 +14,10 @@ fn main() {
         .unwrap_or_else(|| vec![1, all]);
     // BitNet 2B4T shapes: (rows=out, cols=in)
     let shapes = [("qo 2560x2560", 2560, 2560), ("kv 640x2560", 640, 2560), ("gate/up 6912x2560", 6912, 2560), ("down 2560x6912", 2560, 6912)];
+    if std::env::var("KB_QUANT").is_ok() {
+        quant_probe();
+        return;
+    }
     if std::env::var("KB_STREAM").is_ok() {
         stream(&threads);
         return;
@@ -95,5 +99,24 @@ fn stream(threads: &[usize]) {
                 println!("threads {nt:>2} | 520MB gemv {:<10}    | {:>7.2} GB/s  {:>6.1} ms/token-equivalent", k.name(), p.data.len() as f64 / dt / 1e9, dt * 1e3);
             }
         });
+    }
+}
+
+/// `KB_QUANT=1`: single-thread activation quantizer speed, scalar vs dispatched.
+fn quant_probe() {
+    let k = 2560;
+    let x: Vec<f32> = (0..k).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+    let mut q = vec![0i8; k];
+    let n = 2000;
+    for (name, f) in [
+        ("scalar", lb_ternary::quant::quantize_row_scalar as fn(&[f32], &mut [i8]) -> (f32, i32)),
+        ("dispatched", lb_ternary::quant::quantize_row),
+    ] {
+        let t0 = Instant::now();
+        let mut s = 0i32;
+        for _ in 0..n {
+            s = s.wrapping_add(f(std::hint::black_box(&x), &mut q).1);
+        }
+        println!("quantize_row {name:<10} k={k}: {:.2} us/row ({s})", t0.elapsed().as_secs_f64() / n as f64 * 1e6);
     }
 }

@@ -115,40 +115,77 @@ pub fn ternary_gemm_i32(w: TernaryView<'_>, x: &QuantActs, kernel: Kernel) -> Ve
 
 /// `out[t * rows + r] = y` (row-major `[m, rows]`, i.e. `x @ W^T`).
 pub fn ternary_gemm(w: TernaryView<'_>, x: &QuantActs, kernel: Kernel, out: &mut [f32]) {
-    check(&w, x);
-    let (m, n) = (x.m, w.rows);
-    assert_eq!(out.len(), m * n);
-    let inv: Vec<f32> = x.scale.iter().map(|&sa| 1.0 / (sa * w.scale)).collect();
-    let chunk = chunk_rows(n);
+    ternary_gemm_multi(&[w], x, kernel, &mut [out]);
+}
+
+/// Several matrices that share the same input `x` (e.g. q/k/v, or gate/up) in one
+/// parallel region: `outs[i][t * ws[i].rows + r] = (x @ ws[i]^T)[t, r]`.
+///
+/// Every output element is computed exactly as [`ternary_gemm`] computes it (same integer
+/// dot, same `1 / (s_a * s_w)` scaling), so results are bit-identical to separate calls;
+/// fusing only saves the fork/join and lets the row chunks of all matrices balance
+/// across threads together.
+pub fn ternary_gemm_multi(ws: &[TernaryView<'_>], x: &QuantActs, kernel: Kernel, outs: &mut [&mut [f32]]) {
+    assert_eq!(ws.len(), outs.len());
+    let m = x.m;
+    for (w, o) in ws.iter().zip(outs.iter()) {
+        check(w, x);
+        assert_eq!(o.len(), m * w.rows);
+    }
+    let total_rows: usize = ws.iter().map(|w| w.rows).sum();
+    let chunk = chunk_rows(total_rows);
     if m == 1 {
-        let inv0 = inv[0];
-        out.par_chunks_mut(chunk).enumerate().for_each(|(ci, dst)| {
-            let r0 = ci * chunk;
+        // decode: write straight into the outputs, one task per row chunk
+        let mut tasks: Vec<(TernaryView<'_>, usize, f32, &mut [f32])> = Vec::new();
+        for (w, o) in ws.iter().zip(outs.iter_mut()) {
+            let inv = 1.0 / (x.scale[0] * w.scale);
+            for (ci, dst) in o.chunks_mut(chunk).enumerate() {
+                tasks.push((*w, ci * chunk, inv, dst));
+            }
+        }
+        tasks.into_par_iter().for_each(|(w, r0, inv, dst)| {
             let mut acc = [0i32; 1];
             for (r, o) in dst.iter_mut().enumerate() {
                 dot_row(kernel, w.row(r0 + r), x, &mut acc);
-                *o = acc[0] as f32 * inv0;
+                *o = acc[0] as f32 * inv;
             }
         });
         return;
     }
-    let mut tmp = vec![0f32; n * m];
-    tmp.par_chunks_mut(chunk * m).enumerate().for_each(|(ci, dst)| {
-        let r0 = ci * chunk;
-        let rows = dst.len() / m;
-        let mut acc = vec![0i32; m];
-        for r in 0..rows {
-            dot_row(kernel, w.row(r0 + r), x, &mut acc);
-            for t in 0..m {
-                dst[r * m + t] = acc[t] as f32 * inv[t];
+    // prefill: each task computes a row chunk for all tokens into `tmp` ([row][token]),
+    // then a second parallel pass transposes into the `[token][row]` outputs.
+    let mut tmps: Vec<Vec<f32>> = ws.iter().map(|w| vec![0f32; w.rows * m]).collect();
+    let invs: Vec<Vec<f32>> = ws.iter().map(|w| x.scale.iter().map(|&sa| 1.0 / (sa * w.scale)).collect()).collect();
+    {
+        let mut tasks: Vec<(TernaryView<'_>, usize, &[f32], &mut [f32])> = Vec::new();
+        for ((w, inv), tmp) in ws.iter().zip(&invs).zip(tmps.iter_mut()) {
+            for (ci, dst) in tmp.chunks_mut(chunk * m).enumerate() {
+                tasks.push((*w, ci * chunk, inv.as_slice(), dst));
             }
         }
-    });
-    for r in 0..n {
-        for t in 0..m {
-            out[t * n + r] = tmp[r * m + t];
+        tasks.into_par_iter().for_each(|(w, r0, inv, dst)| {
+            let rows = dst.len() / m;
+            let mut acc = vec![0i32; m];
+            for r in 0..rows {
+                dot_row(kernel, w.row(r0 + r), x, &mut acc);
+                for t in 0..m {
+                    dst[r * m + t] = acc[t] as f32 * inv[t];
+                }
+            }
+        });
+    }
+    let mut rows_out: Vec<(&[f32], usize, &mut [f32])> = Vec::new();
+    for (tmp, o) in tmps.iter().zip(outs.iter_mut()) {
+        let n = o.len() / m;
+        for (t, dst) in o.chunks_mut(n).enumerate() {
+            rows_out.push((tmp.as_slice(), t, dst));
         }
     }
+    rows_out.into_par_iter().for_each(|(tmp, t, dst)| {
+        for (r, d) in dst.iter_mut().enumerate() {
+            *d = tmp[r * m + t];
+        }
+    });
 }
 
 fn check(w: &TernaryView<'_>, x: &QuantActs) {
