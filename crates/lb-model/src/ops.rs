@@ -13,6 +13,8 @@ use burn::tensor::{DType, Int, Shape, Tensor, TensorData};
 use burn_flex::FlexTensor;
 use lb_ternary::{quant::quantize_acts_into, QuantActs, TernaryView};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 #[backend_extension(Flex)]
 pub trait TernaryBackend: Backend {
@@ -23,6 +25,17 @@ pub trait TernaryBackend: Backend {
 
     /// `x[m, k] (f32) @ W^T` with `W[n, k]` stored as bf16 (the tied LM head).
     fn bf16_linear(x: FloatTensor<Self>, w: FloatTensor<Self>) -> FloatTensor<Self>;
+}
+
+/// Cumulative wall time (ns) and call counts of the custom ops, for profiling.
+pub static PROF_TERNARY_NS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_TERNARY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_BF16_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn prof_reset() {
+    PROF_TERNARY_NS.store(0, Ordering::Relaxed);
+    PROF_TERNARY_CALLS.store(0, Ordering::Relaxed);
+    PROF_BF16_NS.store(0, Ordering::Relaxed);
 }
 
 thread_local! {
@@ -44,6 +57,7 @@ fn contiguous(t: FlexTensor) -> FlexTensor {
 
 impl TernaryBackend for Flex {
     fn ternary_linear(x: FlexTensor, packed: FlexTensor, scale: f32, cols: usize) -> FlexTensor {
+        let t0 = Instant::now();
         let x = contiguous(x);
         let packed = contiguous(packed);
         assert_eq!(x.dtype(), DType::F32, "ternary_linear expects f32 activations");
@@ -60,10 +74,14 @@ impl TernaryBackend for Flex {
             quantize_acts_into(xs, m, k, &mut q);
             lb_ternary::ternary_gemm(view, &q, lb_ternary::Kernel::detect(), &mut out);
         });
-        FlexTensor::from_data(TensorData::new(out, [m, rows]))
+        let r = FlexTensor::from_data(TensorData::new(out, [m, rows]));
+        PROF_TERNARY_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        PROF_TERNARY_CALLS.fetch_add(1, Ordering::Relaxed);
+        r
     }
 
     fn bf16_linear(x: FlexTensor, w: FlexTensor) -> FlexTensor {
+        let t0 = Instant::now();
         let x = contiguous(x);
         let w = contiguous(w);
         assert_eq!(x.dtype(), DType::F32);
@@ -80,7 +98,9 @@ impl TernaryBackend for Flex {
         for i in 0..m {
             lb_ternary::bf16::bf16_gemv(ws, n, k, &xs[i * k..(i + 1) * k], &mut out[i * n..(i + 1) * n], kernel);
         }
-        FlexTensor::from_data(TensorData::new(out, [m, n]))
+        let r = FlexTensor::from_data(TensorData::new(out, [m, n]));
+        PROF_BF16_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        r
     }
 }
 

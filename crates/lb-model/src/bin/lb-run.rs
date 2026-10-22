@@ -121,6 +121,7 @@ fn main() -> Result<()> {
             // deterministic synthetic prompt of ordinary tokens
             let ids: Vec<u32> = std::iter::once(m.cfg.bos_token_id).chain((0..prompt_len as u32 - 1).map(|i| 1000 + (i * 7919) % 30000)).collect();
             for r in 0..reps {
+                lb_model::ops::prof_reset();
                 let mut cache = m.new_cache();
                 let t0 = Instant::now();
                 let logits = to_vec(m.forward(&ids, &mut cache, false));
@@ -132,6 +133,10 @@ fn main() -> Result<()> {
                     next = argmax(&l);
                 }
                 let td = t1.elapsed().as_secs_f64();
+                let tern = lb_model::ops::PROF_TERNARY_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+                let bf = lb_model::ops::PROF_BF16_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+                eprintln!("  profile (prefill+decode): ternary ops {tern:.2}s, lm_head {bf:.2}s, other {:.2}s", tp + td - tern - bf);
+                lb_model::ops::prof_reset();
                 println!(
                     "rep {r}: prefill {} tok {:.2}s = {:.2} tok/s | decode {} tok {:.2}s = {:.2} tok/s | rss {:.0} MB | kernel {} threads {}",
                     ids.len(),

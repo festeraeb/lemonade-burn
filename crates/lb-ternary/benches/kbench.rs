@@ -1,1 +1,99 @@
-fn main(){}
+//! Simple timed microbenchmark (no criterion): `cargo bench -p lb-ternary --bench kbench`.
+//! Env: `KB_THREADS` (comma list, default "1,<all>"), `KB_ITERS` (default auto ~0.3 s).
+//! Reports per-call time, weight bandwidth (packed bytes / time) and int8 GOPS.
+
+use lb_ternary::pack::ternarize_absmean;
+use lb_ternary::{quantize_acts, ternary_gemm, Kernel, PackedTernary};
+use std::time::Instant;
+
+fn main() {
+    let all = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let threads: Vec<usize> = std::env::var("KB_THREADS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, all]);
+    // BitNet 2B4T shapes: (rows=out, cols=in)
+    let shapes = [("qo 2560x2560", 2560, 2560), ("kv 640x2560", 640, 2560), ("gate/up 6912x2560", 6912, 2560), ("down 2560x6912", 2560, 6912)];
+    if std::env::var("KB_STREAM").is_ok() {
+        stream(&threads);
+        return;
+    }
+    println!("cpu kernels available: {:?}", Kernel::available().iter().map(|k| k.name()).collect::<Vec<_>>());
+    for &nt in &threads {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(nt).build().unwrap();
+        pool.install(|| {
+            for &(label, rows, cols) in &shapes {
+                let mut s = 0x9e3779b97f4a7c15u64;
+                let w: Vec<f32> = (0..rows * cols)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                    })
+                    .collect();
+                let (t, sc) = ternarize_absmean(&w);
+                let p = PackedTernary::from_ternary(rows, cols, &t, sc);
+                for m in [1usize, 16] {
+                    let x: Vec<f32> = (0..m * cols).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+                    let qa = quantize_acts(&x, m, cols);
+                    let mut out = vec![0f32; m * rows];
+                    for k in Kernel::available() {
+                        ternary_gemm(p.view(), &qa, k, &mut out); // warm
+                        let t0 = Instant::now();
+                        let mut iters = 0;
+                        while t0.elapsed().as_secs_f64() < 0.3 {
+                            ternary_gemm(p.view(), &qa, k, &mut out);
+                            iters += 1;
+                        }
+                        let dt = t0.elapsed().as_secs_f64() / iters as f64;
+                        println!(
+                            "threads {nt:>2} | {label:<18} m={m:<2} | {:<10} | {:>9.1} us/call | {:>6.2} GB/s weights | {:>7.1} GOPS",
+                            k.name(),
+                            dt * 1e6,
+                            p.data.len() as f64 / dt / 1e9,
+                            2.0 * (rows * cols * m) as f64 / dt / 1e9
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Decode-like streaming: one 520 MB packed matrix (same bytes as all BitNet 2B4T
+/// ternary layers) read once per GEMV, so it cannot sit in cache. Also reports a plain
+/// parallel u64 sum over the same buffer as the DRAM read ceiling.
+fn stream(threads: &[usize]) {
+    use rayon::prelude::*;
+    let cols = 2560;
+    let rows = 520_000_000 / (cols / 4);
+    let t: Vec<i8> = (0..rows * cols).map(|i| ((i * 2654435761usize) >> 7) as i8 % 2).collect();
+    let p = PackedTernary::from_ternary(rows, cols, &t, 1.0);
+    drop(t);
+    let x: Vec<f32> = (0..cols).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+    let qa = quantize_acts(&x, 1, cols);
+    let mut out = vec![0f32; rows];
+    let words: &[u64] = unsafe { std::slice::from_raw_parts(p.data.as_ptr() as *const u64, p.data.len() / 8) };
+    for &nt in threads {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(nt).build().unwrap();
+        pool.install(|| {
+            let t0 = Instant::now();
+            let mut s = 0u64;
+            for _ in 0..3 {
+                s = s.wrapping_add(words.par_chunks(1 << 16).map(|c| c.iter().fold(0u64, |a, &b| a ^ b)).reduce(|| 0, |a, b| a ^ b));
+            }
+            let dt = t0.elapsed().as_secs_f64() / 3.0;
+            println!("threads {nt:>2} | read-only xor sweep      | {:>7.2} GB/s ({s:x})", p.data.len() as f64 / dt / 1e9);
+            for k in Kernel::available().into_iter().filter(|k| *k != Kernel::Scalar) {
+                ternary_gemm(p.view(), &qa, k, &mut out);
+                let t0 = Instant::now();
+                for _ in 0..3 {
+                    ternary_gemm(p.view(), &qa, k, &mut out);
+                }
+                let dt = t0.elapsed().as_secs_f64() / 3.0;
+                println!("threads {nt:>2} | 520MB gemv {:<10}    | {:>7.2} GB/s  {:>6.1} ms/token-equivalent", k.name(), p.data.len() as f64 / dt / 1e9, dt * 1e3);
+            }
+        });
+    }
+}
