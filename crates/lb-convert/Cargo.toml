@@ -1,0 +1,18 @@
+[package]
+name = "lb-convert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "BitNet b1.58 bf16 safetensors -> packed ternary safetensors (lemonade-burn format v1)"
+
+[dependencies]
+lb-ternary.workspace = true
+rayon.workspace = true
+safetensors.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+anyhow.workspace = true
+clap.workspace = true
