@@ -8,6 +8,7 @@ description = "Ternary (BitNet b1.58) packed weights, int8 activation quantizati
 
 [dependencies]
 rayon.workspace = true
+nix = { version = "0.31", default-features = false, features = ["sched"] }
 
 [dev-dependencies]
 rayon.workspace = true

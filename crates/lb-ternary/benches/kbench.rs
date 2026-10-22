@@ -3,7 +3,7 @@
 //! Reports per-call time, weight bandwidth (packed bytes / time) and int8 GOPS.
 
 use lb_ternary::pack::ternarize_absmean;
-use lb_ternary::{quantize_acts, ternary_gemm, Kernel, PackedTernary};
+use lb_ternary::{quantize_acts, ternary_gemm, Kernel, PackedTernary, TernaryView};
 use std::time::Instant;
 
 fn main() {
@@ -79,6 +79,26 @@ fn stream(threads: &[usize]) {
     let qa = quantize_acts(&x, 1, cols);
     let mut out = vec![0f32; rows];
     let words: &[u64] = unsafe { std::slice::from_raw_parts(p.data.as_ptr() as *const u64, p.data.len() / 8) };
+    if let Some(np) = lb_ternary::numa::NodePools::global() {
+        // two-socket split: rows [0, s) placed on node 0, [s, rows) on node 1
+        let s = np.split_rows(rows);
+        let rb = p.view().row_bytes();
+        let d0 = np.place(0, &p.data[..s * rb]);
+        let d1 = np.place(1, &p.data[s * rb..]);
+        let (v0, v1) = (TernaryView::new(s, cols, &d0, 1.0), TernaryView::new(rows - s, cols, &d1, 1.0));
+        let (o0, o1) = out.split_at_mut(s);
+        for k in Kernel::available().into_iter().filter(|k| *k != Kernel::Scalar) {
+            for rep in 0..4 {
+                let t0 = Instant::now();
+                for _ in 0..3 {
+                    np.join(|| ternary_gemm(v0, &qa, k, o0), || ternary_gemm(v1, &qa, k, o1));
+                }
+                let dt = t0.elapsed().as_secs_f64() / 3.0;
+                println!("numa share {:.2} rep {rep} | 520MB gemv {:<10} | {:>7.2} GB/s  {:>6.1} ms/token-equivalent", np.share, k.name(), p.data.len() as f64 / dt / 1e9, dt * 1e3);
+            }
+        }
+        return;
+    }
     for &nt in threads {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(nt).build().unwrap();
         pool.install(|| {

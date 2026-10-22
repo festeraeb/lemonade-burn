@@ -5,10 +5,12 @@
 //! * [`quant`]: per-token absmax int8 activation quantization (`ActQuant`).
 //! * [`gemm`]: int8 x ternary GEMV/GEMM with scalar, AVX2 and AVX-512 (BW / VNNI) paths,
 //!   selected at runtime.
+//! * [`numa`]: per-socket thread pools and first-touch placement for two-socket runs.
 //! * [`bf16`]: f32 x bf16 GEMV used for the (unquantized, tied) LM head.
 
 pub mod bf16;
 pub mod gemm;
+pub mod numa;
 pub mod pack;
 pub mod quant;
 
