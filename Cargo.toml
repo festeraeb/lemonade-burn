@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lb-ternary", "crates/lb-convert", "crates/lb-model"]
+members = ["crates/lb-ternary", "crates/lb-convert", "crates/lb-model", "crates/lb-server"]
 
 [workspace.package]
 version = "0.1.0"

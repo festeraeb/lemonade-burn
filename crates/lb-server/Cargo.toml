@@ -1,0 +1,24 @@
+[package]
+name = "lb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "OpenAI-compatible HTTP server for the lemonade-burn BitNet runtime"
+
+[[bin]]
+name = "lemonade-burn-server"
+path = "src/main.rs"
+
+[dependencies]
+lb-model.workspace = true
+lb-ternary.workspace = true
+burn.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
+futures-util = "0.3"
