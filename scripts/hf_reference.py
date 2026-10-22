@@ -62,9 +62,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
+    ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "float64"])
     ap.add_argument("--gen", type=int, default=24)
     ap.add_argument("--skip-quant", action="store_true")
+    ap.add_argument("--ids-from", help="prompts.json of an earlier run: reuse its token sequences (no generation)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     torch.set_num_threads(min(16, os.cpu_count() or 4))
@@ -83,6 +84,17 @@ def main():
           getattr(model.model.layers[0].self_attn.q_proj, "online_quant", None), flush=True)
 
     records = []
+    if a.ids_from:
+        prev = json.load(open(a.ids_from))["records"]
+        for i, r in enumerate(prev):
+            with torch.no_grad():
+                logits = model(torch.tensor([r["full_ids"]])).logits[0].float().numpy()
+            np.save(os.path.join(a.out, f"logits_{i}.npy"), logits)
+            print(f"[{i}] reused {len(r['full_ids'])} tokens", flush=True)
+            records.append(r)
+        json.dump({"dtype": a.dtype, "torch": torch.__version__, "records": records, "ids_from": a.ids_from},
+                  open(os.path.join(a.out, "prompts.json"), "w"), indent=1)
+        return
     for i, p in enumerate(PROMPTS):
         if p["kind"] == "chat":
             ids = tok.apply_chat_template(p["messages"], add_generation_prompt=True, tokenize=True)
