@@ -1,0 +1,10 @@
+[package]
+name = "ternary-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Packed 2-bit ternary (BitNet b1.58) x int8 GEMV/GEMM kernels: scalar reference, AVX2, AVX-512BW, AVX-512 VNNI"
+
+[dependencies]
+rayon.workspace = true
+half.workspace = true
