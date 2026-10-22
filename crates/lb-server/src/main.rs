@@ -168,6 +168,8 @@ fn run_job(model: &BitNet, codec: &TextCodec, job: &Job) {
 #[derive(Deserialize)]
 struct ChatReq {
     #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     messages: Vec<Value>,
     #[serde(default)]
     prompt: Option<Value>,
@@ -263,7 +265,8 @@ async fn respond(st: Arc<AppState>, req: ChatReq, prompt: Vec<u32>, chat: bool) 
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = format!("{}-{:x}{:04x}", if chat { "chatcmpl" } else { "cmpl" }, now(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let created = now();
-    let model = st.model_id.clone();
+    // echo the caller's model name (Lemonade routes by its own id) when given
+    let model = req.model.clone().filter(|m| !m.is_empty()).unwrap_or_else(|| st.model_id.clone());
     if !req.stream {
         let mut text = String::new();
         loop {
