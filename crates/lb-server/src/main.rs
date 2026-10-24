@@ -410,8 +410,13 @@ fn main() -> Result<()> {
         eprintln!("lemonade-burn-server: listening on http://{addr}");
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
-                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("sigterm handler");
-                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+                #[cfg(unix)]
+                {
+                    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("sigterm handler");
+                    tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+                }
+                #[cfg(not(unix))]
+                let _ = tokio::signal::ctrl_c().await;
             })
             .await?;
         Ok(())

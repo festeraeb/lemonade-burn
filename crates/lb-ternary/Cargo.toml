@@ -8,6 +8,9 @@ description = "Ternary (BitNet b1.58) packed weights, int8 activation quantizati
 
 [dependencies]
 rayon.workspace = true
+
+# Thread pinning for the optional two-socket mode (LB_NUMA) uses Linux sched_setaffinity.
+[target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["sched"] }
 
 [dev-dependencies]

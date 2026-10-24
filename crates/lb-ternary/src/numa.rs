@@ -37,6 +37,7 @@ pub fn parse_cpus(s: &str) -> Option<Vec<usize>> {
     (!v.is_empty()).then_some(v)
 }
 
+#[cfg(target_os = "linux")]
 fn pin_current_thread(cpus: &[usize]) {
     use nix::sched::{sched_setaffinity, CpuSet};
     use nix::unistd::Pid;
@@ -48,6 +49,10 @@ fn pin_current_thread(cpus: &[usize]) {
         eprintln!("lb-ternary numa: could not pin thread to {cpus:?}: {e}");
     }
 }
+
+/// Pinning is Linux-only; elsewhere the pools still run, just unpinned.
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread(_cpus: &[usize]) {}
 
 impl NodePools {
     fn builder(n: usize, cpus: &[usize]) -> rayon::ThreadPoolBuilder {

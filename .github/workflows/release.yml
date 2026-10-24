@@ -1,0 +1,95 @@
+# Builds lemonade-burn-server for Linux, Windows and macOS and attaches the archives to the release.
+# Runs on a pushed tag (v*) or by hand with a tag name. The model archive is uploaded separately.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach to (e.g. v0.1.1)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  BIN: lemonade-burn-server
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  linux:
+    # Built in Ubuntu 20.04 so the binary runs on glibc 2.30 and newer.
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
+    steps:
+      - name: Toolchain
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl build-essential pkg-config ca-certificates git >/dev/null
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Build
+        run: cargo build --release --locked -p lb-server --bin "$BIN"
+      - name: Package
+        shell: bash
+        run: |
+          VER="${TAG#v}"; NAME="$BIN-$VER-x86_64-linux.tar.gz"
+          mkdir pkg && cp "target/release/$BIN" LICENSE-MIT LICENSE-APACHE pkg/ && strip "pkg/$BIN"
+          tar czf "$NAME" -C pkg "$BIN" LICENSE-MIT LICENSE-APACHE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-linux
+          path: "*.tar.gz"
+
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, platform: x86_64-windows, exe: .exe }
+          - { os: macos-latest, target: aarch64-apple-darwin, platform: aarch64-macos, exe: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, platform: x86_64-macos, exe: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Toolchain
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked -p lb-server --bin "$BIN" --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          VER="${TAG#v}"; F="$BIN${{ matrix.exe }}"; NAME="$BIN-$VER-${{ matrix.platform }}.tar.gz"
+          mkdir pkg && cp "target/${{ matrix.target }}/release/$F" LICENSE-MIT LICENSE-APACHE pkg/
+          if [ "${{ matrix.exe }}" = "" ]; then strip "pkg/$F"; fi
+          tar czf "$NAME" -C pkg "$F" LICENSE-MIT LICENSE-APACHE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: "*.tar.gz"
+
+  publish:
+    needs: [linux, native]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist && sha256sum *.tar.gz | tee SHA256SUMS-server
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "lemonade-burn ${TAG#v}" --notes "Server builds for Linux, Windows and macOS. The model archive is in v0.1.0."
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber *.tar.gz SHA256SUMS-server
