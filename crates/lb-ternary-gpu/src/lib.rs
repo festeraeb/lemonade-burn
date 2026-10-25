@@ -19,10 +19,16 @@ fn ternary_gemm_kernel(w: &[u32], x: &[i32], dims: &[u32], out: &mut [i32]) {
         let words_per_row = kp / 16;
         let blocks = kp / 128;
         let mut acc = 0i32;
-        // FORGE TODO (LB1): loop over the `blocks` blocks of row r. Block b of row r is the 8 words
-        // w[r * words_per_row + b * 8 .. r * words_per_row + b * 8 + 8]; byte j (0..32) of the block is
-        // bits 8*(j%4) .. 8*(j%4)+7 of word j/4. Bits 2k..2k+1 (k in 0..4) of byte j hold the code of
-        // column b*128 + k*32 + j; weight = code - 1. Add weight * x[t * kp + column] to acc.
+        for b in 0..blocks {
+            for j in 0..32usize {
+                let word = w[r * words_per_row + b * 8 + j / 4];
+                let byte = (word >> (((j % 4) * 8) as u32)) & 255u32;
+                for k in 0..4usize {
+                    let code = ((byte >> ((2 * k) as u32)) & 3u32) as i32;
+                    acc += (code - 1) * x[t * kp + b * 128 + k * 32 + j];
+                }
+            }
+        }
         out[pos] = acc;
     }
 }
