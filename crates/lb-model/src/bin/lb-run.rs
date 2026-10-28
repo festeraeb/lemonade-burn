@@ -37,6 +37,10 @@ enum Cmd {
         model: PathBuf,
         #[arg(long = "ref")]
         reference: PathBuf,
+        /// Also write this engine's logits as raw little-endian f32 (`logits_<i>.f32`) to
+        /// DIR, for bit-exact comparison between builds (`cmp`).
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
     Bench {
         #[arg(long)]
@@ -115,7 +119,7 @@ fn main() -> Result<()> {
                 rss_mb()
             );
         }
-        Cmd::Compare { model, reference } => compare(&model, &reference)?,
+        Cmd::Compare { model, reference, dump } => compare(&model, &reference, dump.as_deref())?,
         Cmd::Bench { model, prompt_len, gen, reps } => {
             let (m, _codec) = load(&model)?;
             // deterministic synthetic prompt of ordinary tokens
@@ -135,7 +139,15 @@ fn main() -> Result<()> {
                 let td = t1.elapsed().as_secs_f64();
                 let tern = lb_model::ops::PROF_TERNARY_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
                 let bf = lb_model::ops::PROF_BF16_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+                let ld = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
                 eprintln!("  profile (prefill+decode): ternary ops {tern:.2}s, lm_head {bf:.2}s, other {:.2}s", tp + td - tern - bf);
+                eprintln!(
+                    "  ternary detail: decode(m=1) {:.3}s, quantize {:.3}s, gemm {:.3}s, calls {}",
+                    ld(&lb_model::ops::PROF_TERNARY_M1_NS),
+                    ld(&lb_model::ops::PROF_QUANT_NS),
+                    ld(&lb_model::ops::PROF_GEMM_NS),
+                    lb_model::ops::PROF_TERNARY_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+                );
                 lb_model::ops::prof_reset();
                 println!(
                     "rep {r}: prefill {} tok {:.2}s = {:.2} tok/s | decode {} tok {:.2}s = {:.2} tok/s | rss {:.0} MB | kernel {} threads {}",
@@ -172,7 +184,7 @@ fn read_npy_f32(path: &Path) -> Result<(Vec<usize>, Vec<f32>)> {
     Ok((shape, data))
 }
 
-fn compare(model: &Path, refdir: &Path) -> Result<()> {
+fn compare(model: &Path, refdir: &Path, dump: Option<&Path>) -> Result<()> {
     let (m, codec) = load(model)?;
     let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(refdir.join("prompts.json"))?)?;
     println!("reference dtype: {}", meta["dtype"]);
@@ -203,6 +215,11 @@ fn compare(model: &Path, refdir: &Path) -> Result<()> {
             rows.push(to_vec(m.forward(&[t], &mut cache, false)));
         }
         let el = t0.elapsed().as_secs_f64();
+        if let Some(dir) = dump {
+            std::fs::create_dir_all(dir)?;
+            let bytes: Vec<u8> = rows.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(dir.join(format!("logits_{i}.f32")), bytes)?;
+        }
         let (mut agree, mut maxd, mut sumd, mut agree_margin, mut n_margin) = (0, 0f32, 0f64, 0, 0);
         let mut first_disagree = None;
         for (pos, row) in rows.iter().enumerate() {
