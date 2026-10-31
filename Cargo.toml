@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/lb-ternary", "crates/lb-convert", "crates/lb-model", "crates/lb-server", "crates/lb-gguf", "crates/lb-lfm2"]
+members = ["crates/lb-ternary", "crates/lb-convert", "crates/lb-model", "crates/lb-server", "crates/lb-gguf", "crates/lb-lfm2", "crates/lb-ternary-gpu", "crates/lb-q4-gpu"]
+# `cargo build` at the root stays CPU-only; the GPU crates (wgpu) build with -p or the `gpu` features.
+default-members = ["crates/lb-ternary", "crates/lb-convert", "crates/lb-model", "crates/lb-server", "crates/lb-gguf", "crates/lb-lfm2"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +22,10 @@ clap = { version = "4", features = ["derive", "env"] }
 lb-ternary = { path = "crates/lb-ternary" }
 lb-convert = { path = "crates/lb-convert" }
 lb-model = { path = "crates/lb-model" }
+lb-gguf = { path = "crates/lb-gguf" }
+lb-lfm2 = { path = "crates/lb-lfm2" }
+lb-q4-gpu = { path = "crates/lb-q4-gpu" }
+cubecl = { version = "=0.11.2", default-features = false, features = ["std", "wgpu"] }
 burn = { version = "=0.22.1", default-features = false, features = ["std", "flex", "extension"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 

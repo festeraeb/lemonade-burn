@@ -10,8 +10,14 @@ description = "OpenAI-compatible HTTP server for the lemonade-burn BitNet runtim
 name = "lemonade-burn-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# Resident LFM2 experts on the wgpu device named by LB_WGPU_DEVICE.
+gpu = ["lb-lfm2/gpu"]
+
 [dependencies]
 lb-model.workspace = true
+lb-lfm2.workspace = true
 lb-ternary.workspace = true
 burn.workspace = true
 anyhow.workspace = true

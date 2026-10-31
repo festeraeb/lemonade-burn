@@ -3864,6 +3864,7 @@ dependencies = [
  "burn-flex",
  "clap",
  "lb-gguf",
+ "lb-q4-gpu",
  "rayon",
  "serde",
  "serde_json",
@@ -3889,6 +3890,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-q4-gpu"
+version = "0.1.0"
+dependencies = [
+ "cubecl",
+ "half",
+ "lb-gguf",
+ "lb-ternary-gpu",
+]
+
+[[package]]
 name = "lb-server"
 version = "0.1.0"
 dependencies = [
@@ -3897,6 +3908,7 @@ dependencies = [
  "burn",
  "clap",
  "futures-util",
+ "lb-lfm2",
  "lb-model",
  "lb-ternary",
  "rayon",
@@ -3911,6 +3923,14 @@ version = "0.1.0"
 dependencies = [
  "nix",
  "rayon",
+]
+
+[[package]]
+name = "lb-ternary-gpu"
+version = "0.1.0"
+dependencies = [
+ "cubecl",
+ "lb-ternary",
 ]
 
 [[package]]

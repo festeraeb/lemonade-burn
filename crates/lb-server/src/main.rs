@@ -21,8 +21,9 @@ use burn::tensor::Device;
 use clap::Parser;
 use futures_util::stream::{self, Stream};
 use lb_model::sample::{Sampler, SamplingParams};
-use lb_model::text::{ChatMessage, StreamDecoder, TextCodec};
+use lb_model::text::{ChatMessage, ChatStyle, StreamDecoder, TextCodec};
 use lb_model::BitNet;
+use burn::tensor::Tensor;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -38,9 +39,20 @@ pub const RUNTIME_NAME: &str = "lemonade-burn";
 #[derive(Parser, Debug, Clone)]
 #[command(name = "lemonade-burn-server")]
 struct Args {
-    /// Converted model directory (lb-convert output).
+    /// Model: a converted BitNet directory (lb-convert output) or an LFM2 / LFM2-MoE `.gguf`
+    /// file (with `tokenizer.json` beside it).
     #[arg(long)]
     model: PathBuf,
+    /// LFM2 only: directory of NautiBurn scrape files to plan the expert placement from.
+    #[arg(long)]
+    placement_from_scrapes: Option<PathBuf>,
+    /// LFM2 only: GPU byte budget for resident experts (MB); 0 = all experts on the CPU.
+    #[arg(long, default_value_t = 0)]
+    gpu_budget_mb: usize,
+    /// LFM2 only: upload the planned residents to the GPU named by LB_WGPU_DEVICE and run
+    /// them there (needs the `gpu` feature).
+    #[arg(long, default_value_t = false)]
+    gpu: bool,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8000)]
@@ -89,7 +101,67 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn worker(model: BitNet, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
+/// A decoder the server can host: prefill/decode with its own cache.
+pub trait Decoder: Send + 'static {
+    type Cache;
+    fn new_cache(&self) -> Self::Cache;
+    /// Logits `[1, vocab]` for the last of `tokens`, run at positions `cache.len..`.
+    fn forward(&self, tokens: &[u32], cache: &mut Self::Cache, all_logits: bool) -> Tensor<2>;
+    fn max_context(&self) -> usize;
+    fn bos(&self) -> u32;
+    fn kernel_name(&self) -> &'static str;
+    /// Called after each request (scrape flush, profiling); default nothing.
+    fn after_request(&self, _prompt: &[u32]) {}
+}
+
+impl Decoder for BitNet {
+    type Cache = lb_model::model::KvCache;
+    fn new_cache(&self) -> Self::Cache {
+        BitNet::new_cache(self)
+    }
+    fn forward(&self, tokens: &[u32], cache: &mut Self::Cache, all_logits: bool) -> Tensor<2> {
+        BitNet::forward(self, tokens, cache, all_logits)
+    }
+    fn max_context(&self) -> usize {
+        self.cfg.max_position_embeddings
+    }
+    fn bos(&self) -> u32 {
+        self.cfg.bos_token_id
+    }
+    fn kernel_name(&self) -> &'static str {
+        lb_ternary::Kernel::detect().name()
+    }
+}
+
+impl Decoder for lb_lfm2::Lfm2 {
+    type Cache = lb_lfm2::Cache;
+    fn new_cache(&self) -> Self::Cache {
+        lb_lfm2::Lfm2::new_cache(self)
+    }
+    fn forward(&self, tokens: &[u32], cache: &mut Self::Cache, all_logits: bool) -> Tensor<2> {
+        lb_lfm2::Lfm2::forward(self, tokens, cache, all_logits)
+    }
+    fn max_context(&self) -> usize {
+        self.cfg().n_ctx
+    }
+    fn bos(&self) -> u32 {
+        self.cfg().bos
+    }
+    fn kernel_name(&self) -> &'static str {
+        if self.store.n_resident() > 0 {
+            "lfm2 q4_0 (resident experts on GPU, rest CPU)"
+        } else {
+            "lfm2 q4_0 (CPU)"
+        }
+    }
+    fn after_request(&self, prompt: &[u32]) {
+        if let Err(e) = self.scraper.flush("prefill", prompt) {
+            eprintln!("scrape flush failed: {e}");
+        }
+    }
+}
+
+fn worker<D: Decoder>(model: D, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
     while let Ok(job) = rx.recv() {
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&model, &codec, &job)));
         if let Err(e) = res {
@@ -99,7 +171,7 @@ fn worker(model: BitNet, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
     }
 }
 
-fn run_job(model: &BitNet, codec: &TextCodec, job: &Job) {
+fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
     let to_vec = |t: burn::tensor::Tensor<2>| t.into_data().try_to_vec::<f32>().expect("logits");
     let mut cache = model.new_cache();
     let mut sampler = Sampler::new(job.params.clone());
@@ -115,7 +187,7 @@ fn run_job(model: &BitNet, codec: &TextCodec, job: &Job) {
     let mut finish = "length";
     let max_stop = job.stop.iter().map(|s| s.len()).max().unwrap_or(0);
     while n < job.max_tokens {
-        if TextCodec::is_stop(next) {
+        if codec.is_stop(next) {
             finish = "stop";
             break;
         }
@@ -156,6 +228,7 @@ fn run_job(model: &BitNet, codec: &TextCodec, job: &Job) {
     if text.len() > sent {
         let _ = job.tx.send(Gen::Text(text[sent..].to_string()));
     }
+    model.after_request(&job.prompt);
     let _ = job.tx.send(Gen::Done {
         finish_reason: finish,
         prompt_tokens: job.prompt.len(),
@@ -371,20 +444,47 @@ fn main() -> Result<()> {
     }
     let t0 = Instant::now();
     let dev = Device::flex();
-    let model = BitNet::load(&args.model, &dev)?;
-    let codec = Arc::new(TextCodec::load(&args.model, model.cfg.bos_token_id)?);
-    let ctx = args.ctx.min(model.cfg.max_position_embeddings);
-    let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "bitnet".into()));
+    let is_gguf = args.model.extension().map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false);
+    let (jtx, jrx) = std_mpsc::channel::<Job>();
+    let (codec, ctx, model_id, kernel): (Arc<TextCodec>, usize, String, &'static str) = if is_gguf {
+        let mut model = lb_lfm2::Lfm2::load(&args.model, &dev)?;
+        let cfg = model.cfg().clone();
+        if let Some(dir) = &args.placement_from_scrapes {
+            let scrapes = lb_lfm2::moe::read_scrape_dir(dir)?;
+            let hist = lb_lfm2::moe::Histogram::from_scrapes("lfm2", cfg.n_layer, cfg.n_expert, &scrapes);
+            let bytes: Vec<usize> = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).collect();
+            model.placement = lb_lfm2::moe::Placement::plan(&hist, &bytes, args.gpu_budget_mb * 1_000_000);
+            eprintln!("placement: {} experts planned resident ({:.0} MB) from {} scrape files", model.placement.n_resident(), model.placement.resident_bytes as f64 / 1e6, scrapes.len());
+            if args.gpu {
+                let n = model.load_residents().map_err(|e| anyhow::anyhow!(e))?;
+                eprintln!("uploaded {n} experts ({:.0} MB) to the GPU", model.store.bytes as f64 / 1e6);
+            }
+        }
+        let dir = args.model.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let codec = Arc::new(TextCodec::load_with(&dir.join("tokenizer.json"), cfg.bos, ChatStyle::ChatMl, vec![cfg.eos])?);
+        let ctx = args.ctx.min(cfg.n_ctx);
+        let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "lfm2".into()));
+        let kernel = model.kernel_name();
+        let wc = codec.clone();
+        std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
+        (codec, ctx, model_id, kernel)
+    } else {
+        let model = BitNet::load(&args.model, &dev)?;
+        let codec = Arc::new(TextCodec::load(&args.model, model.cfg.bos_token_id)?);
+        let ctx = args.ctx.min(model.cfg.max_position_embeddings);
+        let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "bitnet".into()));
+        let kernel = model.kernel_name();
+        let wc = codec.clone();
+        std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
+        (codec, ctx, model_id, kernel)
+    };
     eprintln!(
         "lemonade-burn-server: loaded {} in {:.1}s (kernel {}, {} threads, ctx {ctx})",
         model_id,
         t0.elapsed().as_secs_f64(),
-        lb_ternary::Kernel::detect().name(),
+        kernel,
         rayon::current_num_threads()
     );
-    let (jtx, jrx) = std_mpsc::channel::<Job>();
-    let wc = codec.clone();
-    std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
     let state = Arc::new(AppState {
         model_id,
         ctx,
@@ -392,7 +492,7 @@ fn main() -> Result<()> {
         codec,
         jobs: jtx,
         started: now(),
-        kernel: lb_ternary::Kernel::detect().name(),
+        kernel,
         threads: rayon::current_num_threads(),
     });
     let app = Router::new()

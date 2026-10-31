@@ -14,7 +14,7 @@
 //! everything else is ordinary Burn tensor ops.
 
 use crate::config::Config;
-use crate::moe::{moe_ffn, Placement, PlacementStats, Scraper};
+use crate::moe::{moe_ffn, ExpertStore, Placement, PlacementStats, Scraper};
 use crate::weights::{Ffn, MatRef, Operator, Weights};
 use anyhow::Result;
 use burn::tensor::activation::{silu, softmax};
@@ -28,6 +28,8 @@ pub struct Lfm2 {
     pub w: Weights,
     pub device: Device,
     pub placement: Placement,
+    /// Experts made resident on the GPU from `placement` (see [`Lfm2::load_residents`]).
+    pub store: ExpertStore,
     pub stats: PlacementStats,
     pub scraper: Scraper,
     /// Wall time inside quantized matmuls (ns), for profiling.
@@ -55,10 +57,18 @@ impl Lfm2 {
             w,
             device: device.clone(),
             placement,
+            store: ExpertStore::default(),
             stats: PlacementStats::default(),
             scraper: Scraper::from_env(&model_id),
             matmul_ns: Default::default(),
         })
+    }
+
+    /// Upload the `Home::Gpu` experts of the current placement to the device
+    /// (`LB_WGPU_DEVICE`); needs the `gpu` feature. Returns how many were uploaded.
+    pub fn load_residents(&mut self) -> Result<usize, String> {
+        let Self { w, placement, store, .. } = self;
+        store.load(w, placement)
     }
 
     pub fn cfg(&self) -> &Config {
@@ -289,7 +299,7 @@ impl Lfm2 {
                 Ffn::Moe { router, bias, gate, up, down } => {
                     let hv = Self::to_vec(h2);
                     let t = Instant::now();
-                    let (out, routes) = moe_ffn(&self.w, router, bias, gate, up, down, &hv, m, &self.placement, li, &self.stats);
+                    let (out, routes) = moe_ffn(&self.w, router, bias, gate, up, down, &hv, m, &self.store, li, &self.stats);
                     self.matmul_ns.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     self.scraper.record(li, pos0, &routes);
                     self.from_vec(out, m, e)

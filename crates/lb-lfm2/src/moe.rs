@@ -17,6 +17,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+#[cfg(feature = "gpu")]
+mod cubecl_handle {
+    pub use lb_q4_gpu::cubecl_server::Handle;
+}
+
 /// Selected experts and their weights for one token.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Route {
@@ -137,12 +142,77 @@ impl Placement {
     }
 }
 
-/// Counters for the step-1 placement shadow: how many expert calls would have hit a
-/// GPU-resident expert versus the CPU path.
+/// Counters: expert calls that ran on (or, without the `gpu` feature, would have hit) a
+/// GPU-resident expert versus the CPU path, and time spent in each.
 #[derive(Default, Debug)]
 pub struct PlacementStats {
     pub gpu_hits: AtomicU64,
     pub cpu_calls: AtomicU64,
+    pub gpu_ns: AtomicU64,
+    pub cpu_ns: AtomicU64,
+}
+
+/// Experts resident on the GPU, keyed by (layer, expert). Empty without the `gpu` feature.
+#[derive(Default)]
+pub struct ExpertStore {
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<lb_q4_gpu::Gpu>,
+    #[cfg(feature = "gpu")]
+    pub resident: HashMap<(usize, usize), lb_q4_gpu::GpuExpert>,
+    pub bytes: usize,
+}
+
+impl ExpertStore {
+    pub fn is_resident(&self, layer: usize, expert: usize) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            return self.resident.contains_key(&(layer, expert));
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = (layer, expert);
+            false
+        }
+    }
+
+    pub fn n_resident(&self) -> usize {
+        #[cfg(feature = "gpu")]
+        {
+            return self.resident.len();
+        }
+        #[allow(unreachable_code)]
+        0
+    }
+
+    /// Upload every `Home::Gpu` expert of `placement` to the device chosen by
+    /// `LB_WGPU_DEVICE`. Returns the number uploaded. Without the `gpu` feature: an error.
+    #[cfg(feature = "gpu")]
+    pub fn load(&mut self, w: &Weights, placement: &Placement) -> Result<usize, String> {
+        use crate::weights::Ffn;
+        if self.gpu.is_none() {
+            self.gpu = Some(lb_q4_gpu::Gpu::open()?);
+        }
+        let gpu = self.gpu.as_ref().unwrap();
+        let mut n = 0;
+        for (l, layer) in w.layers.iter().enumerate() {
+            let Ffn::Moe { gate, up, down, .. } = &layer.ffn else { continue };
+            for e in 0..gate.n {
+                if placement.home(l, e) != Home::Gpu || self.resident.contains_key(&(l, e)) {
+                    continue;
+                }
+                let ex = lb_q4_gpu::GpuExpert::upload(gpu, w.mat(&gate.expert(e)), w.mat(&up.expert(e)), w.mat(&down.expert(e)))?;
+                self.bytes += ex.bytes_on_device();
+                self.resident.insert((l, e), ex);
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    pub fn load(&mut self, _w: &Weights, _placement: &Placement) -> Result<usize, String> {
+        Err("built without the `gpu` feature: experts cannot be made resident".to_string())
+    }
 }
 
 /// Executes an expert FFN for a batch of tokens. One SwiGLU expert:
@@ -175,7 +245,7 @@ pub fn moe_ffn(
     down: &ExpertMats,
     x: &[f32],
     m: usize,
-    placement: &Placement,
+    store: &ExpertStore,
     layer: usize,
     stats: &PlacementStats,
 ) -> (Vec<f32>, Vec<Route>) {
@@ -192,24 +262,58 @@ pub fn moe_ffn(
     }
     let mut experts: Vec<(usize, Vec<(usize, f32)>)> = by_expert.into_iter().collect();
     experts.sort_by_key(|(e, _)| *e);
-    for (e, _) in &experts {
-        match placement.home(layer, *e) {
-            Home::Gpu => stats.gpu_hits.fetch_add(1, Ordering::Relaxed),
-            Home::Cpu => stats.cpu_calls.fetch_add(1, Ordering::Relaxed),
+    let gather = |toks: &[(usize, f32)]| -> Vec<f32> {
+        let mut xs = Vec::with_capacity(toks.len() * n_embd);
+        for (t, _) in toks {
+            xs.extend_from_slice(&x[t * n_embd..(t + 1) * n_embd]);
+        }
+        xs
+    };
+    let (gpu_part, cpu_part): (Vec<_>, Vec<_>) = experts.into_iter().partition(|(e, _)| store.is_resident(layer, *e));
+    stats.gpu_hits.fetch_add(gpu_part.len() as u64, Ordering::Relaxed);
+    stats.cpu_calls.fetch_add(cpu_part.len() as u64, Ordering::Relaxed);
+
+    // Resident experts: launch everything first (asynchronous), read back after the CPU work.
+    #[cfg(feature = "gpu")]
+    let gpu_launched: Vec<(Vec<(usize, f32)>, (cubecl_handle::Handle, usize))> = {
+        let t = std::time::Instant::now();
+        let v = match store.gpu.as_ref() {
+            Some(gpu) => gpu_part
+                .iter()
+                .map(|(e, toks)| {
+                    let xh = gpu.upload_f32(&gather(toks));
+                    (toks.clone(), store.resident[&(layer, *e)].launch(gpu, &xh, toks.len()))
+                })
+                .collect(),
+            None => Vec::new(),
         };
-    }
-    let parts: Vec<(Vec<(usize, f32)>, Vec<f32>)> = experts
+        stats.gpu_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        v
+    };
+    #[cfg(not(feature = "gpu"))]
+    let _ = &gpu_part;
+
+    let t = std::time::Instant::now();
+    #[allow(unused_mut)]
+    let mut parts: Vec<(Vec<(usize, f32)>, Vec<f32>)> = cpu_part
         .into_par_iter()
         .map(|(e, toks)| {
-            let mut xs = Vec::with_capacity(toks.len() * n_embd);
-            for (t, _) in &toks {
-                xs.extend_from_slice(&x[t * n_embd..(t + 1) * n_embd]);
-            }
-            // Step 1: every home executes on the CPU path (the GPU path is the next layer).
+            let xs = gather(&toks);
             let y = expert_ffn(w, gate, up, down, e, &xs, toks.len());
             (toks, y)
         })
         .collect();
+    stats.cpu_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = store.gpu.as_ref() {
+        let t = std::time::Instant::now();
+        let (toks, hs): (Vec<_>, Vec<_>) = gpu_launched.into_iter().unzip();
+        let outs = gpu.read_all(hs).expect("GPU expert read");
+        parts.extend(toks.into_iter().zip(outs));
+        stats.gpu_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
     let mut out = vec![0f32; m * n_embd];
     for (toks, y) in parts {
         for (i, (t, wt)) in toks.iter().enumerate() {
@@ -220,6 +324,21 @@ pub fn moe_ffn(
         }
     }
     (out, routes)
+}
+
+/// Read every `run-*.json` scrape file in `dir` (unreadable files are skipped).
+pub fn read_scrape_dir(dir: &std::path::Path) -> std::io::Result<Vec<Scrape>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let p = e?.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("run-") && name.ends_with(".json") {
+            if let Ok(s) = serde_json::from_str::<Scrape>(&std::fs::read_to_string(&p)?) {
+                out.push(s);
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ---- NautiBurn routing scrape (schema_version 1) ----

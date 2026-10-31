@@ -42,21 +42,12 @@ struct Args {
     /// GPU byte budget for resident experts, in MB.
     #[arg(long, default_value_t = 0)]
     gpu_budget_mb: usize,
+    /// Actually upload the planned residents to the GPU (LB_WGPU_DEVICE) and run them there
+    /// (needs the `gpu` feature); without it the placement is only a counted shadow.
+    #[arg(long, default_value_t = false)]
+    gpu: bool,
 }
 
-fn read_scrapes(dir: &std::path::Path) -> Result<Vec<lb_lfm2::moe::Scrape>> {
-    let mut out = Vec::new();
-    for e in std::fs::read_dir(dir)? {
-        let p = e?.path();
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.starts_with("run-") && name.ends_with(".json") {
-            if let Ok(s) = serde_json::from_str::<lb_lfm2::moe::Scrape>(&std::fs::read_to_string(&p)?) {
-                out.push(s);
-            }
-        }
-    }
-    Ok(out)
-}
 
 fn oracle_tokenize(base: &str, text: &str) -> Result<Vec<u32>> {
     let r: Value = ureq::post(&format!("{base}/tokenize"))
@@ -93,14 +84,9 @@ fn main() -> Result<()> {
     let cfg = model.cfg().clone();
     if let Some(dir) = &args.placement_from_scrapes {
         use lb_lfm2::moe::{Histogram, Placement};
-        let scrapes = read_scrapes(dir)?;
+        let scrapes = lb_lfm2::moe::read_scrape_dir(dir)?;
         let hist = Histogram::from_scrapes("lfm2.5-24b-a2b", cfg.n_layer, cfg.n_expert, &scrapes);
-        let bytes_per_expert: Vec<usize> = (0..cfg.n_layer)
-            .map(|l| match &model.w.layers[l].ffn {
-                lb_lfm2::weights::Ffn::Moe { gate, up, down, .. } => gate.per_expert + up.per_expert + down.per_expert,
-                _ => 0,
-            })
-            .collect();
+        let bytes_per_expert: Vec<usize> = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).collect();
         model.placement = Placement::plan(&hist, &bytes_per_expert, args.gpu_budget_mb * 1_000_000);
         let seen: u64 = hist.counts.iter().flatten().sum();
         eprintln!(
@@ -111,6 +97,11 @@ fn main() -> Result<()> {
             model.placement.resident_bytes as f64 / 1e6,
             args.gpu_budget_mb
         );
+        if args.gpu {
+            let t = Instant::now();
+            let n = model.load_residents().map_err(|e| anyhow::anyhow!(e))?;
+            eprintln!("uploaded {n} experts ({:.0} MB) to the GPU in {:.1}s", model.store.bytes as f64 / 1e6, t.elapsed().as_secs_f32());
+        }
     }
     eprintln!(
         "loaded {} in {:.1}s: {} layers, {} experts x top-{}, attn layers {:?}",
@@ -186,10 +177,15 @@ fn main() -> Result<()> {
         100.0 * agree as f32 / total.max(1) as f32,
         total - args.prompts.len()
     );
+    let o = std::sync::atomic::Ordering::Relaxed;
     println!(
-        "placement shadow: {} expert calls would hit GPU residents, {} CPU (all executed on CPU in step 1)",
-        model.stats.gpu_hits.load(std::sync::atomic::Ordering::Relaxed),
-        model.stats.cpu_calls.load(std::sync::atomic::Ordering::Relaxed)
+        "placement: {} expert calls on GPU residents ({:.1}s), {} on CPU ({:.1}s); {} experts resident{}",
+        model.stats.gpu_hits.load(o),
+        model.stats.gpu_ns.load(o) as f64 / 1e9,
+        model.stats.cpu_calls.load(o),
+        model.stats.cpu_ns.load(o) as f64 / 1e9,
+        model.store.n_resident(),
+        if args.gpu { " (executed on the GPU)" } else { " (shadow only: all executed on CPU)" }
     );
     if let Some(p) = &args.report {
         std::fs::write(p, serde_json::to_string_pretty(&json!({ "model": args.model, "agree": agree, "total": total, "prompts": report }))?)?;

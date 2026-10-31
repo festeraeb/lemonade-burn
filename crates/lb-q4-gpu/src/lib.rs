@@ -9,6 +9,10 @@
 //! whole matrix is padded to a multiple of 4 bytes). The f16 scale is decoded in the
 //! kernel from its 16 bits (sign, 5-bit exponent, 10-bit mantissa; subnormals included).
 
+pub mod store;
+pub use store::{Gpu, GpuExpert, GpuQ4Mat};
+pub use cubecl::server as cubecl_server;
+
 use cubecl::prelude::*;
 use lb_gguf::QuantMat;
 use lb_ternary_gpu::pick_device;

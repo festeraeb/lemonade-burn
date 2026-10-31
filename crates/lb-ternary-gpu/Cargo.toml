@@ -5,9 +5,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Own workspace root: not a member of the lemonade-burn workspace (keeps wgpu out of the CPU build).
-[workspace]
 
 [dependencies]
 lb-ternary = { path = "../lb-ternary" }
-cubecl = { version = "=0.11.2", default-features = false, features = ["std", "wgpu"] }
+cubecl.workspace = true

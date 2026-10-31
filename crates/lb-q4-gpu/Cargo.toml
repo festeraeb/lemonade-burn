@@ -6,11 +6,9 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "Q4_0 (GGUF) dequant + matvec on the GPU with CubeCL (wgpu: Vulkan/DX12/Metal), checked against lb-gguf's CPU kernels"
 
-# Own workspace root, like lb-ternary-gpu: keeps wgpu out of the CPU build.
-[workspace]
 
 [dependencies]
-lb-gguf = { path = "../lb-gguf" }
+lb-gguf.workspace = true
 lb-ternary-gpu = { path = "../lb-ternary-gpu" }
-cubecl = { version = "=0.11.2", default-features = false, features = ["std", "wgpu"] }
+cubecl.workspace = true
 half = "2"

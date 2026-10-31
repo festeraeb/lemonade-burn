@@ -82,3 +82,35 @@ fn real_q4_0_rows_from_gguf_if_present() {
         assert!((g - e).abs() <= 1e-4 * (1.0 + e.abs()) + 1e-5 * cols as f32, "elem {i}: gpu {g} cpu {e}");
     }
 }
+
+/// A resident SwiGLU expert on the device must match the CPU composition
+/// `down(silu(gate x) * up x)` built from the same CPU reference matvecs.
+#[test]
+fn resident_expert_ffn_matches_cpu() {
+    use lb_q4_gpu::{Gpu, GpuExpert};
+    let (n_embd, n_ff, m) = (256usize, 192usize, 3usize);
+    let mut rng = Rng(11);
+    let mk = |rng: &mut Rng, rows: usize, cols: usize| -> Vec<u8> {
+        let wf: Vec<f32> = (0..rows * cols).map(|_| rng.unit()).collect();
+        wf.chunks_exact(cols).flat_map(|r| quantize_q4_0(r)).collect()
+    };
+    let (gb, ub, db) = (mk(&mut rng, n_ff, n_embd), mk(&mut rng, n_ff, n_embd), mk(&mut rng, n_embd, n_ff));
+    let gate = QuantMat::new(GgmlType::Q4_0, n_ff, n_embd, &gb);
+    let up = QuantMat::new(GgmlType::Q4_0, n_ff, n_embd, &ub);
+    let down = QuantMat::new(GgmlType::Q4_0, n_embd, n_ff, &db);
+    let x: Vec<f32> = (0..m * n_embd).map(|_| rng.unit()).collect();
+    let (mut g, mut u) = (vec![0f32; m * n_ff], vec![0f32; m * n_ff]);
+    matvec_f32(gate, &x, m, &mut g);
+    matvec_f32(up, &x, m, &mut u);
+    for (gi, ui) in g.iter_mut().zip(&u) {
+        *gi = *gi / (1.0 + (-*gi).exp()) * ui;
+    }
+    let mut want = vec![0f32; m * n_embd];
+    matvec_f32(down, &g, m, &mut want);
+    let gpu = Gpu::open().unwrap_or_else(|e| panic!("{e}"));
+    let e = GpuExpert::upload(&gpu, gate, up, down).unwrap();
+    let got = e.ffn(&gpu, &x, m).unwrap();
+    for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+        assert!((a - b).abs() <= 1e-3 * (1.0 + b.abs()), "elem {i}: gpu {a} cpu {b}");
+    }
+}

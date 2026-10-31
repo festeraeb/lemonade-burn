@@ -186,6 +186,14 @@ impl Weights {
         Ok(Self { gguf, cfg, layers, embd, final_norm })
     }
 
+    /// Bytes of one expert (gate + up + down) in `layer`, 0 for dense layers.
+    pub fn expert_bytes(&self, layer: usize) -> usize {
+        match &self.layers[layer].ffn {
+            Ffn::Moe { gate, up, down, .. } => gate.per_expert + up.per_expert + down.per_expert,
+            Ffn::Dense { .. } => 0,
+        }
+    }
+
     /// Dequantized embedding row of token `t`.
     pub fn embed_row(&self, t: u32, out: &mut [f32]) {
         self.mat(&self.embd).dequant_row(t as usize, out);
