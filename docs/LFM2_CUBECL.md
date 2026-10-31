@@ -1,6 +1,6 @@
 # LFM2.5-24B-A2B on our own engine (Burn + CubeCL)
 
-Status: **step 1 (correct forward pass) — see "Verification" for what was run and the numbers.**
+Status: **step 1 (correct forward pass) and step 2 (GPU-resident experts + serving) done; see §5 and §8 for what was run and the numbers.**
 Operator decision 2026-10-31: stop patching other people's engines; build our own MoE
 engine in Rust on Burn 0.22.1 / CubeCL 0.11.2 (one kernel source for Vulkan, CUDA, ROCm,
 Metal, DX12), and use the NautiBurn routing scrapes to place experts.
@@ -179,14 +179,92 @@ Seeds proven first: the seeded tests compile, and on c3 they fail only on the st
 The check script runs the crate's tests on cesarops3's WX 5100 over the NFS view of the
 verify worktree; t440's GPUs are never touched.
 
-## 7. What is left for step 2
+## 7. Step-2 work (2026-10-31, same day)
 
-* GPU execution of resident experts (`Home::Gpu`) with the CubeCL kernels; device
-  buffers per expert, uploaded at load from the placement; CPU fallback stays.
-* Prefetch loop with `nautiburn-shadow` predictions; measure hit rate and time hidden.
-* Q6_K kernel for the head; multi-token GEMM for prefill; attention on the GPU.
-* Own BPE tokenizer from the GGUF vocab (`tokenizer.ggml.*`, pre-tokenizer `lfm2`).
-* Serving: `lb-server` model trait so it can host `Lfm2` as well as BitNet; Lemonade
-  adapter entry.
-* Speed: the step-1 CPU path is a correctness reference (f32 activations, scalar
-  dequant), not a fast path.
+* `lb-q4-gpu::store`: `Gpu` (client for `LB_WGPU_DEVICE`), `GpuQ4Mat` (a Q4_0 matrix
+  uploaded once), `GpuExpert` (gate, up, `silu(g)*u` kernel, down; intermediates stay on
+  the device), batched read-back. Test `resident_expert_ffn_matches_cpu`.
+* `lb-lfm2` feature `gpu`: `ExpertStore::load` uploads every `Home::Gpu` expert of the
+  placement; `moe_ffn` launches the resident experts first (asynchronous), runs the
+  non-resident ones on the CPU meanwhile, then reads the GPU batch back with one sync per
+  layer. Without the feature the placement stays a counted shadow.
+* `lb-server`: a `Decoder` trait (BitNet and `Lfm2`); `--model x.gguf` serves LFM2 with
+  `tokenizer.json` beside the file (LiquidAI's, loaded by the `tokenizers` crate; ChatML
+  rendering, eos stop), `--placement-from-scrapes DIR --gpu-budget-mb N --gpu`, scrape
+  flush after each request. Lemonade adapter spec:
+  lemonade-engine-adapters `engines/lemonade-burn-lfm2.json` (`make-adapter --check` passes).
+* Workspace: the GPU crates are members; `default-members` keep `cargo build` CPU-only;
+  `--features gpu` on `lb-lfm2` / `lb-server` links wgpu.
+
+## 8. Step-2 results **[measured 2026-10-31]**
+
+Card: **cesarops4's GeForce GTX 1070 (8 GB, wgpu `discrete:2`, Vulkan on NVIDIA)**, which
+also makes this the cross-vendor check (step 0/1 kernels: AMD Polaris; here: NVIDIA
+Pascal). Why not c3's WX 5100: its VRAM is 7.94 of 8 GB taken by the c3 LFM2.5 Lemonade
+seat itself (pid 1304825 holds renderD130), so a resident store there would evict the
+phone's seat; the 1070 was idle with 5.9 GB free (a 2.2 GB qwen2.5-coder seat stays on
+it, untouched). c4 ran at load average 20-25 (forge coders) during all runs; our runs used
+32 rayon threads of 80.
+
+* Kernel tests on the 1070: `lb-q4-gpu` **6/6** (Q4_0 shapes, the real expert matrix, the
+  resident expert FFN).
+* Parity: `lfm2-check` with `--gpu --gpu-budget-mb 4000` versus the same binary CPU-only,
+  3 prompts, 86 positions: the GPU path's top-1 equals the CPU path's top-1 **at every
+  position** (diff of the per-position tables is empty), both 75/86 vs the oracle with the
+  same 11 near-tie disagreements as on t440, and identical greedy continuations of 16
+  tokens (e.g. " Berlin. The capital of Italy is Rome. The capital of Spain is Madrid.").
+  Raw: `/data/lfm2-scrapes/c4-out/{gpu2,cpu2}.txt` on t440.
+* Residency: 753 of 2432 experts (3997 MB) from the 177-file histogram; upload 86 s cold
+  (NFS), 3.6 s warm. **5868 of 11273 expert calls (52.1%) ran on the GPU.**
+* Speed (warm page cache, same prompts):
+
+| path | prompt 29 tok | prompt 44 tok | prompt 13 tok | decode (16 steps, 3 prompts) |
+|---|---|---|---|---|
+| CPU only, 32 threads | 4.1 s | 5.9 s | 1.9 s | 5.28 / 4.94 / 4.64 tok/s |
+| GPU residents (1070) + CPU rest | 4.5 s | 4.9 s | 1.7 s | 1.76 / 2.45 / 3.22 tok/s |
+
+  Served through `lemonade-burn-server` (`/v1/chat/completions`, 34-token ChatML prompt,
+  120 completion tokens, identical text from both modes): CPU-only 7.9 tok/s prompt,
+  **3.79 tok/s decode**; GPU residents **1.86 tok/s decode** (prompt 2.87 tok/s).
+* Verdict, honestly: **GPU execution is correct end to end but slower than 32 Xeon
+  threads.** The expert-call cost on the GPU path was 10.1 s for 5868 calls = 1.7 ms per
+  call (2.8 ms cold), overhead-bound: the matvec kernel runs ONE thread per output row
+  (1536 threads for a 1536x2048 matrix, each looping 64 blocks serially), plus an
+  activation upload and 4 launches per expert and one read-back sync per layer (38 per
+  decode token). Forge job **LB-Q4GPU-V2** (queued) rewrites the kernel as one 64-thread
+  workgroup per output element with a shared-memory reduction; the per-layer sync and the
+  per-expert upload are step-3 engine work (one upload per layer, one output buffer per
+  layer). The resident-hit rate (52% with 4 GB; 66.5% shadow with 6 GB) says the
+  placement idea holds; the kernel does not yet.
+
+## 9. Serving round trip **[measured 2026-10-31, cesarops4]**
+
+`lemonade-burn-server --model LFM2.5-24B-A2B-QAD-Q4_0.gguf --placement-from-scrapes
+/mnt/t440/data/lfm2-scrapes --gpu-budget-mb 4000 --gpu` (LB_WGPU_DEVICE=discrete:2),
+`/v1/models` lists `LFM2.5-24B-A2B-QAD-Q4_0` owned by `lemonade-burn`; POST
+`/v1/chat/completions` with "In two sentences, what does side-scan sonar show a search
+team, and why does a wreck cast a shadow?" (temperature 0, max_tokens 120) answered:
+
+> `<think>`We need to answer: ... Must be concise. Ensure two sentences.`</think>`Side-scan
+> sonar displays the seafloor and any objects on it as contrasting bright or
+
+(cut by max_tokens; the model reasons first, LFM2.5 style). Same text from the CPU-only
+server. Scrape files were written to `NAUTIBURN_SCRAPE_DIR` by the server after each
+request. Raw: `/data/lfm2-scrapes/c4-out/serve-{gpu,cpu}.json`.
+
+## 10. What is left for step 3
+
+* Kernel speed: LB-Q4GPU-V2 (forge, queued) workgroup-per-output matvec; then one
+  activation upload per layer, one output buffer per layer, no per-expert read-back;
+  multi-token GEMM tile for prefill; attention and the dense/conv matmuls on the GPU
+  (today only experts run there); Q6_K head kernel (forge LB-Q6KGPU, running) and Q8_0
+  (LB-Q8GPU, running).
+* Prefetch: feed `Scraper::record`'s per-layer routes to `nautiburn-shadow prepredict`
+  and copy predicted non-resident experts while the current layer computes; measure
+  hit rate and hidden time.
+* Native BPE tokenizer from the GGUF vocab (served path uses LiquidAI's
+  `tokenizer.json` via the `tokenizers` crate; the harness uses the oracle's
+  `/tokenize`); the LFM2.5 chat template beyond plain ChatML (tools, thinking control).
+* Lemonade: load through the generated `burnlfm2` backend (spec checked, not loaded).
+* c3: a resident store on the WX 5100 needs the LFM2.5 Lemonade seat moved off that
+  card or a budget under its free VRAM.
