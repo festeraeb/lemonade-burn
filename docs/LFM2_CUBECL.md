@@ -126,11 +126,58 @@ path (conv state + KV cache) greedily and prints the text.
 
 See the per-position tables in `docs/lfm2-check-2026-10-31.txt` (raw harness output).
 
-(filled in below once the runs finish)
+All **[measured]** 2026-10-31 on t440, CPU path (48 threads, f32 activations), model
+`LFM2.5-24B-A2B-QAD-Q4_0.gguf`, oracle `llama-server --device none` on the same file.
+
+* Loader: `lb-gguf` tests pass, including the real-file test that matches gguf-py's
+  dequantize on Q6_K and F32 rows (7 tests).
+* Q4_0 GPU kernel: `lb-q4-gpu` 5/5 on **cesarops3's Radeon Pro WX 5100** (RADV Vulkan,
+  `LB_WGPU_DEVICE=discrete:1`), including a real expert matrix (`blk.2.ffn_gate_exps`,
+  expert 0, 1536x2048, two tokens) against the CPU reference.
+* Teacher-forced top-1 agreement with the oracle (per position tables in
+  `docs/lfm2-check-2026-10-31.txt`):
+
+| run | prompt | positions | ours == oracle | ours == true next | oracle == true next |
+|---|---|---|---|---|---|
+| A | "The capital of France is Paris. The capital of Germany is" | 13 | 12 | 8/12 | 9/12 |
+| B1 | SAR / side-scan sonar sentence | 29 | 25 | | |
+| B2 | a Rust `fn main` snippet (with literal `\n`) | 49 | 46 | | |
+| B3 | chat-template question (boiling point) | 23 | 23 | | |
+| B4 | shipwreck survey notes | 44 | 39 | | |
+| B total | | 145 | **133 (91.7%)** | 59/141 | 60/141 |
+| C | "The sonar operator marked the target at 31 m and the dive team" (placement run) | 16 | 13 | 5/15 | 4/15 |
+
+Our engine predicts the real next token as often as llama.cpp does (59 vs 60 of 141);
+the disagreements are near-ties that flip between our f32-activation matmul and
+llama.cpp's int8-activation Q4_0 dot (e.g. run B1 pos 7: ours " Michigan" = truth, oracle
+" found"). Greedy continuations from our decode path (conv state + KV cache): run A
+" Berlin. The capital of Italy"; B1 " the kayak was found at a depth"; B3
+"<think>\nWe need to answer: \""; B4 " seabed was mostly sand with some gravel".
+
+Speed on this path: 2-4 s per prompt token (about 56 s for 29 tokens, 69 s for 49),
+nearly all of it in the scalar dequant matmuls; it is the reference, not the product.
+
+* Placement shadow (run C): histogram from 177 scrape files (55,472 expert activations:
+  this engine's own scrapes plus the oracle's NautiBurn hook output from runs A/B), budget
+  6000 MB: 1130 of 2432 experts resident (5999 MB); on a fresh prompt **730 of 1097 expert
+  calls (66.5%) would hit a GPU-resident expert**, 367 would take the CPU path. With more
+  scrape data the hit rate should rise; this is the number to beat with prefetch.
+* Scraper: every run wrote `run-<epoch>-<seq>.json` (schema_version 1) with
+  `NAUTIBURN_SCRAPE_DIR` set; the files were read back by `Histogram::from_scrapes`.
 
 ## 6. Forge jobs queued
 
-(filled in below)
+Seeds proven first: the seeded tests compile, and on c3 they fail only on the stub
+(`q6_k_matvec_gpu: not implemented yet`) while the Q4_0 tests pass
+(`forge-pool/checks/lb_gpu_kernel.sh q6k_matches_scalar`, 2026-10-31).
+
+| job | spec | files | check |
+|---|---|---|---|
+| LB-Q8GPU | `forge-pool/specs/LB-Q8GPU.json` | `crates/lb-q4-gpu/src/lib.rs` (`q8_0_matvec_gpu`) | `lb_gpu_kernel.sh q8_0_matches_scalar` on c3 |
+| LB-Q6KGPU | `forge-pool/specs/LB-Q6KGPU.json` | `crates/lb-q4-gpu/src/lib.rs` (`q6_k_matvec_gpu`) | `lb_gpu_kernel.sh q6k_matches_scalar` on c3 |
+
+The check script runs the crate's tests on cesarops3's WX 5100 over the NFS view of the
+verify worktree; t440's GPUs are never touched.
 
 ## 7. What is left for step 2
 
