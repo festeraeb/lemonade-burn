@@ -254,6 +254,22 @@ request. Raw: `/data/lfm2-scrapes/c4-out/serve-{gpu,cpu}.json`.
 
 ## 10. What is left for step 3
 
+**Step 3, start here.** Branch `lfm2-cubecl` (PR #1, unmerged) serves LFM2.5 correctly on
+CPU and with GPU-resident experts; only speed is missing. First fold in the forge kernels
+when their checks pass (`/data/forge-pool/done/LB-Q4GPU-V2*`, `LB-Q8GPU*`, `LB-Q6KGPU*`;
+their branches are in the repo, tests in `crates/lb-q4-gpu/tests/`), rebuild on c4 with
+`CARGO_TARGET_DIR=~/cargo-target/lb-gpu cargo build --release -p lb-lfm2 -p lb-server
+--features gpu` from the NFS view `/mnt/t440/codebase/repos/lemonade-burn`, and re-measure
+with `/data/lfm2-scrapes/c4-rerun.sh` (GPU vs CPU harness, needs the t440 oracle:
+`llama-server --device none --host 10.44.0.10 --port 18080` on the same GGUF with
+`CUDA_VISIBLE_DEVICES=`) and `/data/lfm2-scrapes/c4-serve.sh` (served tok/s). Then, in
+`lb_lfm2::moe::moe_ffn` and `lb_q4_gpu::store`, upload the layer's activations once and
+give each layer one output buffer so an expert call is launches only (no per-expert
+upload or read-back); then the items below in order. The rules stay: clean room, no t440
+GPUs, do not evict seats (c3's WX 5100 is held by the LFM2.5 Lemonade seat), scratch in
+the session scratchpad, commit as you go on this branch.
+
+
 * Kernel speed: LB-Q4GPU-V2 (forge, queued) workgroup-per-output matvec; then one
   activation upload per layer, one output buffer per layer, no per-expert read-back;
   multi-token GEMM tile for prefill; attention and the dense/conv matmuls on the GPU
