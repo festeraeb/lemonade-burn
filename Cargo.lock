@@ -3847,6 +3847,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-gguf"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "memmap2",
+ "rayon",
+]
+
+[[package]]
+name = "lb-lfm2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "burn",
+ "burn-flex",
+ "clap",
+ "lb-gguf",
+ "rayon",
+ "serde",
+ "serde_json",
+ "ureq 2.12.1",
+]
+
+[[package]]
 name = "lb-model"
 version = "0.1.0"
 dependencies = [
