@@ -35,6 +35,27 @@ struct Args {
     /// Write a JSON report here.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Directory of NautiBurn scrape files (`run-*.json`) to build the routing histogram
+    /// from; with `--gpu-budget-mb` this plans the expert placement (shadow only in step 1).
+    #[arg(long)]
+    placement_from_scrapes: Option<PathBuf>,
+    /// GPU byte budget for resident experts, in MB.
+    #[arg(long, default_value_t = 0)]
+    gpu_budget_mb: usize,
+}
+
+fn read_scrapes(dir: &std::path::Path) -> Result<Vec<lb_lfm2::moe::Scrape>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let p = e?.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("run-") && name.ends_with(".json") {
+            if let Ok(s) = serde_json::from_str::<lb_lfm2::moe::Scrape>(&std::fs::read_to_string(&p)?) {
+                out.push(s);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn oracle_tokenize(base: &str, text: &str) -> Result<Vec<u32>> {
@@ -68,8 +89,29 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let device = Device::default();
     let t0 = Instant::now();
-    let model = Lfm2::load(&args.model, &device)?;
+    let mut model = Lfm2::load(&args.model, &device)?;
     let cfg = model.cfg().clone();
+    if let Some(dir) = &args.placement_from_scrapes {
+        use lb_lfm2::moe::{Histogram, Placement};
+        let scrapes = read_scrapes(dir)?;
+        let hist = Histogram::from_scrapes("lfm2.5-24b-a2b", cfg.n_layer, cfg.n_expert, &scrapes);
+        let bytes_per_expert: Vec<usize> = (0..cfg.n_layer)
+            .map(|l| match &model.w.layers[l].ffn {
+                lb_lfm2::weights::Ffn::Moe { gate, up, down, .. } => gate.per_expert + up.per_expert + down.per_expert,
+                _ => 0,
+            })
+            .collect();
+        model.placement = Placement::plan(&hist, &bytes_per_expert, args.gpu_budget_mb * 1_000_000);
+        let seen: u64 = hist.counts.iter().flatten().sum();
+        eprintln!(
+            "placement from {} scrape files ({seen} expert activations): {} of {} experts GPU-resident in {:.0} MB (budget {} MB)",
+            scrapes.len(),
+            model.placement.n_resident(),
+            cfg.n_layer.saturating_sub(cfg.n_dense_lead) * cfg.n_expert,
+            model.placement.resident_bytes as f64 / 1e6,
+            args.gpu_budget_mb
+        );
+    }
     eprintln!(
         "loaded {} in {:.1}s: {} layers, {} experts x top-{}, attn layers {:?}",
         args.model.display(),

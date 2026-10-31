@@ -112,3 +112,28 @@ pub fn q4_0_matvec_gpu(w: QuantMat<'_>, x: &[f32], m: usize) -> Result<Vec<f32>,
     let out = client.read_one(o_h).map_err(|e| format!("GPU read failed: {e:?}"))?;
     Ok(f32::from_bytes(&out).to_vec())
 }
+
+// ---- Seeds for forge lanes (bodies to be written; tests in tests/q6k_matches_scalar.rs and
+// tests/q8_0_matches_scalar.rs are `#[ignore]` until then: run with `--include-ignored`
+// on a GPU host, never on t440). ----
+
+/// Q8_0 matvec on the GPU: blocks of 32 values, f16 scale `d` then 32 signed bytes
+/// (`value = d * q`), row bytes `cols / 32 * 34`. Same contract as [`q4_0_matvec_gpu`].
+pub fn q8_0_matvec_gpu(w: QuantMat<'_>, x: &[f32], m: usize) -> Result<Vec<f32>, String> {
+    if w.ty != lb_gguf::GgmlType::Q8_0 {
+        return Err(format!("expected Q8_0, got {}", w.ty.name()));
+    }
+    let _ = (x, m);
+    Err("q8_0_matvec_gpu: not implemented yet (forge seed)".to_string())
+}
+
+/// Q6_K matvec on the GPU: super-blocks of 256 values, 210 bytes (`ql[128]`, `qh[64]`,
+/// `scales[16]` i8, `d` f16); see `lb_gguf::types::dequant_q6_k_block` for the exact
+/// bit layout. Row bytes `cols / 256 * 210`. Same contract as [`q4_0_matvec_gpu`].
+pub fn q6_k_matvec_gpu(w: QuantMat<'_>, x: &[f32], m: usize) -> Result<Vec<f32>, String> {
+    if w.ty != lb_gguf::GgmlType::Q6K {
+        return Err(format!("expected Q6_K, got {}", w.ty.name()));
+    }
+    let _ = (x, m);
+    Err("q6_k_matvec_gpu: not implemented yet (forge seed)".to_string())
+}
