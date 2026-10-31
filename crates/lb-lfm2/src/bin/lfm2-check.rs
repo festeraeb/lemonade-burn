@@ -158,8 +158,10 @@ fn main() -> Result<()> {
             rows.push(json!({ "pos": i, "ours": ours[i], "oracle": orc, "truth": truth, "agree": ok }));
         }
         let mut gen = Vec::new();
+        let mut decode_s = 0f32;
         if args.generate > 0 {
             let mut next = ours[n - 1];
+            let t = Instant::now();
             for _ in 0..args.generate {
                 gen.push(next);
                 let l = model.forward(&[next], &mut cache, false);
@@ -168,9 +170,15 @@ fn main() -> Result<()> {
                     break;
                 }
             }
-            println!("ours greedy: {:?}", oracle_detokenize(&args.oracle, &gen).unwrap_or_default());
+            decode_s = t.elapsed().as_secs_f32();
+            println!(
+                "ours greedy: {:?}  ({} decode steps in {decode_s:.1}s = {:.2} tok/s)",
+                oracle_detokenize(&args.oracle, &gen).unwrap_or_default(),
+                gen.len(),
+                gen.len() as f32 / decode_s.max(1e-6)
+            );
         }
-        report.push(json!({ "prompt": prompt, "tokens": ids, "forward_s": dt, "positions": rows, "generated": gen }));
+        report.push(json!({ "prompt": prompt, "tokens": ids, "forward_s": dt, "decode_s": decode_s, "positions": rows, "generated": gen }));
     }
     println!(
         "\nagreement ours==oracle: {agree}/{total} ({:.1}%); ours==truth {agree_truth}, oracle==truth {oracle_truth} (of {} with a next token)",
