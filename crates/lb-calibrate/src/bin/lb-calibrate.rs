@@ -63,6 +63,12 @@ enum Cmd {
         holdout_every: usize,
         #[arg(long = "hypothetical")]
         hypothetical: Vec<String>,
+        /// Where the dense part runs: gpu (default) or cpu (activations visit the host every layer).
+        #[arg(long, default_value = "gpu")]
+        dense: String,
+        /// Use only this card index from the --bench/--hypothetical list as the single card.
+        #[arg(long)]
+        card: Option<usize>,
     },
 }
 
@@ -121,9 +127,13 @@ fn main() -> Result<()> {
                 eprintln!("wrote {}", p.display());
             }
         }
-        Cmd::Sweep { benches, scrapes, budgets, k, cards: n, n_layer, n_expert, holdout_every, hypothetical } => {
-            let (cards, host) = load_all(&benches, &hypothetical)?;
-            let budgets_mb = budgets_for(&cards, &budgets);
+        Cmd::Sweep { benches, scrapes, budgets, k, cards: n, n_layer, n_expert, holdout_every, hypothetical, dense, card } => {
+            let (mut cards, host) = load_all(&benches, &hypothetical)?;
+            let mut budgets_mb = budgets_for(&cards, &budgets);
+            if let Some(ci) = card {
+                cards = vec![cards[ci].clone()];
+                budgets_mb = vec![budgets_mb[ci]];
+            }
             let trace = Trace::load_dir(&scrapes, n_layer, n_expert)?;
             let (train, test) = trace.split(holdout_every);
             let hist = train.histogram();
@@ -135,6 +145,7 @@ fn main() -> Result<()> {
             let mut cfg = SimConfig::single_card(cards[0].clone(), host, slots_for(budgets_mb[0]), k);
             cfg.cards = cards[..n].to_vec();
             cfg.slots = budgets_mb[..n].iter().map(|&b| slots_for(b)).collect();
+            cfg.dense_on_gpu = dense != "cpu";
             let staged = top_k(&hist, k);
             for mp in [MissPolicy::Cpu, MissPolicy::Best] {
                 cfg.miss_policy = mp;
