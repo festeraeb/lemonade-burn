@@ -152,6 +152,19 @@ pub struct PlacementStats {
     pub cpu_ns: AtomicU64,
 }
 
+impl PlacementStats {
+    /// `(gpu_hits, cpu_calls, gpu_s, cpu_s, hit_rate)`. `hit_rate` is the share of expert
+    /// calls the residency plan actually caught; a plan that covers few of the experts the
+    /// router asks for leaves the CPU on the critical path however fast the GPU kernel is,
+    /// so this is the number to read before optimizing the kernel again.
+    pub fn snapshot(&self) -> (u64, u64, f64, f64, f64) {
+        let o = Ordering::Relaxed;
+        let (hits, calls) = (self.gpu_hits.load(o), self.cpu_calls.load(o));
+        let total = hits + calls;
+        (hits, calls, self.gpu_ns.load(o) as f64 / 1e9, self.cpu_ns.load(o) as f64 / 1e9, if total == 0 { 0.0 } else { hits as f64 / total as f64 })
+    }
+}
+
 /// Experts resident on the GPU, keyed by (layer, expert). Empty without the `gpu` feature.
 #[derive(Default)]
 pub struct ExpertStore {

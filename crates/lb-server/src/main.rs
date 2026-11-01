@@ -95,6 +95,8 @@ struct AppState {
     started: u64,
     kernel: &'static str,
     threads: usize,
+    /// LFM2 only: the live expert-placement counters, shared with the model thread.
+    placement: Option<Arc<lb_lfm2::moe::PlacementStats>>,
 }
 
 fn now() -> u64 {
@@ -429,6 +431,20 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"status": "ok", "runtime": RUNTIME_NAME, "version": env!("CARGO_PKG_VERSION"), "model": st.model_id, "model_loaded": st.model_id}))
 }
 
+/// Where the expert calls went since start: how many the GPU residents caught, how many
+/// fell through to the CPU, and the wall time each side cost. Cumulative, not per request.
+async fn placement_stats(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let Some(s) = st.placement.as_ref() else {
+        return Json(json!({"placement": "none (not an LFM2 model)"}));
+    };
+    let (hits, calls, gpu_s, cpu_s, rate) = s.snapshot();
+    Json(json!({
+        "schema": "lemonade-burn.placement.v1",
+        "gpu_hits": hits, "cpu_calls": calls, "gpu_hit_rate": rate,
+        "gpu_s": gpu_s, "cpu_s": cpu_s
+    }))
+}
+
 async fn topology(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "schema": "lemonade-burn.topology.v1",
@@ -446,7 +462,8 @@ fn main() -> Result<()> {
     let dev = Device::flex();
     let is_gguf = args.model.extension().map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false);
     let (jtx, jrx) = std_mpsc::channel::<Job>();
-    let (codec, ctx, model_id, kernel): (Arc<TextCodec>, usize, String, &'static str) = if is_gguf {
+    type Loaded = (Arc<TextCodec>, usize, String, &'static str, Option<Arc<lb_lfm2::moe::PlacementStats>>);
+    let (codec, ctx, model_id, kernel, placement): Loaded = if is_gguf {
         let mut model = lb_lfm2::Lfm2::load(&args.model, &dev)?;
         let cfg = model.cfg().clone();
         if let Some(dir) = &args.placement_from_scrapes {
@@ -465,9 +482,10 @@ fn main() -> Result<()> {
         let ctx = args.ctx.min(cfg.n_ctx);
         let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "lfm2".into()));
         let kernel = model.kernel_name();
+        let stats = model.stats.clone();
         let wc = codec.clone();
         std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
-        (codec, ctx, model_id, kernel)
+        (codec, ctx, model_id, kernel, Some(stats))
     } else {
         let model = BitNet::load(&args.model, &dev)?;
         let codec = Arc::new(TextCodec::load(&args.model, model.cfg.bos_token_id)?);
@@ -476,7 +494,7 @@ fn main() -> Result<()> {
         let kernel = model.kernel_name();
         let wc = codec.clone();
         std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
-        (codec, ctx, model_id, kernel)
+        (codec, ctx, model_id, kernel, None)
     };
     eprintln!(
         "lemonade-burn-server: loaded {} in {:.1}s (kernel {}, {} threads, ctx {ctx})",
@@ -494,9 +512,11 @@ fn main() -> Result<()> {
         started: now(),
         kernel,
         threads: rayon::current_num_threads(),
+        placement,
     });
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/placement", get(placement_stats))
         .route("/v1/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))

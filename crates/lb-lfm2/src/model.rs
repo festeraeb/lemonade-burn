@@ -30,7 +30,9 @@ pub struct Lfm2 {
     pub placement: Placement,
     /// Experts made resident on the GPU from `placement` (see [`Lfm2::load_residents`]).
     pub store: ExpertStore,
-    pub stats: PlacementStats,
+    /// Shared so a host (the server) can read the counters while the model runs on its
+    /// own thread: this is the only view of where a token's time actually went.
+    pub stats: Arc<PlacementStats>,
     pub scraper: Scraper,
     /// Wall time inside quantized matmuls (ns), for profiling.
     pub matmul_ns: std::sync::atomic::AtomicU64,
@@ -58,7 +60,7 @@ impl Lfm2 {
             device: device.clone(),
             placement,
             store: ExpertStore::default(),
-            stats: PlacementStats::default(),
+            stats: Arc::new(PlacementStats::default()),
             scraper: Scraper::from_env(&model_id),
             matmul_ns: Default::default(),
         })
