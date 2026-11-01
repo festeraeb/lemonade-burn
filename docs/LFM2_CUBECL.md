@@ -272,9 +272,9 @@ the session scratchpad, commit as you go on this branch.
 
 * Kernel speed: LB-Q4GPU-V2 (forge, queued) workgroup-per-output matvec; then one
   activation upload per layer, one output buffer per layer, no per-expert read-back;
-  multi-token GEMM tile for prefill; attention and the dense/conv matmuls on the GPU
-  (today only experts run there); Q6_K head kernel (forge LB-Q6KGPU, running) and Q8_0
-  (LB-Q8GPU, running).
+  multi-token GEMM tile for prefill; ~~attention and the dense/conv matmuls on the GPU
+  (today only experts run there); Q6_K head kernel (forge LB-Q6KGPU, running)~~ **both
+  done 2026-11-01, see §11**; Q8_0 (LB-Q8GPU, running).
 * Prefetch: feed `Scraper::record`'s per-layer routes to `nautiburn-shadow prepredict`
   and copy predicted non-resident experts while the current layer computes; measure
   hit rate and hidden time.
@@ -284,3 +284,71 @@ the session scratchpad, commit as you go on this branch.
 * Lemonade: load through the generated `burnlfm2` backend (spec checked, not loaded).
 * c3: a resident store on the WX 5100 needs the LFM2.5 Lemonade seat moved off that
   card or a budget under its free VRAM.
+
+## 11. The dense path on the device **[measured 2026-11-01, t440 P100]**
+
+Step 2 made every expert resident and bought almost nothing end to end (1.11-1.26x, below
+our 1.5x bar). The reason was not the expert work: a decode token is only ~13% experts. The
+other ~87% was the **dense** matmuls, all still on the CPU reference kernels.
+
+A decode step runs 106 dense matvecs plus the tied head:
+
+```text
+30 short-conv layers:  in_proj [6144, 2048]   out_proj [2048, 2048]
+10 attention layers:   q, o [2048, 2048]      k, v [512, 2048]
+ 2 leading dense FFNs: gate, up [11776, 2048] down [2048, 11776]
+ 1 tied head:          token_embd [128000, 2048] Q6_K
+```
+
+`DenseStore` (`crates/lb-lfm2/src/dense.rs`) uploads them once, keyed by GGUF byte offset;
+`Lfm2::linear` uses the device copy when there is one. 751 MB (423 Q4_0 + 328 for the
+repacked head), so 13.7 GB of a 16 GB card alongside the 2432 experts. Enable with
+`--gpu --gpu-dense-mb 900`.
+
+### Why it was worth doing: `cargo run --release -p lb-q4-gpu --example dense_bench`
+
+| | CPU | device | |
+|---|---|---|---|
+| round trip (32x32 matvec) | | 0.26-0.31 ms | the floor, not 1 ms |
+| dense Q4_0, 106 matvecs | 273-316 ms | 22.7-27.6 ms | ~10x |
+| Q6_K tied head | 54.1 ms | 1.63 ms | 33x |
+
+Every shape lands within noise of the round-trip floor, i.e. the kernels are already free
+and what remains is sync count, not arithmetic.
+
+### End to end: `scratchpad/ab.sh`, interleaved A/B/A/B on one card
+
+This box runs photogrammetry and a llama-server at load 70-105, so sequential arms are not
+comparable (the CPU arm alone varied 2.1x between rounds). Arms were interleaved on the same
+card. 20 reps, medians of `timings.predicted_per_second`:
+
+| | tok/s | spread | vs CPU arm | decode ms/token |
+|---|---|---|---|---|
+| dense on the CPU | 1.822 | 2.14x | — | ~860-1040 (all passes) |
+| dense Q4_0 resident | 4.815 | 1.24x | **2.64x** | ~241-246 (all passes) |
+| + Q6_K head | 7.06 | 1.13x | **3.87x** | **142.9** |
+
+Prefill on the same prompt: 4.0 s -> 0.86 s. **Every rep of every arm returned byte-identical
+greedy text** (sha 062392b8d2b0361a) — the correctness gate, passed before any speed number
+was taken seriously. The spread column matters too: off the contended CPU the engine is three
+times more predictable.
+
+### Correction to §10's premise
+
+`Timings` (reported by `/v1/placement`, decode passes counted apart from prefill) says the
+non-matmul tensor work — attention, softmax, RoPE, residuals, norms — is **8.7 ms of a
+142.9 ms decode token**. The earlier reading, that 87% of a token was "attention, the
+short-conv operator, the dense FFN and the head", mis-attributed it: ~94-98% of a token is
+quantized matmuls and the operators around them are nearly free. The fix it pointed to
+happened to be the right one, for a simpler reason.
+
+### What the numbers now point at
+
+134 ms of the 142.9 ms decode token is matmul, but the device arithmetic inside it is a small
+fraction of that. A token makes about **145 host syncs** — 107 dense matrices plus 38 expert
+layers — and under this load each costs roughly 1 ms against the 0.26-0.31 ms idle floor.
+So the next lever is **syncing once per layer instead of once per matrix** (keep a layer's
+activations and intermediates on the device: in_proj -> conv -> out_proj is 2 syncs, q/k/v
+batched then o is 2, gate/up batched then down is 2), not faster kernels. Multi-card
+residency and more scrape runs are no longer on the critical path: all 2432 experts are
+resident and the hit rate is 1.0.
