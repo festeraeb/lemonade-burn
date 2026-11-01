@@ -14,7 +14,10 @@ CMPS="$OUT/compare-$STAMP.tsv"
 printf 'file\tarch\tmoe\tn_layer\tn_expert\ttop_k\tmtp\tquants\tmissing\n' > "$PROBES"
 printf 'model_group\ttensor\tty_a\tty_b\tcosine\trel_rms\tmax_abs\tn\n' > "$CMPS"
 
-mapfile -t FILES < <(find /mnt/t440/raid0/models /mnt/t440/fast/models -name '*.gguf' -size +100M 2>/dev/null | sort)
+# Only the first shard of a split GGUF carries the metadata header, so later shards can
+# never be probed; skip them rather than logging them as failures.
+mapfile -t FILES < <(find /mnt/t440/raid0/models /mnt/t440/fast/models -name '*.gguf' -size +100M 2>/dev/null \
+  | grep -vE '\-0*([2-9]|[1-9][0-9]+)-of-[0-9]+\.gguf$' | sort)
 echo "$(date -uIs) probing ${#FILES[@]} files" >&2
 
 declare -A GROUP_FILES
@@ -27,8 +30,13 @@ for f in "${FILES[@]}"; do
   quants=$(grep -oE '\b(F32|F16|Q[2-8]_[01K]|Q[2-6]_K|type#[0-9]+)\b' <<<"$p" | sort -u | paste -sd, -)
   missing=$(grep -c 'MISSING' <<<"$p")
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$f" "$arch" "$moe" "$g" "$mtp" "$quants" "$missing" >> "$PROBES"
-  # group files by (arch, layers, experts) so same-model quants compare
-  key="$arch-$(cut -f1 <<<"$g")-$(cut -f2 <<<"$g")"
+  # Group by MODEL IDENTITY, not just geometry: the basename with the quantization suffix
+  # stripped, plus the geometry. Grouping on geometry alone compares different models that
+  # happen to share a shape (Mistral-7B against Llama-7B scored cosine -0.004, and two
+  # different gemma-4-31B builds scored 0.092 with Q8_0 on *both* sides, which cannot be a
+  # decoder fault). Only same-model, different-quant pairs say anything about a decoder.
+  ident=$(basename "$f" .gguf | sed -E 's/[-.]((UD-)?I?Q[0-9][^-]*([-_](K|0|1|M|S|L|XL|XXS|XS|PURE|P))*|F16|BF16|MXFP4(_MOE)?|QAD)([-_].*)?$//I')
+  key="$ident|$arch-$(cut -f1 <<<"$g")-$(cut -f2 <<<"$g")"
   GROUP_FILES[$key]="${GROUP_FILES[$key]:-} $f"
 done
 
@@ -58,4 +66,7 @@ done
 
 echo "$(date -uIs) done. probes=$PROBES compares=$CMPS" >&2
 # anything with a correct dequantizer must beat 0.90; flag the rest loudly
-awk -F'\t' 'NR>1 && $5+0 < 0.90 {print "SUSPECT: "$0}' "$CMPS" >&2
+# A pair with the SAME quant on both sides exercises one code path twice, so a low score
+# there means different weights, never a decoder bug. Only differing-quant pairs are evidence.
+awk -F'\t' 'NR>1 && $3!=$4 && $5+0 < 0.90 {print "SUSPECT: "$0}' "$CMPS" >&2
+awk -F'\t' 'NR>1 && $3==$4 && $5+0 < 0.90 {print "NOTE (same quant both sides = different weights, not a decoder fault): "$0}' "$CMPS" >&2
