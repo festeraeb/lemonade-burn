@@ -150,18 +150,69 @@ pub struct PlacementStats {
     pub cpu_calls: AtomicU64,
     pub gpu_ns: AtomicU64,
     pub cpu_ns: AtomicU64,
+    /// Misses served by copying the expert to the device ([`MissPolicy::OnDemand`]):
+    /// counted apart from `gpu_hits` so the residency plan's own hit rate stays readable.
+    pub on_demand: AtomicU64,
+    pub on_demand_ns: AtomicU64,
+}
+
+/// A reading of [`PlacementStats`]. `hit_rate` is the share of expert calls the residency
+/// plan caught outright; a plan that covers few of the experts the router asks for leaves
+/// the misses on the critical path however fast the GPU kernel is, so this is the number to
+/// read before optimizing the kernel again.
+#[derive(Clone, Copy, Debug)]
+pub struct StatsSnapshot {
+    pub gpu_hits: u64,
+    pub cpu_calls: u64,
+    pub on_demand: u64,
+    pub gpu_s: f64,
+    pub cpu_s: f64,
+    pub on_demand_s: f64,
+    pub hit_rate: f64,
 }
 
 impl PlacementStats {
-    /// `(gpu_hits, cpu_calls, gpu_s, cpu_s, hit_rate)`. `hit_rate` is the share of expert
-    /// calls the residency plan actually caught; a plan that covers few of the experts the
-    /// router asks for leaves the CPU on the critical path however fast the GPU kernel is,
-    /// so this is the number to read before optimizing the kernel again.
-    pub fn snapshot(&self) -> (u64, u64, f64, f64, f64) {
+    pub fn snapshot(&self) -> StatsSnapshot {
         let o = Ordering::Relaxed;
-        let (hits, calls) = (self.gpu_hits.load(o), self.cpu_calls.load(o));
-        let total = hits + calls;
-        (hits, calls, self.gpu_ns.load(o) as f64 / 1e9, self.cpu_ns.load(o) as f64 / 1e9, if total == 0 { 0.0 } else { hits as f64 / total as f64 })
+        let (gpu_hits, cpu_calls, on_demand) = (self.gpu_hits.load(o), self.cpu_calls.load(o), self.on_demand.load(o));
+        let total = gpu_hits + cpu_calls + on_demand;
+        StatsSnapshot {
+            gpu_hits,
+            cpu_calls,
+            on_demand,
+            gpu_s: self.gpu_ns.load(o) as f64 / 1e9,
+            cpu_s: self.cpu_ns.load(o) as f64 / 1e9,
+            on_demand_s: self.on_demand_ns.load(o) as f64 / 1e9,
+            hit_rate: if total == 0 { 0.0 } else { gpu_hits as f64 / total as f64 },
+        }
+    }
+}
+
+/// What to do with an expert the router asked for that is not GPU-resident.
+///
+/// Measured on the 24B with a 12 GB budget (2066 residents): the plan catches 97.1% of the
+/// calls, and the 2.9% it misses take 71% of the expert wall time - 45.2 ms to run a miss on
+/// the CPU against 0.542 ms to enqueue a hit. Copying the expert over and running it on the
+/// device instead costs about 2 ms to repack plus 1.7 ms for the copy, so `OnDemand` trades
+/// a 45 ms CPU call for a roughly 4 ms one. `Cpu` stays the default because it is the only
+/// policy that needs no free VRAM and no device at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MissPolicy {
+    /// Run the miss on the CPU reference path.
+    #[default]
+    Cpu,
+    /// Upload the expert to the device, run it there, release it after the readback.
+    OnDemand,
+}
+
+impl MissPolicy {
+    /// Parse a `--miss-policy` value.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "cpu" => Ok(Self::Cpu),
+            "on-demand" | "ondemand" => Ok(Self::OnDemand),
+            other => Err(format!("unknown miss policy {other:?} (expected cpu or on-demand)")),
+        }
     }
 }
 
@@ -173,6 +224,8 @@ pub struct ExpertStore {
     #[cfg(feature = "gpu")]
     pub resident: HashMap<(usize, usize), lb_q4_gpu::GpuExpert>,
     pub bytes: usize,
+    /// How to serve an expert that is not resident.
+    pub miss: MissPolicy,
 }
 
 impl ExpertStore {
@@ -282,8 +335,15 @@ pub fn moe_ffn(
         }
         xs
     };
-    let (gpu_part, cpu_part): (Vec<_>, Vec<_>) = experts.into_iter().partition(|(e, _)| store.is_resident(layer, *e));
+    let (gpu_part, mut cpu_part): (Vec<_>, Vec<_>) = experts.into_iter().partition(|(e, _)| store.is_resident(layer, *e));
     stats.gpu_hits.fetch_add(gpu_part.len() as u64, Ordering::Relaxed);
+
+    // `MissPolicy::OnDemand`: take the misses away from the CPU and serve them by copying
+    // the expert over. Each copy is a repack plus a host-to-device transfer, paid per call
+    // and released after the readback, so this needs an expert's worth of free VRAM per
+    // concurrent miss and nothing else.
+    #[cfg(feature = "gpu")]
+    let od_part: Vec<(usize, Vec<(usize, f32)>)> = if store.miss == MissPolicy::OnDemand && store.gpu.is_some() { std::mem::take(&mut cpu_part) } else { Vec::new() };
     stats.cpu_calls.fetch_add(cpu_part.len() as u64, Ordering::Relaxed);
 
     // Resident experts: launch everything first (asynchronous), read back after the CPU work.
@@ -311,6 +371,31 @@ pub fn moe_ffn(
         stats.gpu_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         v
     };
+    // The transient experts have to outlive the readback, so they are held here and dropped
+    // (freeing their device buffers) only once `read_all` has returned.
+    #[cfg(feature = "gpu")]
+    let (_od_held, od_launched): (Vec<lb_q4_gpu::GpuExpert>, Vec<(Vec<(usize, f32)>, (cubecl_handle::Handle, usize))>) = {
+        let t = std::time::Instant::now();
+        let mut held = Vec::with_capacity(od_part.len());
+        let mut launched = Vec::with_capacity(od_part.len());
+        if let Some(gpu) = store.gpu.as_ref() {
+            for (e, toks) in &od_part {
+                match lb_q4_gpu::GpuExpert::upload(gpu, w.mat(&gate.expert(*e)), w.mat(&up.expert(*e)), w.mat(&down.expert(*e))) {
+                    Ok(ex) => {
+                        let xh = gpu.upload_f32(&gather(toks));
+                        launched.push((toks.clone(), ex.launch(gpu, &xh, toks.len())));
+                        held.push(ex);
+                    }
+                    // out of VRAM or an unsupported type: fall back to the CPU for this one
+                    Err(_) => cpu_part.push((*e, toks.clone())),
+                }
+            }
+        }
+        stats.on_demand.fetch_add(launched.len() as u64, Ordering::Relaxed);
+        stats.on_demand_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        (held, launched)
+    };
+
     #[cfg(not(feature = "gpu"))]
     let _ = &gpu_part;
 
@@ -329,10 +414,20 @@ pub fn moe_ffn(
     #[cfg(feature = "gpu")]
     if let Some(gpu) = store.gpu.as_ref() {
         let t = std::time::Instant::now();
-        let (toks, hs): (Vec<_>, Vec<_>) = gpu_launched.into_iter().unzip();
+        // One synchronisation for the residents and the copied-in experts together: the
+        // scratch pool only recycles after a read, so splitting this into two reads would
+        // cost a second round trip for no gain.
+        let n_res = gpu_launched.len();
+        let (toks, hs): (Vec<_>, Vec<_>) = gpu_launched.into_iter().chain(od_launched).unzip();
         let outs = gpu.read_all(hs).expect("GPU expert read");
         parts.extend(toks.into_iter().zip(outs));
-        stats.gpu_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let dt = t.elapsed().as_nanos() as u64;
+        // charge the readback to whichever side actually used it
+        if n_res > 0 {
+            stats.gpu_ns.fetch_add(dt, Ordering::Relaxed);
+        } else {
+            stats.on_demand_ns.fetch_add(dt, Ordering::Relaxed);
+        }
     }
 
     let mut out = vec![0f32; m * n_embd];

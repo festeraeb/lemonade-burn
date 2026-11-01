@@ -53,6 +53,11 @@ struct Args {
     /// them there (needs the `gpu` feature).
     #[arg(long, default_value_t = false)]
     gpu: bool,
+    /// LFM2 only: what to do with an expert the router asked for that is not resident.
+    /// `cpu` runs it on the CPU reference path; `on-demand` copies it to the device and
+    /// runs it there, which measured 45.2 ms against about 4 ms a call on the 24B.
+    #[arg(long, default_value = "cpu")]
+    miss_policy: String,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8000)]
@@ -437,11 +442,12 @@ async fn placement_stats(State(st): State<Arc<AppState>>) -> Json<Value> {
     let Some(s) = st.placement.as_ref() else {
         return Json(json!({"placement": "none (not an LFM2 model)"}));
     };
-    let (hits, calls, gpu_s, cpu_s, rate) = s.snapshot();
+    let t = s.snapshot();
     Json(json!({
         "schema": "lemonade-burn.placement.v1",
-        "gpu_hits": hits, "cpu_calls": calls, "gpu_hit_rate": rate,
-        "gpu_s": gpu_s, "cpu_s": cpu_s
+        "gpu_hits": t.gpu_hits, "cpu_calls": t.cpu_calls, "on_demand": t.on_demand,
+        "gpu_hit_rate": t.hit_rate,
+        "gpu_s": t.gpu_s, "cpu_s": t.cpu_s, "on_demand_s": t.on_demand_s
     }))
 }
 
@@ -466,6 +472,7 @@ fn main() -> Result<()> {
     let (codec, ctx, model_id, kernel, placement): Loaded = if is_gguf {
         let mut model = lb_lfm2::Lfm2::load(&args.model, &dev)?;
         let cfg = model.cfg().clone();
+        model.store.miss = lb_lfm2::moe::MissPolicy::parse(&args.miss_policy).map_err(|e| anyhow::anyhow!(e))?;
         if let Some(dir) = &args.placement_from_scrapes {
             let scrapes = lb_lfm2::moe::read_scrape_dir(dir)?;
             let hist = lb_lfm2::moe::Histogram::from_scrapes("lfm2", cfg.n_layer, cfg.n_expert, &scrapes);
