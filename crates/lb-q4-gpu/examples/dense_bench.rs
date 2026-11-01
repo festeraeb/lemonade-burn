@@ -58,6 +58,48 @@ fn main() -> Result<(), String> {
         println!("{{\"metric\":\"round_trip_ms\",\"value\":{:.4}}}", median(rt));
     }
 
+    // Is the sync the cost, or the dispatch? Chain `depth` square matvecs, each eating the
+    // last one's output, and compare one readback at the end against one readback per step.
+    // Identical arithmetic and identical dispatch count: the only difference is host syncs.
+    // This is the number that says whether keeping a layer on the device is worth the
+    // restructuring it needs, before any of that restructuring is done.
+    {
+        let (rows, cols) = (2048usize, 2048usize);
+        let nb = rows * (cols / 32);
+        let bytes: Vec<u8> = (0..nb * 18).map(|i| (i % 251) as u8).collect();
+        let w = lb_q4_gpu::GpuQ4Mat::upload(&gpu, lb_gguf::QuantMat::new(lb_gguf::GgmlType::Q4_0, rows, cols, &bytes))?;
+        let x = vec![0.02f32; cols];
+        for depth in [8usize, 32, 106] {
+            let mut chained = Vec::new();
+            let mut per_step = Vec::new();
+            for _ in 0..5 {
+                // one sync for the whole chain
+                let t = std::time::Instant::now();
+                let mut h = gpu.upload_f32(&x);
+                for _ in 0..depth {
+                    h = w.launch(&gpu, &h, 1);
+                }
+                std::hint::black_box(gpu.read_all(vec![(h, rows)])?);
+                chained.push(t.elapsed().as_secs_f64() * 1e3);
+
+                // one sync per step, which is what `Lfm2::linear` does today
+                let t = std::time::Instant::now();
+                let mut v = x.clone();
+                for _ in 0..depth {
+                    v = w.matvec(&gpu, &v, 1)?;
+                }
+                std::hint::black_box(&v);
+                per_step.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let (c, p) = (median(chained), median(per_step));
+            println!(
+                "{{\"metric\":\"chain_vs_sync_per_step\",\"depth\":{depth},\"chained_ms\":{c:.3},\"per_step_ms\":{p:.3},\"speedup\":{:.2},\"saved_per_sync_ms\":{:.4}}}",
+                p / c,
+                (p - c) / depth as f64
+            );
+        }
+    }
+
     let mut cpu_total = 0.0;
     let mut gpu_total = 0.0;
     for &(name, rows, cols, count) in SHAPES {
