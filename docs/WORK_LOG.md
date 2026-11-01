@@ -25,25 +25,35 @@ about t440's noise still explains *why*, but t440 is no longer where you measure
 | host load | **50-105** on 48 cores | **0.09** idle, **~1.5-2.8** with the engine running |
 | free 16 GB cards | 0 (both P100s now serve qwq + hermes) | **2x Tesla P100** + an RTX 2060 SUPER 8 GB |
 | card temp / clocks | 47-55 C | 39-43 C, pinned 1328 MHz |
-| same config, decode | 7.333 **and 9.185** tok/s an hour apart | **10.405 and 10.554** |
-| drift, identical config | **1.253x (25%)** | **1.014x (1.4%)** |
-| within-run spread | 1.23x - 2.34x | **1.054x / 1.085x** (stdev 2.0% / 2.9%) |
-| smallest credible claim | **~1.5x** | **~1.05x** |
+| same config, decode | 7.333 **and 9.185** tok/s an hour apart | **10.405 / 10.554 / 10.689** |
+| drift over ~1 hour, identical config | **1.253x (25%)** | **1.027x (2.7%)** |
+| within-run spread | 1.23x - 2.34x | **1.054x / 1.085x / 1.089x** (stdev 2.0-3.2%) |
+| smallest credible claim | **~1.5x** | **~1.1x** |
 
-**Measured 2026-11-01, two 6-rep runs of the identical full config** (`--gpu
---placement-from-scrapes ... --gpu-budget-mb 14500 --gpu-dense-mb 900`, `LB_WGPU_DEVICE=discrete:0`):
-c2 is **both faster and ~18x tighter across runs**. Greedy text `062392b8d2b0361a` in all 12
-reps -- byte-identical to t440, so the host swap changed no output.
+**Measured 2026-11-01, three 6-rep runs of the identical full config** (`--gpu
+--placement-from-scrapes ... --gpu-budget-mb 14500 --gpu-dense-mb 900`, `LB_WGPU_DEVICE=discrete:0`)
+at 13:39, 13:40 and **14:43 -- a real 64-minute span**, which is the scale on which t440 drifted
+25%. c2 drifted **2.7%**: **9x tighter at hour scale**. Greedy text `062392b8d2b0361a` in all
+**18** reps -- byte-identical to t440, so the host swap changed no output.
+
+**The hour-gap run corrected my own first number, which is why it was worth running.** The
+first two runs were 2 minutes apart and suggested 1.4% drift and a ~1.05x bar. Across a real
+hour it is 2.7%, so the honest bar is **~1.1x** (3x the measured hour-scale drift). Use 1.1x.
 
 **c2 is faster on the same card, which is itself a result**: identical P100, identical binary.
 The decode token is dominated by host-side dispatch, so t440's load was starving it. That
 independently confirms the "a token is ~94% quantized matmuls, and the cost is latency not
 arithmetic" finding below.
 
-**The honest caveat on the 1.05x bar:** those two runs were ~2 minutes apart. t440's 1.25x
-drift was across an *hour*, with photogrammetry load changing underneath. **An hour-gap
-repeat on c2 is still owed** before treating 1.05x as the standing bar; until someone runs it,
-quote 1.05x as "within-session" and stay conservative on anything under ~1.1x.
+**c2 is faster on the same card, which is itself a result**: identical P100, identical binary.
+The decode token is dominated by host-side dispatch, so t440's load was starving it. That
+independently confirms the "a token is ~94% quantized matmuls, and the cost is latency not
+arithmetic" finding below.
+
+**Caveat closed.** The hour-gap repeat was owed and has been run (Q3, 14:43, 64 minutes after
+Q1). It moved the bar from 1.05x to **1.1x** — so quote **1.1x**, and remember that the
+2-minute figure flattered the box. Raw runs are kept on c2 at
+`/home/cesarops/lb-measure/out/Q{1,2,3}.out`.
 
 Run it there: everything is local to c2 under `/home/cesarops/lb-measure/`
 (`bin/lemonade-burn-server`, `models/`, `scrapes/`, `c2_e2e.sh <label> [args...]`). **No NFS in
