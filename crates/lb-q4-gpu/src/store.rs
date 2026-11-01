@@ -12,6 +12,12 @@ use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 use lb_ternary_gpu::pick_device;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// Most free buffers to keep per size. Decode reuses a handful of sizes, so this only caps
+/// pathological growth (a long prefill with many distinct `m`).
+const POOL_PER_SIZE: usize = 64;
 
 /// `h[i] = silu(g[i]) * u[i]`.
 #[cube(launch)]
@@ -26,6 +32,11 @@ fn silu_mul_kernel(g: &[f32], u: &[f32], h: &mut [f32]) {
 pub struct Gpu {
     pub client: Client,
     pub name: String,
+    /// Recycled scratch buffers, keyed by byte size.
+    free: Mutex<HashMap<usize, Vec<Handle>>>,
+    /// Scratch handed out since the last sync. Reusing one before the GPU has run would
+    /// corrupt it, so these only return to `free` after `read_all` has synchronised.
+    in_flight: Mutex<Vec<(usize, Handle)>>,
 }
 
 impl Gpu {
@@ -34,7 +45,7 @@ impl Gpu {
         let device = pick_device()?;
         let dev = cubecl::Device::Wgpu(device);
         let client = std::panic::catch_unwind(|| dev.client()).map_err(|_| "no wgpu adapter available".to_string())?;
-        Ok(Self { client, name: format!("{dev:?}") })
+        Ok(Self { client, name: format!("{dev:?}"), free: Mutex::new(HashMap::new()), in_flight: Mutex::new(Vec::new()) })
     }
 
     pub fn upload_f32(&self, x: &[f32]) -> Handle {
@@ -46,12 +57,47 @@ impl Gpu {
         cubecl::future::block_on(self.client.sync()).map_err(|e| format!("GPU sync failed: {e:?}"))
     }
 
-    /// Read several f32 outputs back in one synchronisation.
+    /// A scratch buffer of `bytes`, reusing a recycled one when one is free.
+    ///
+    /// `GpuQ4Mat::launch` and `GpuExpert::launch` allocated a fresh buffer for every
+    /// intermediate, which in decode is about four allocations per resident expert, so
+    /// hundreds a token. Sizes repeat exactly, so recycling removes essentially all of them.
+    pub fn scratch(&self, bytes: usize) -> Handle {
+        let h = match self.free.lock().expect("scratch pool").get_mut(&bytes).and_then(Vec::pop) {
+            Some(h) => h,
+            None => self.client.empty(bytes),
+        };
+        self.in_flight.lock().expect("scratch pool").push((bytes, h.clone()));
+        h
+    }
+
+    /// Return every scratch buffer handed out since the last sync. Only safe once the
+    /// device has finished with them, which is why `read_all` is the one caller.
+    fn recycle(&self) {
+        let taken: Vec<(usize, Handle)> = std::mem::take(&mut *self.in_flight.lock().expect("scratch pool"));
+        let mut free = self.free.lock().expect("scratch pool");
+        for (bytes, h) in taken {
+            let slot = free.entry(bytes).or_default();
+            if slot.len() < POOL_PER_SIZE {
+                slot.push(h);
+            }
+        }
+    }
+
+    /// Read several f32 outputs back in one synchronisation, then recycle this round's scratch.
     pub fn read_all(&self, handles: Vec<(Handle, usize)>) -> Result<Vec<Vec<f32>>, String> {
         let lens: Vec<usize> = handles.iter().map(|(_, n)| *n).collect();
         let hs: Vec<Handle> = handles.into_iter().map(|(h, _)| h).collect();
         let bytes = self.client.read(hs).map_err(|e| format!("GPU read failed: {e:?}"))?;
-        Ok(bytes.iter().zip(lens).map(|(b, n)| f32::from_bytes(b)[..n].to_vec()).collect())
+        let out: Vec<Vec<f32>> = bytes.iter().zip(lens).map(|(b, n)| f32::from_bytes(b)[..n].to_vec()).collect();
+        // the read synchronised, so nothing handed out before it is still in flight
+        self.recycle();
+        Ok(out)
+    }
+
+    /// Buffers currently held for reuse, for tests and reporting.
+    pub fn pooled(&self) -> usize {
+        self.free.lock().expect("scratch pool").values().map(Vec::len).sum()
     }
 }
 
@@ -88,7 +134,7 @@ impl GpuQ4Mat {
     /// Launch `out = x @ W^T` for `m` rows of `x` already on the device; returns the output handle.
     pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
         let n_out = m * self.rows;
-        let out = gpu.client.empty(n_out * 4);
+        let out = gpu.scratch(n_out * 4);
         unsafe {
             q4_0_matvec_kernel::launch(
                 &gpu.client,
@@ -131,7 +177,7 @@ impl GpuExpert {
         let n_ff = self.gate.rows;
         let g = self.gate.launch(gpu, x, m);
         let u = self.up.launch(gpu, x, m);
-        let h = gpu.client.empty(m * n_ff * 4);
+        let h = gpu.scratch(m * n_ff * 4);
         let threads = 64usize;
         unsafe {
             silu_mul_kernel::launch(

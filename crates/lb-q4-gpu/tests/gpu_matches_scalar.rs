@@ -122,3 +122,51 @@ fn resident_expert_ffn_matches_cpu() {
         assert!((a - b).abs() <= 1e-3 * (1.0 + b.abs()), "elem {i}: gpu {a} cpu {b}");
     }
 }
+
+/// The scratch pool recycles buffers after every `read_all`. If it ever handed back a buffer
+/// the device had not finished with, or returned one of the wrong size, a second round would
+/// differ from the first. Several experts per round, several rounds, all results identical.
+#[test]
+fn pooled_scratch_reuse_is_stable_across_rounds() {
+    use lb_q4_gpu::{Gpu, GpuExpert};
+    let (n_embd, n_ff) = (256usize, 192usize);
+    let mut rng = Rng(23);
+    let mk = |rng: &mut Rng, rows: usize, cols: usize| -> Vec<u8> {
+        let wf: Vec<f32> = (0..rows * cols).map(|_| rng.unit()).collect();
+        wf.chunks_exact(cols).flat_map(|r| quantize_q4_0(r)).collect()
+    };
+    let (gb, ub, db) = (mk(&mut rng, n_ff, n_embd), mk(&mut rng, n_ff, n_embd), mk(&mut rng, n_embd, n_ff));
+    let gate = QuantMat::new(GgmlType::Q4_0, n_ff, n_embd, &gb);
+    let up = QuantMat::new(GgmlType::Q4_0, n_ff, n_embd, &ub);
+    let down = QuantMat::new(GgmlType::Q4_0, n_embd, n_ff, &db);
+
+    let gpu = Gpu::open().unwrap_or_else(|e| panic!("{e}"));
+    let e = GpuExpert::upload(&gpu, gate, up, down).unwrap();
+    // two token counts, so the pool holds more than one size at once
+    let mut first: Vec<Vec<f32>> = Vec::new();
+    for round in 0..4 {
+        let mut got_round = Vec::new();
+        for &m in &[1usize, 3] {
+            let x: Vec<f32> = (0..m * n_embd).map(|i| ((i * 37 % 101) as f32 / 101.0) - 0.5).collect();
+            let xh = gpu.upload_f32(&x);
+            // three experts in one round, as a layer would
+            let hs: Vec<_> = (0..3).map(|_| e.launch(&gpu, &xh, m)).collect();
+            let outs = gpu.read_all(hs).expect("read");
+            for o in &outs {
+                assert_eq!(o.len(), m * n_embd, "wrong output length at m={m}");
+                assert!(o.iter().all(|v| v.is_finite()), "non-finite output at m={m}");
+            }
+            // every expert in the round is the same weights on the same x
+            for o in &outs[1..] {
+                assert_eq!(&outs[0], o, "experts in one round disagree at m={m}");
+            }
+            got_round.push(outs[0].clone());
+        }
+        if round == 0 {
+            first = got_round;
+            assert!(gpu.pooled() > 0, "nothing was recycled after the first round");
+        } else {
+            assert_eq!(first, got_round, "round {round} differs from round 0: pool handed back a dirty buffer");
+        }
+    }
+}
