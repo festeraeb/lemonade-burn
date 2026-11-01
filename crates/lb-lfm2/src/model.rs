@@ -242,6 +242,68 @@ impl Lfm2 {
         x * cos.clone() + rot * sin.clone()
     }
 
+    /// One short-conv layer. For a single token with the block resident, this is one host
+    /// sync for the whole layer (`in_proj -> conv -> out_proj` chained on the device); every
+    /// other case falls through to the CPU path below.
+    ///
+    /// The two states have to be kept consistent, because the device copy advances itself:
+    /// * CPU path: afterwards, push the host state to the device and mark it clean, so the
+    ///   first decode token after a prefill convolves against real history, not zeros.
+    /// * device path: the host state is now stale, so mark the layer dirty. A later
+    ///   multi-token pass (`m > 1`) pulls the state back first -- one sync, rare.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_layer(&self, h: Tensor<2>, li: usize, in_proj: &MatRef, conv: &[f32], out_proj: &MatRef, state: &mut Option<Tensor<2>>) -> Tensor<2> {
+        let (e, l) = (self.cfg().n_embd, self.cfg().l_cache);
+        let [m, _] = h.dims();
+        #[cfg(feature = "gpu")]
+        {
+            let resident = crate::dense::conv_blocks_enabled()
+                && self.dense.conv.contains_key(&in_proj.start)
+                && self.store.gpu.is_some();
+            if resident && m == 1 {
+                let gpu = self.store.gpu.as_ref().expect("checked");
+                let block = self.dense.conv.get(&in_proj.start).expect("checked");
+                let hv = Self::to_vec(h.clone());
+                let t = Instant::now();
+                let done = block.forward(gpu, &hv);
+                self.timings.matmul_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                match done {
+                    Ok(out) => {
+                        self.dense.mark_conv_dirty(in_proj.start);
+                        return self.from_vec(out, 1, e);
+                    }
+                    Err(err) => eprintln!("conv block {li} on device failed: {err}; using the CPU kernel"),
+                }
+            }
+            if resident && m > 1 && self.dense.is_conv_dirty(in_proj.start) {
+                // decode has advanced the device state past the host's: bring it back
+                let gpu = self.store.gpu.as_ref().expect("checked");
+                let block = self.dense.conv.get(&in_proj.start).expect("checked");
+                match block.read_state(gpu) {
+                    Ok(rows) => {
+                        *state = Some(self.from_vec(rows, l - 1, e));
+                        self.dense.mark_conv_clean(in_proj.start);
+                    }
+                    Err(err) => eprintln!("conv state {li} read back failed: {err}; the host state may be behind"),
+                }
+            }
+        }
+        let out = self.conv_block(h, in_proj, conv, out_proj, state);
+        #[cfg(feature = "gpu")]
+        if let (Some(gpu), Some(block), Some(st)) =
+            (self.store.gpu.as_ref(), self.dense.conv.get(&in_proj.start), state.as_ref())
+        {
+            // the CPU path just moved the history on: tell the device where it got to
+            if let Err(err) = block.set_state(gpu, &Self::to_vec(st.clone())) {
+                eprintln!("conv state {li} push failed: {err}; the device state may be behind");
+            } else {
+                self.dense.mark_conv_clean(in_proj.start);
+            }
+        }
+        let _ = (li, l);
+        out
+    }
+
     fn conv_block(&self, h: Tensor<2>, in_proj: &MatRef, conv: &[f32], out_proj: &MatRef, state: &mut Option<Tensor<2>>) -> Tensor<2> {
         let cfg = self.cfg();
         let (e, l) = (cfg.n_embd, cfg.l_cache);
@@ -369,6 +431,15 @@ impl Lfm2 {
         let m = tokens.len();
         let pos0 = cache.len;
         let total = pos0 + m;
+        // A pass at position 0 is a new sequence. The resident conv blocks carry their state
+        // on the device, where no new `Cache` can clear it, so it has to be cleared here or
+        // the first token would convolve against the previous request's history.
+        #[cfg(feature = "gpu")]
+        if pos0 == 0 {
+            if let Some(gpu) = self.store.gpu.as_ref() {
+                self.dense.reset_conv(gpu);
+            }
+        }
         self.ensure_cap(cache, total);
         let (cos, sin) = self.rope_tables(pos0, m);
         let e = cfg.n_embd;
@@ -377,7 +448,7 @@ impl Lfm2 {
         for (li, layer) in self.w.layers.iter().enumerate() {
             let h = self.rms_norm(x.clone(), &layer.attn_norm);
             let op_out = match &layer.op {
-                Operator::Conv { in_proj, conv, out_proj } => self.conv_block(h, in_proj, conv, out_proj, &mut cache.conv[li]),
+                Operator::Conv { in_proj, conv, out_proj } => self.conv_layer(h, li, in_proj, conv, out_proj, &mut cache.conv[li]),
                 Operator::Attn { q, k, v, o, q_norm, k_norm } => {
                     let group = cfg.n_head / cfg.kv_heads[li];
                     let mask = if m > 1 {

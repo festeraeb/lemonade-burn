@@ -253,6 +253,32 @@ impl GpuConv {
         self.in_proj.bytes_on_device() + self.out_proj.bytes_on_device() + (self.l * 2 - 1) * self.e * 4
     }
 
+    /// Rows the state holds: `l_cache - 1` rows of `n_embd`.
+    pub fn state_rows(&self) -> (usize, usize) {
+        (self.l - 1, self.e)
+    }
+
+    /// Overwrite the state with `rows` (`(l_cache - 1) * n_embd` values, oldest first).
+    ///
+    /// Prefill runs on the CPU, so after it the device state has to be told where the
+    /// sequence got to, or the first decode token would convolve against zeros.
+    pub fn set_state(&self, gpu: &Gpu, rows: &[f32]) -> Result<(), String> {
+        let want = (self.l - 1) * self.e;
+        if rows.len() != want {
+            return Err(format!("conv state needs {want} values, got {}", rows.len()));
+        }
+        gpu.client.write(&self.state, Bytes::from_elems(rows.to_vec()));
+        Ok(())
+    }
+
+    /// Read the state back. Costs a sync, so this is for the rare path where the host needs
+    /// the history again (a multi-token forward after decoding has already advanced it).
+    pub fn read_state(&self, gpu: &Gpu) -> Result<Vec<f32>, String> {
+        let n = (self.l - 1) * self.e;
+        let bytes = gpu.client.read(vec![self.state.clone()]).map_err(|e| format!("conv state read failed: {e:?}"))?;
+        Ok(f32::from_bytes(&bytes[0])[..n].to_vec())
+    }
+
     /// Zero the rolling state: a new sequence starts with no history.
     pub fn reset(&self, gpu: &Gpu) {
         let zeros = vec![0f32; (self.l - 1) * self.e];

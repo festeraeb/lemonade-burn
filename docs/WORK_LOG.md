@@ -67,6 +67,37 @@ Run it: `--gpu --placement-from-scrapes /data/lfm2-scrapes/served --gpu-budget-m
 
 ## Changes, newest first
 
+### 2026-11-01 — the whole short-conv block on the device, state included (`dc1665a`)
+
+30 of the 40 layers are short-conv layers and each paid **two** host syncs: both projections
+were resident matmuls, but the arithmetic between them was Burn CPU tensor ops, so the result
+came back to the host and went out again for five flops per channel. `conv_decode_kernel` +
+`GpuConv` make a decode token `in_proj -> conv -> out_proj` with **one** sync for the layer:
+**30 of ~145 syncs removed.**
+
+The rolling state lives on the device and the kernel rewrites it in place, so it never
+crosses the bus. That makes `GpuConv::launch` **stateful** - it advances the layer by one
+token and must be called once per token, in order. Consequences anyone touching this must
+know:
+
+* **One token only.** Prefill keeps the CPU path; it is a cheaper, different problem.
+* `Lfm2::conv_layer` keeps the two states consistent: after a CPU pass it pushes the host
+  state to the device (`set_state`), and after a device token it marks the layer dirty so a
+  later `m > 1` pass pulls the state back first (`read_state`, one sync, rare).
+* A pass at `pos0 == 0` resets every resident block, because a new `Cache` cannot clear state
+  that lives on the device - without that, a request would convolve against the previous
+  request's history.
+
+Tests all run **sequences**: a single-token check passes even when the state shift is wrong.
+3 tests on the plane path and 3 with `LB_NO_PLANE=1`, including an l=5 window to exercise the
+shift loop that is a no-op at the real l=3, and a reset test that first asserts the state
+actually changes the output so it cannot pass vacuously.
+
+**Trap for the next person writing tests here:** random bytes are **not** valid Q4_0 test
+data. The f16 scale in each 18-byte block comes out inf or NaN often enough that both sides
+become garbage; the first run of these failed with CPU `NaN` against GPU `1e24`. Write a sane
+scale per block (`random_q4_0` in the test file).
+
 ### 2026-11-01 — dense weights and the tied head on the device (4.02x)
 
 Interleaved A/B on one card, 10 reps per arm, medians:
@@ -136,7 +167,7 @@ arithmetic and identical dispatch count, the only difference is host syncs):
 ~0.24 ms saved per sync removed. So the dense side's ~85 ms is mostly *waiting*, and the work
 is to keep a layer's activations and intermediates on the device:
 
-* conv layer: `in_proj -> (b*xx, conv taps, *c) -> out_proj` = 2 syncs, not 6
+* ~~conv layer~~ **done (`dc1665a`)**: 1 sync per layer, 30 removed
 * attention: `q,k,v` batched -> the attention math -> `o` = 2 syncs, not 8
 * dense FFN: `gate,up` fused (kernel already exists) -> `down` = 1 sync, not 3
 

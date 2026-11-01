@@ -38,33 +38,97 @@ pub struct DenseStore {
     pub resident: HashMap<usize, lb_q4_gpu::GpuQ4Mat>,
     #[cfg(feature = "gpu")]
     pub q6: HashMap<usize, lb_q4_gpu::GpuQ6KMat>,
+    /// Whole short-conv blocks, keyed by their `in_proj` offset. A block owns both its
+    /// projections, so those two never also go in `resident` -- that would upload 283 MB
+    /// twice.
+    #[cfg(feature = "gpu")]
+    pub conv: HashMap<usize, lb_q4_gpu::GpuConv>,
+    /// Conv layers whose device state is ahead of the host's `Cache::conv` (decode has run).
+    /// A later multi-token pass has to pull the state back before it can use the CPU path.
+    /// Behind a mutex because `forward` takes `&self`.
+    #[cfg(feature = "gpu")]
+    conv_dirty: std::sync::Mutex<std::collections::HashSet<usize>>,
     pub bytes: usize,
 }
 
+/// `LB_NO_CONV_BLOCK=1` keeps the conv projections as loose resident matrices and runs the
+/// block's arithmetic on the host, as before `dc1665a`. It exists so the device conv path can
+/// be measured against its own absence **in one binary**: on this box arms have to be
+/// interleaved to mean anything, and two binaries cannot be interleaved. Also a kill switch.
+#[cfg(feature = "gpu")]
+pub fn conv_blocks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LB_NO_CONV_BLOCK").is_err())
+}
+
 impl DenseStore {
+    /// The device state of this conv layer is now ahead of the host's.
+    #[cfg(feature = "gpu")]
+    pub fn mark_conv_dirty(&self, in_proj_start: usize) {
+        self.conv_dirty.lock().expect("conv dirty set").insert(in_proj_start);
+    }
+
+    /// Host and device conv state agree again.
+    #[cfg(feature = "gpu")]
+    pub fn mark_conv_clean(&self, in_proj_start: usize) {
+        self.conv_dirty.lock().expect("conv dirty set").remove(&in_proj_start);
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn is_conv_dirty(&self, in_proj_start: usize) -> bool {
+        self.conv_dirty.lock().expect("conv dirty set").contains(&in_proj_start)
+    }
+
+    /// Zero every resident conv block's rolling state: a new sequence has no history.
+    #[cfg(feature = "gpu")]
+    pub fn reset_conv(&self, gpu: &lb_q4_gpu::Gpu) {
+        for block in self.conv.values() {
+            block.reset(gpu);
+        }
+        self.conv_dirty.lock().expect("conv dirty set").clear();
+    }
+
     pub fn n_resident(&self) -> usize {
         #[cfg(feature = "gpu")]
         {
-            return self.resident.len() + self.q6.len();
+            return self.resident.len() + self.q6.len() + self.conv.len();
         }
         #[allow(unreachable_code)]
         0
     }
 
-    /// Every dense matrix a decode step runs. Router rows, norms and the conv taps are f32
-    /// and stay on the host.
+    /// Every dense matrix a decode step runs, *except* the conv projections, which are
+    /// uploaded as whole blocks by [`Self::load_conv`]. Router rows, norms and the conv taps
+    /// are f32 and stay on the host.
     fn candidates(w: &Weights) -> Vec<&MatRef> {
         let mut v = vec![&w.embd];
         for layer in &w.layers {
             match &layer.op {
-                Operator::Conv { in_proj, out_proj, .. } => v.extend([in_proj, out_proj]),
                 Operator::Attn { q, k, v: vp, o, .. } => v.extend([q, k, vp, o]),
+                // with conv blocks off, the projections are ordinary resident matrices again
+                #[cfg(feature = "gpu")]
+                Operator::Conv { in_proj, out_proj, .. } if !conv_blocks_enabled() => v.extend([in_proj, out_proj]),
+                #[cfg(not(feature = "gpu"))]
+                Operator::Conv { in_proj, out_proj, .. } => v.extend([in_proj, out_proj]),
+                Operator::Conv { .. } => {}
             }
             if let Ffn::Dense { gate, up, down } = &layer.ffn {
                 v.extend([gate, up, down]);
             }
         }
         v
+    }
+
+    /// The conv projections, as (layer, in_proj, out_proj).
+    fn conv_layers(w: &Weights) -> Vec<(usize, &MatRef, &MatRef)> {
+        w.layers
+            .iter()
+            .enumerate()
+            .filter_map(|(l, layer)| match &layer.op {
+                Operator::Conv { in_proj, out_proj, .. } => Some((l, in_proj, out_proj)),
+                Operator::Attn { .. } => None,
+            })
+            .collect()
     }
 
     /// CPU ms saved per device MB, measured (`dense_bench`, P100, 2026-11-01): the 106 dense
@@ -91,8 +155,49 @@ impl DenseStore {
     /// Upload dense matrices until `budget_bytes` is spent, best return per device byte
     /// first and larger matrices before smaller within a type. Returns how many were
     /// uploaded. Without the `gpu` feature: an error.
+    ///
+    /// Conv blocks go first, before any budget is spent on single matrices: they are 30 of the
+    /// 40 layers and a whole block on the device saves a host sync as well as the two
+    /// matmuls, which a loose `in_proj` cannot.
     #[cfg(feature = "gpu")]
     pub fn load(&mut self, gpu: &lb_q4_gpu::Gpu, w: &Weights, budget_bytes: usize) -> Result<usize, String> {
+        let mut n = self.load_conv(gpu, w, budget_bytes)?;
+        n += self.load_mats(gpu, w, budget_bytes)?;
+        Ok(n)
+    }
+
+    /// Upload whole short-conv blocks (both projections, the taps and the rolling state).
+    #[cfg(feature = "gpu")]
+    fn load_conv(&mut self, gpu: &lb_q4_gpu::Gpu, w: &Weights, budget_bytes: usize) -> Result<usize, String> {
+        let mut n = 0;
+        if !conv_blocks_enabled() {
+            return Ok(0);
+        }
+        for (l, in_proj, out_proj) in Self::conv_layers(w) {
+            if self.conv.contains_key(&in_proj.start) {
+                continue;
+            }
+            if in_proj.ty != lb_gguf::GgmlType::Q4_0 || out_proj.ty != lb_gguf::GgmlType::Q4_0 {
+                continue;
+            }
+            let Operator::Conv { conv, .. } = &w.layers[l].op else { continue };
+            // the taps and the rolling state are allocated too: count them, or the budget is
+            // exceeded by a little per layer (it reported 752 MB of a 751 MB budget)
+            let e = in_proj.rows / 3;
+            let extra = (conv.len() + (conv.len() / e.max(1)).saturating_sub(1) * e) * 4;
+            if self.bytes + in_proj.len + out_proj.len + extra > budget_bytes {
+                continue;
+            }
+            let g = lb_q4_gpu::GpuConv::upload(gpu, w.mat(in_proj), conv, w.mat(out_proj))?;
+            self.bytes += g.bytes_on_device();
+            self.conv.insert(in_proj.start, g);
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    #[cfg(feature = "gpu")]
+    fn load_mats(&mut self, gpu: &lb_q4_gpu::Gpu, w: &Weights, budget_bytes: usize) -> Result<usize, String> {
         let mut cand = Self::candidates(w);
         cand.sort_by(|a, b| Self::by_return(a, b));
         let mut n = 0;
@@ -138,13 +243,16 @@ impl DenseStore {
         Err("built without the `gpu` feature: dense weights cannot be made resident".to_string())
     }
 
-    /// Bytes every dense matrix we have a kernel for would take on the device.
+    /// Bytes every dense matrix we have a kernel for would take on the device, conv blocks
+    /// included (their state and taps are a few hundred KB and are not counted).
     pub fn candidate_bytes(w: &Weights) -> usize {
-        Self::candidates(w)
+        let mats: usize = Self::candidates(w)
             .iter()
             .filter(|m| matches!(m.ty, lb_gguf::GgmlType::Q4_0 | lb_gguf::GgmlType::Q6K))
             .map(|m| Self::device_bytes(m))
-            .sum()
+            .sum();
+        let convs: usize = Self::conv_layers(w).iter().map(|(_, a, b)| a.len + b.len).sum();
+        mats + convs
     }
 }
 
