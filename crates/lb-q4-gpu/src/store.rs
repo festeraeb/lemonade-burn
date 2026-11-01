@@ -8,6 +8,7 @@
 //! so a layer's resident experts cost one round trip, not one per expert.
 
 use crate::{cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, repack_q4_0, QuantMat, THREADS};
+use cubecl::bytes::Bytes;
 use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -72,7 +73,20 @@ impl Gpu {
     }
 
     pub fn upload_f32(&self, x: &[f32]) -> Handle {
-        self.client.create_from_slice(f32::as_bytes(x))
+        self.client.create(Bytes::from_elems(x.to_vec()))
+    }
+
+    /// Put an owned, typed buffer on the device without copying it on the host first.
+    ///
+    /// `Client::create_from_slice` copies the blob **twice** before any backend sees it:
+    /// `slice.to_vec()`, and then `Bytes::from_bytes_vec(data.to_vec())` inside
+    /// `do_create_from_slices` on a vector it already owns (cubecl-runtime 0.11.3
+    /// `client.rs`). Above the malloc mmap threshold each fresh allocation also page-faults,
+    /// which is why our measured host-to-device rate got *worse* with blob size. `create`
+    /// takes `Bytes` as it is, and `Bytes::from_elems` erases the element type of a `Vec`
+    /// without touching the data, so a repacked `Vec<u32>` reaches the device uncopied.
+    pub fn upload_u32(&self, v: Vec<u32>) -> Handle {
+        self.client.create(Bytes::from_elems(v))
     }
 
     /// Wait for everything submitted so far (a timing fence).
@@ -153,9 +167,9 @@ impl GpuQ4Mat {
             row_bytes: w.row_bytes(),
             n_qs: qs.len(),
             n_sc: sc.len(),
-            qs: gpu.client.create_from_slice(u32::as_bytes(&qs)),
-            sc: gpu.client.create_from_slice(u32::as_bytes(&sc)),
-            dims: gpu.client.create_from_slice(u32::as_bytes(&dims)),
+            qs: gpu.upload_u32(qs),
+            sc: gpu.upload_u32(sc),
+            dims: gpu.upload_u32(dims.to_vec()),
         })
     }
 
