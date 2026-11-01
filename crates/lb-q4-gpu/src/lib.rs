@@ -119,6 +119,34 @@ fn q4_0_matvec_kernel(w: &[u32], x: &[f32], dims: &[u32], out: &mut [f32]) {
     }
 }
 
+/// Fused SwiGLU front half: `h[t, r] = silu(x_t . gate_r) * (x_t . up_r)`. One cube per
+/// output element reads the same row of both weight matrices (same shape, same `dims`)
+/// and reduces the two partials separately, so gate/up/silu are one dispatch and the
+/// intermediate `g`/`u` buffers never exist.
+#[cube(launch)]
+fn q4_0_gate_up_silu_kernel(wg: &[u32], wu: &[u32], x: &[f32], dims: &[u32], h: &mut [f32]) {
+    let pos = CUBE_POS as usize;
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let row_bytes = dims[2] as usize;
+    let n_iter = dims[3] as usize;
+    let mut sm_g = Shared::<[f32]>::new_slice(64usize);
+    let mut sm_u = Shared::<[f32]>::new_slice(64usize);
+    let mut pg = 0.0f32;
+    let mut pu = 0.0f32;
+    if pos < h.len() {
+        let t = pos / rows;
+        let r = pos % rows;
+        pg = q4_row_partial(wg, r * row_bytes, x, t * cols, cols / 32, n_iter);
+        pu = q4_row_partial(wu, r * row_bytes, x, t * cols, cols / 32, n_iter);
+    }
+    let g = reduce64(&mut sm_g, pg);
+    let u = reduce64(&mut sm_u, pu);
+    if pos < h.len() && UNIT_POS == 0u32 {
+        h[pos] = g / (1.0f32 + Exp::exp(-g)) * u;
+    }
+}
+
 /// Cube size used by every kernel here (the reduction assumes it).
 pub const THREADS: usize = 64;
 

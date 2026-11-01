@@ -7,7 +7,7 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{cube_count, matvec_dims, q4_0_matvec_kernel, QuantMat, THREADS};
+use crate::{cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, QuantMat, THREADS};
 use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -18,16 +18,6 @@ use std::sync::Mutex;
 /// Most free buffers to keep per size. Decode reuses a handful of sizes, so this only caps
 /// pathological growth (a long prefill with many distinct `m`).
 const POOL_PER_SIZE: usize = 64;
-
-/// `h[i] = silu(g[i]) * u[i]`.
-#[cube(launch)]
-fn silu_mul_kernel(g: &[f32], u: &[f32], h: &mut [f32]) {
-    let i = ABSOLUTE_POS;
-    if i < h.len() {
-        let x = g[i];
-        h[i] = x / (1.0f32 + Exp::exp(-x)) * u[i];
-    }
-}
 
 pub struct Gpu {
     pub client: Client,
@@ -175,18 +165,19 @@ impl GpuExpert {
     /// Launch the expert on `m` rows of `x` (device handle); returns (output handle, length).
     pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> (Handle, usize) {
         let n_ff = self.gate.rows;
-        let g = self.gate.launch(gpu, x, m);
-        let u = self.up.launch(gpu, x, m);
-        let h = gpu.scratch(m * n_ff * 4);
-        let threads = 64usize;
+        assert!(self.gate.rows == self.up.rows && self.gate.cols == self.up.cols, "gate/up shape mismatch");
+        let n_h = m * n_ff;
+        let h = gpu.scratch(n_h * 4);
         unsafe {
-            silu_mul_kernel::launch(
+            q4_0_gate_up_silu_kernel::launch(
                 &gpu.client,
-                CubeCount::Static((m * n_ff).div_ceil(threads) as u32, 1, 1),
-                CubeDim::new_1d(threads as u32),
-                BufferArg::from_raw_parts(g, m * n_ff),
-                BufferArg::from_raw_parts(u, m * n_ff),
-                BufferArg::from_raw_parts(h.clone(), m * n_ff),
+                cube_count(n_h),
+                CubeDim::new_1d(THREADS as u32),
+                BufferArg::from_raw_parts(self.gate.words.clone(), self.gate.n_words),
+                BufferArg::from_raw_parts(self.up.words.clone(), self.up.n_words),
+                BufferArg::from_raw_parts(x.clone(), m * self.gate.cols),
+                BufferArg::from_raw_parts(self.gate.dims.clone(), 4),
+                BufferArg::from_raw_parts(h.clone(), n_h),
             );
         }
         let out = self.down.launch(gpu, &h, m);
