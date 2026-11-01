@@ -15,22 +15,73 @@ micro-numbers on any GPU host.
 
 ---
 
-## Measurement rules on this box (read first, this is where most wrong numbers come from)
+## Measure on c2, not t440 **[changed 2026-11-01 — read this first]**
 
-t440 runs photogrammetry and a llama-server at **load 50-105 on 48 cores**. Consequences:
+**Measurement moved to cesarops2.** The operator freed it for exactly this. Everything below
+about t440's noise still explains *why*, but t440 is no longer where you measure.
 
-1. **A sequential A/B is worthless here.** The CPU arm of today's test varied **2.14x**
+| | t440 | **c2 (use this)** |
+|---|---|---|
+| host load | **50-105** on 48 cores | **0.09** idle, **~1.5-2.8** with the engine running |
+| free 16 GB cards | 0 (both P100s now serve qwq + hermes) | **2x Tesla P100** + an RTX 2060 SUPER 8 GB |
+| card temp / clocks | 47-55 C | 39-43 C, pinned 1328 MHz |
+| same config, decode | 7.333 **and 9.185** tok/s an hour apart | **10.405 and 10.554** |
+| drift, identical config | **1.253x (25%)** | **1.014x (1.4%)** |
+| within-run spread | 1.23x - 2.34x | **1.054x / 1.085x** (stdev 2.0% / 2.9%) |
+| smallest credible claim | **~1.5x** | **~1.05x** |
+
+**Measured 2026-11-01, two 6-rep runs of the identical full config** (`--gpu
+--placement-from-scrapes ... --gpu-budget-mb 14500 --gpu-dense-mb 900`, `LB_WGPU_DEVICE=discrete:0`):
+c2 is **both faster and ~18x tighter across runs**. Greedy text `062392b8d2b0361a` in all 12
+reps -- byte-identical to t440, so the host swap changed no output.
+
+**c2 is faster on the same card, which is itself a result**: identical P100, identical binary.
+The decode token is dominated by host-side dispatch, so t440's load was starving it. That
+independently confirms the "a token is ~94% quantized matmuls, and the cost is latency not
+arithmetic" finding below.
+
+**The honest caveat on the 1.05x bar:** those two runs were ~2 minutes apart. t440's 1.25x
+drift was across an *hour*, with photogrammetry load changing underneath. **An hour-gap
+repeat on c2 is still owed** before treating 1.05x as the standing bar; until someone runs it,
+quote 1.05x as "within-session" and stay conservative on anything under ~1.1x.
+
+Run it there: everything is local to c2 under `/home/cesarops/lb-measure/`
+(`bin/lemonade-burn-server`, `models/`, `scrapes/`, `c2_e2e.sh <label> [args...]`). **No NFS in
+the measured path** — the 13.6 GB GGUF and the tokenizer are copied to c2's own disk.
+**No rebuild needed**: a t440-built binary runs as-is (c2 glibc 2.44 > t440's 2.39, and
+`vulkan-icd-loader` + `nvidia_icd.json` are installed).
+
+`c2_e2e.sh` prints a `card:` line with every GPU's used memory, so a mislabelled
+`discrete:N` cannot go unnoticed — **wgpu's discrete order is not nvidia-smi's**, and two of
+c2's three cards report the identical name `Tesla P100-PCIE-16GB`. Check which card filled.
+
+### The rules themselves
+
+1. **A sequential A/B is worthless on a loaded host.** The CPU arm of one test varied **2.14x**
    between rounds run an hour apart. Interleave arms (A/B/A/B) on the same card, or do not
-   report a ratio.
+   report a ratio. Keep interleaving on c2 until a quiet-host spread is actually established.
 2. Medians of >=5 reps, never a single run. Report the spread; a spread above ~1.3x means the
    number is load, not the change.
-3. **No claim below 1.5x** on this box. Two real improvements this week came in at 1.11x and
-   1.26x and were correctly not claimed.
+3. **No claim below 1.5x on t440.** Two real improvements this week came in at 1.11x and 1.26x
+   and were correctly not claimed. On c2 this floor should drop a lot — but **measure the
+   floor before trusting a small number**: run the same config twice an hour apart and see
+   what it drifts by. Until someone does that, 1.5x still stands.
 4. One GPU job per card. `LB_WGPU_DEVICE=discrete:0` or `discrete:1`.
-5. **Never use t440's GPUs through t440's lemond** - it auto-loads onto the P100s, which are
-   reserved for photogrammetry. Direct `LB_WGPU_DEVICE` use by this engine is fine.
+5. **Never use a node's GPUs through its lemond** - it auto-loads a model onto whatever card
+   it likes. Direct `LB_WGPU_DEVICE` use by this engine is fine.
 6. Correctness gate before any speed number: greedy (`temperature 0`) output must be
    **byte-identical**. Current reference sha for the standard prompt: `062392b8d2b0361a`.
+
+### What moved, and what that cost
+
+To free c2, its three GPU seats were stood down and two were moved to t440 — all through
+`var/fleet-manifest.json` (`enabled: false` / a different node), **no new systemd units**:
+`flint` (lane B's local coder) retired, `qwq-c2` -> **`qwq-t440`** on t440 P100 0,
+`hermes` -> t440 P100 1. Both verified answering real chat calls, not just an open port.
+
+**Consequence to know about:** t440's two P100s are now fully occupied, so this engine can no
+longer measure there at all, and photogrammetry's GPU stage has nowhere to go (it is CPU-only
+at the moment). t440 also runs with swap 23/23 full. Treat t440 as a serving box now.
 
 ---
 
