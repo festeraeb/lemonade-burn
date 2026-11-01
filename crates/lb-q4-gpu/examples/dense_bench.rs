@@ -100,6 +100,96 @@ fn main() -> Result<(), String> {
         }
     }
 
+    // --- AS CALLED, with the device loaded ----------------------------------------------
+    //
+    // Everything above measures an almost-empty device. In the model there are ~14,600 expert
+    // buffers resident and wgpu builds a fresh BindGroup per dispatch, so the tracker state a
+    // call walks is nothing like this loop's. If a real matvec costs the same here as it does
+    // with 2 GB resident, then the model's per-call overhead is NOT allocator or tracker churn
+    // and the remaining time is the Burn/thread path. If it costs appreciably more, that churn
+    // is real and is worth attacking directly.
+    //
+    // The MoE row is the one that sizes the "one launch per projection per layer" idea: a layer
+    // today is 1 upload, 4 experts x 2 dispatches, 1 read.
+    {
+        // ~2 GB of decoys, in the same shape the model holds most of (an expert's gate/up).
+        let (drows, dcols) = (1536usize, 2048usize);
+        let dnb = drows * (dcols / 32);
+        let dbytes: Vec<u8> = (0..dnb * 18).map(|i| (i % 251) as u8).collect();
+        let mut decoys: Vec<lb_q4_gpu::GpuQ4Mat> = Vec::new();
+        let mut resident_mb = 0usize;
+        while resident_mb < 2048 {
+            let m = lb_q4_gpu::GpuQ4Mat::upload(
+                &gpu,
+                lb_gguf::QuantMat::new(lb_gguf::GgmlType::Q4_0, drows, dcols, &dbytes),
+            )?;
+            resident_mb += m.bytes_on_device() / (1 << 20);
+            decoys.push(m);
+        }
+        println!("{{\"metric\":\"decoys_resident_mb\",\"value\":{resident_mb},\"buffers\":{}}}", decoys.len());
+
+        // One real dense shape, called the way `Lfm2::linear_vec` calls it: upload, launch, read.
+        for &(name, rows, cols) in &[("attn_q", 2048usize, 2048usize), ("shortconv.in_proj", 6144, 2048)] {
+            let nb = rows * (cols / 32);
+            let bytes: Vec<u8> = (0..nb * 18).map(|i| (i % 251) as u8).collect();
+            let w = lb_q4_gpu::GpuQ4Mat::upload(
+                &gpu,
+                lb_gguf::QuantMat::new(lb_gguf::GgmlType::Q4_0, rows, cols, &bytes),
+            )?;
+            let x = vec![0.05f32; cols];
+            let mut v = Vec::new();
+            for _ in 0..REPS {
+                let t = std::time::Instant::now();
+                for _ in 0..32 {
+                    std::hint::black_box(w.matvec(&gpu, &x, 1)?);
+                }
+                v.push(t.elapsed().as_secs_f64() * 1e3 / 32.0);
+            }
+            println!(
+                "{{\"metric\":\"as_called_matvec_ms\",\"shape\":{name:?},\"loaded\":true,\"value\":{:.4}}}",
+                median(v)
+            );
+        }
+
+        // A whole MoE layer as it runs today: one upload of x, top-4 experts each doing
+        // gate/up/silu then down (2 dispatches), one read for the layer.
+        {
+            let (n_embd, n_ff_exp) = (2048usize, 1536usize);
+            let gnb = n_ff_exp * (n_embd / 32);
+            let dnb2 = n_embd * (n_ff_exp / 32);
+            let gb: Vec<u8> = (0..gnb * 18).map(|i| (i % 251) as u8).collect();
+            let db: Vec<u8> = (0..dnb2 * 18).map(|i| (i % 241) as u8).collect();
+            let experts: Vec<lb_q4_gpu::GpuExpert> = (0..4)
+                .map(|_| {
+                    lb_q4_gpu::GpuExpert::upload(
+                        &gpu,
+                        lb_gguf::QuantMat::new(lb_gguf::GgmlType::Q4_0, n_ff_exp, n_embd, &gb),
+                        lb_gguf::QuantMat::new(lb_gguf::GgmlType::Q4_0, n_ff_exp, n_embd, &gb),
+                        lb_gguf::QuantMat::new(lb_gguf::GgmlType::Q4_0, n_embd, n_ff_exp, &db),
+                    )
+                })
+                .collect::<Result<_, _>>()?;
+            let x = vec![0.03f32; n_embd];
+            let mut v = Vec::new();
+            for _ in 0..REPS {
+                let t = std::time::Instant::now();
+                for _ in 0..8 {
+                    let xh = gpu.upload_f32(&x);
+                    let outs: Vec<(cubecl::server::Handle, usize)> =
+                        experts.iter().map(|e| e.launch(&gpu, &xh, 1)).collect();
+                    std::hint::black_box(gpu.read_all(outs)?);
+                }
+                v.push(t.elapsed().as_secs_f64() * 1e3 / 8.0);
+            }
+            let per_layer = median(v);
+            println!(
+                "{{\"metric\":\"as_called_moe_layer_ms\",\"experts\":4,\"dispatches\":8,\"value\":{per_layer:.4},\"x38_layers_ms\":{:.2}}}",
+                per_layer * 38.0
+            );
+        }
+        drop(decoys);
+    }
+
     let mut cpu_total = 0.0;
     let mut gpu_total = 0.0;
     for &(name, rows, cols, count) in SHAPES {

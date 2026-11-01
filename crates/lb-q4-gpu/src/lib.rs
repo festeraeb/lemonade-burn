@@ -17,7 +17,7 @@
 //! output per cube with a shared-memory tree.
 
 pub mod store;
-pub use store::{Gpu, GpuConv, GpuExpert, GpuQ4Mat, GpuQ6KMat};
+pub use store::{Gpu, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat};
 pub use cubecl::server as cubecl_server;
 
 use cubecl::prelude::*;
@@ -414,4 +414,107 @@ pub fn q6_k_matvec_gpu(w: QuantMat<'_>, x: &[f32], m: usize) -> Result<Vec<f32>,
     }
     let gpu = Gpu::open()?;
     GpuQ6KMat::upload(&gpu, w)?.matvec(&gpu, x, m)
+}
+
+/// One dispatch for a whole MoE layer's gate+up+silu, over experts concatenated into one buffer.
+///
+/// The per-expert kernel costs a dispatch per expert, and a dispatch on a loaded device measures
+/// **0.108 ms** -- so a top-4 layer pays 8 of them, 38 layers pay 304, and that is 42% of a
+/// token's matmul budget. Here all 64 experts of a layer live in one `gq`/`uq` buffer and the
+/// routing comes in as data, so the layer is one dispatch whatever the top-k.
+///
+/// `routes` holds two u32 per slot: `[expert_id, token_index]`. A slot is one (expert, token)
+/// pair the router chose, so `h` is `[slots, rows]` and output `o` maps to slot `o / rows`,
+/// row `o % rows`. Expert `e`'s rows start at block `e * rows * bpr`.
+///
+/// Concatenation is only sound because `q4_row_partial` reads the f16 scale at `sc[gb / 2]` from
+/// the GLOBAL block index: each expert's block count must therefore be even, or an expert
+/// boundary would land mid-u32 and shift every scale after it. `GpuExpertLayer::upload` asserts it.
+#[cube(launch)]
+fn q4_0_routed_gate_up_silu_kernel(
+    gq: &[V4U],
+    gs: &[u32],
+    uq: &[V4U],
+    us: &[u32],
+    x: &[V4F],
+    routes: &[u32],
+    dims: &[u32],
+    h: &mut [f32],
+    #[comptime] use_plane: bool,
+) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let bpe = rows * bpr;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < h.len() {
+        let slot = o / rows;
+        let r = o % rows;
+        let e = routes[2usize * slot] as usize;
+        let tok = routes[2usize * slot + 1usize] as usize;
+        let gb0 = e * bpe + r * bpr;
+        let x4 = tok * cols / 4usize;
+        let pg = q4_row_partial(gq, gs, x, gb0, x4, bpr, lane, width);
+        let pu = q4_row_partial(uq, us, x, gb0, x4, bpr, lane, width);
+        let g = lane_sum(&mut sm, pg, use_plane);
+        let u = lane_sum(&mut sm, pu, use_plane);
+        if lane == 0usize {
+            h[o] = g / (1.0f32 + Exp::exp(-g)) * u;
+        }
+        o += step;
+    }
+}
+
+/// One dispatch for a whole MoE layer's `down` projection, experts concatenated as above.
+///
+/// Unlike the gate/up pass, the input is the previous kernel's own output, so slot `s` reads
+/// `h[s * cols ..]` -- the slot index, not a token index. `routes` is the same buffer.
+#[cube(launch)]
+fn q4_0_routed_matvec_kernel(
+    qs: &[V4U],
+    sc: &[u32],
+    h: &[V4F],
+    routes: &[u32],
+    dims: &[u32],
+    out: &mut [f32],
+    #[comptime] use_plane: bool,
+) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let bpe = rows * bpr;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < out.len() {
+        let slot = o / rows;
+        let r = o % rows;
+        let e = routes[2usize * slot] as usize;
+        let p = q4_row_partial(qs, sc, h, e * bpe + r * bpr, slot * cols / 4usize, bpr, lane, width);
+        let v = lane_sum(&mut sm, p, use_plane);
+        if lane == 0usize {
+            out[o] = v;
+        }
+        o += step;
+    }
 }

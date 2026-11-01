@@ -7,7 +7,7 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{conv_decode_kernel, cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, THREADS};
+use crate::{conv_decode_kernel, cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, q4_0_routed_gate_up_silu_kernel, q4_0_routed_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, THREADS};
 use cubecl::bytes::Bytes;
 use cubecl::client::Client;
 use cubecl::prelude::*;
@@ -182,13 +182,20 @@ impl GpuQ4Mat {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
         unsafe {
+            // `from_raw_parts` counts ELEMENTS of the kernel's slice type, not u32 words:
+            // `qs`/`qv` are `&[V4U]` and `x` is `&[V4F]`, so the word counts divide by 4. Both
+            // divide exactly by construction (a Q4_0 block repacks to 4 u32 words, and `cols` is
+            // a multiple of 32) -- assert it so a future shape change fails here instead of
+            // silently handing the kernel a length 4x too long.
+            debug_assert_eq!(self.n_qs % 4, 0);
+            debug_assert_eq!((m * self.cols) % 4, 0);
             q4_0_matvec_kernel::launch(
                 &gpu.client,
                 cube_count(n_out, gpu.per_cube()),
                 CubeDim::new_1d(gpu.cube_dim as u32),
-                BufferArg::from_raw_parts(self.qs.clone(), self.n_qs),
+                BufferArg::from_raw_parts(self.qs.clone(), self.n_qs / 4),
                 BufferArg::from_raw_parts(self.sc.clone(), self.n_sc),
-                BufferArg::from_raw_parts(x.clone(), m * self.cols),
+                BufferArg::from_raw_parts(x.clone(), m * self.cols / 4),
                 BufferArg::from_raw_parts(self.dims.clone(), 2),
                 BufferArg::from_raw_parts(out.clone(), n_out),
                 gpu.use_plane,
@@ -362,13 +369,20 @@ impl GpuQ6KMat {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
         unsafe {
+            // `from_raw_parts` counts ELEMENTS of the kernel's slice type, not u32 words:
+            // `qs`/`qv` are `&[V4U]` and `x` is `&[V4F]`, so the word counts divide by 4. Both
+            // divide exactly by construction (a Q4_0 block repacks to 4 u32 words, and `cols` is
+            // a multiple of 32) -- assert it so a future shape change fails here instead of
+            // silently handing the kernel a length 4x too long.
+            debug_assert_eq!(self.n_qv % 4, 0);
+            debug_assert_eq!((m * self.cols) % 4, 0);
             q6_k_matvec_kernel::launch(
                 &gpu.client,
                 cube_count(n_out, gpu.per_cube()),
                 CubeDim::new_1d(gpu.cube_dim as u32),
-                BufferArg::from_raw_parts(self.qv.clone(), self.n_qv),
+                BufferArg::from_raw_parts(self.qv.clone(), self.n_qv / 4),
                 BufferArg::from_raw_parts(self.sd.clone(), self.n_sd),
-                BufferArg::from_raw_parts(x.clone(), m * self.cols),
+                BufferArg::from_raw_parts(x.clone(), m * self.cols / 4),
                 BufferArg::from_raw_parts(self.dims.clone(), 2),
                 BufferArg::from_raw_parts(out.clone(), n_out),
                 gpu.use_plane,
@@ -407,15 +421,23 @@ impl GpuExpert {
         let n_h = m * n_ff;
         let h = gpu.scratch(n_h * 4);
         unsafe {
+            // `from_raw_parts` counts ELEMENTS of the kernel's slice type, not u32 words:
+            // `qs`/`qv` are `&[V4U]` and `x` is `&[V4F]`, so the word counts divide by 4. Both
+            // divide exactly by construction (a Q4_0 block repacks to 4 u32 words, and `cols` is
+            // a multiple of 32) -- assert it so a future shape change fails here instead of
+            // silently handing the kernel a length 4x too long.
+            debug_assert_eq!(self.gate.n_qs % 4, 0);
+            debug_assert_eq!(self.up.n_qs % 4, 0);
+            debug_assert_eq!((m * self.gate.cols) % 4, 0);
             q4_0_gate_up_silu_kernel::launch(
                 &gpu.client,
                 cube_count(n_h, gpu.per_cube()),
                 CubeDim::new_1d(gpu.cube_dim as u32),
-                BufferArg::from_raw_parts(self.gate.qs.clone(), self.gate.n_qs),
+                BufferArg::from_raw_parts(self.gate.qs.clone(), self.gate.n_qs / 4),
                 BufferArg::from_raw_parts(self.gate.sc.clone(), self.gate.n_sc),
-                BufferArg::from_raw_parts(self.up.qs.clone(), self.up.n_qs),
+                BufferArg::from_raw_parts(self.up.qs.clone(), self.up.n_qs / 4),
                 BufferArg::from_raw_parts(self.up.sc.clone(), self.up.n_sc),
-                BufferArg::from_raw_parts(x.clone(), m * self.gate.cols),
+                BufferArg::from_raw_parts(x.clone(), m * self.gate.cols / 4),
                 BufferArg::from_raw_parts(self.gate.dims.clone(), 2),
                 BufferArg::from_raw_parts(h.clone(), n_h),
                 gpu.use_plane,
@@ -430,5 +452,151 @@ impl GpuExpert {
         let xh = gpu.upload_f32(x);
         let (out, n) = self.launch(gpu, &xh, m);
         Ok(gpu.read_all(vec![(out, n)])?.remove(0))
+    }
+}
+
+/// Every expert of one MoE layer, concatenated so the layer is **2 dispatches, not 2 per expert**.
+///
+/// A dispatch on a loaded device measures 0.108 ms, so a top-4 layer costs 8 of them and the 38
+/// MoE layers of a token cost 304 -- 37.6 ms, 42% of the matmul budget. Here the layer's experts
+/// share one buffer per projection and the routing arrives as data, so the cost stops scaling
+/// with top-k. It also collapses ~14,600 separate buffers to ~114, which should return a chunk
+/// of the 1.5 GB gap between the weights (13.66 GB) and what nvidia-smi reports (15.2 GB).
+pub struct GpuExpertLayer {
+    n_experts: usize,
+    /// gate/up rows (n_ff_exp) and cols (n_embd); `down` is the transpose.
+    n_ff: usize,
+    n_embd: usize,
+    gate: (Handle, usize, Handle, usize),
+    up: (Handle, usize, Handle, usize),
+    down: (Handle, usize, Handle, usize),
+    gu_dims: Handle,
+    dn_dims: Handle,
+    bytes: usize,
+}
+
+impl GpuExpertLayer {
+    /// Concatenate `experts` (gate, up, down per expert, all Q4_0 and all the same shape).
+    ///
+    /// The scale buffer can be concatenated verbatim only because `q4_row_partial` reads
+    /// `sc[gb / 2]` from the GLOBAL block index: a layer whose per-expert block count were odd
+    /// would put an expert boundary mid-u32 and shift every scale after it. Asserted here rather
+    /// than left to a wrong answer.
+    pub fn upload<'a>(gpu: &Gpu, experts: impl IntoIterator<Item = (QuantMat<'a>, QuantMat<'a>, QuantMat<'a>)>) -> Result<Self, String> {
+        let mut shape: Option<(usize, usize)> = None;
+        let (mut gq, mut gs, mut uq, mut us, mut dq, mut ds) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut n_experts = 0usize;
+        for (g, u, d) in experts {
+            for m in [&g, &u, &d] {
+                if m.ty != lb_gguf::GgmlType::Q4_0 {
+                    return Err(format!("GpuExpertLayer needs Q4_0, got {}", m.ty.name()));
+                }
+                if m.cols % 32 != 0 {
+                    return Err(format!("Q4_0 needs cols % 32 == 0, got {}", m.cols));
+                }
+            }
+            if g.rows != u.rows || g.cols != u.cols || d.rows != g.cols || d.cols != g.rows {
+                return Err("GpuExpertLayer: gate/up must share a shape and down must be its transpose".into());
+            }
+            match shape {
+                None => shape = Some((g.rows, g.cols)),
+                Some(s) if s == (g.rows, g.cols) => {}
+                Some(s) => return Err(format!("GpuExpertLayer: expert shape {:?} does not match {:?}", (g.rows, g.cols), s)),
+            }
+            for (m, q, s) in [(&g, &mut gq, &mut gs), (&u, &mut uq, &mut us), (&d, &mut dq, &mut ds)] {
+                let nb = m.rows * (m.cols / 32);
+                if nb % 2 != 0 {
+                    return Err(format!("GpuExpertLayer: {} blocks per expert is odd; concatenated scales would shift", nb));
+                }
+                let (qw, sw) = repack_q4_0(m.bytes, nb);
+                q.extend_from_slice(&qw);
+                s.extend_from_slice(&sw);
+            }
+            n_experts += 1;
+        }
+        let (n_ff, n_embd) = shape.ok_or("GpuExpertLayer: no experts")?;
+        let bytes = (gq.len() + gs.len() + uq.len() + us.len() + dq.len() + ds.len()) * 4;
+        let (ngq, ngs, nuq, nus, ndq, nds) = (gq.len(), gs.len(), uq.len(), us.len(), dq.len(), ds.len());
+        Ok(Self {
+            n_experts,
+            n_ff,
+            n_embd,
+            gate: (gpu.upload_u32(gq), ngq, gpu.upload_u32(gs), ngs),
+            up: (gpu.upload_u32(uq), nuq, gpu.upload_u32(us), nus),
+            down: (gpu.upload_u32(dq), ndq, gpu.upload_u32(ds), nds),
+            gu_dims: gpu.upload_u32(matvec_dims(n_ff, n_embd).to_vec()),
+            dn_dims: gpu.upload_u32(matvec_dims(n_embd, n_ff).to_vec()),
+            bytes,
+        })
+    }
+
+    pub fn n_experts(&self) -> usize {
+        self.n_experts
+    }
+
+    pub fn bytes_on_device(&self) -> usize {
+        self.bytes
+    }
+
+    /// Run the whole layer in **two** dispatches.
+    ///
+    /// `routes` is `[expert_id, token_index]` per slot, a slot being one (expert, token) pair the
+    /// router chose. `x` holds `n_tokens` activation rows of `n_embd`. Returns the output handle
+    /// and its length, `slots * n_embd`, in the same slot order as `routes`.
+    pub fn launch(&self, gpu: &Gpu, x: &Handle, n_tokens: usize, routes: &[u32]) -> Result<(Handle, usize), String> {
+        if routes.len() % 2 != 0 {
+            return Err("GpuExpertLayer::launch: routes must be [expert, token] pairs".into());
+        }
+        let slots = routes.len() / 2;
+        if slots == 0 {
+            return Err("GpuExpertLayer::launch: no slots".into());
+        }
+        if let Some(bad) = routes.chunks(2).find(|c| c[0] as usize >= self.n_experts) {
+            return Err(format!("GpuExpertLayer::launch: expert {} >= {}", bad[0], self.n_experts));
+        }
+        if let Some(bad) = routes.chunks(2).find(|c| c[1] as usize >= n_tokens) {
+            return Err(format!("GpuExpertLayer::launch: token {} >= {n_tokens}", bad[1]));
+        }
+        let rh = gpu.upload_u32(routes.to_vec());
+        let n_h = slots * self.n_ff;
+        let h = gpu.scratch(n_h * 4);
+        unsafe {
+            debug_assert_eq!(self.gate.1 % 4, 0);
+            debug_assert_eq!((n_tokens * self.n_embd) % 4, 0);
+            q4_0_routed_gate_up_silu_kernel::launch(
+                &gpu.client,
+                cube_count(n_h, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.gate.0.clone(), self.gate.1 / 4),
+                BufferArg::from_raw_parts(self.gate.2.clone(), self.gate.3),
+                BufferArg::from_raw_parts(self.up.0.clone(), self.up.1 / 4),
+                BufferArg::from_raw_parts(self.up.2.clone(), self.up.3),
+                BufferArg::from_raw_parts(x.clone(), n_tokens * self.n_embd / 4),
+                BufferArg::from_raw_parts(rh.clone(), routes.len()),
+                BufferArg::from_raw_parts(self.gu_dims.clone(), 2),
+                BufferArg::from_raw_parts(h.clone(), n_h),
+                gpu.use_plane,
+            );
+        }
+        let n_out = slots * self.n_embd;
+        let out = gpu.scratch(n_out * 4);
+        unsafe {
+            debug_assert_eq!(self.down.1 % 4, 0);
+            debug_assert_eq!(n_h % 4, 0);
+            q4_0_routed_matvec_kernel::launch(
+                &gpu.client,
+                cube_count(n_out, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.down.0.clone(), self.down.1 / 4),
+                BufferArg::from_raw_parts(self.down.2.clone(), self.down.3),
+                BufferArg::from_raw_parts(h.clone(), n_h / 4),
+                BufferArg::from_raw_parts(rh.clone(), routes.len()),
+                BufferArg::from_raw_parts(self.dn_dims.clone(), 2),
+                BufferArg::from_raw_parts(out.clone(), n_out),
+                gpu.use_plane,
+            );
+        }
+        Ok((out, n_out))
     }
 }

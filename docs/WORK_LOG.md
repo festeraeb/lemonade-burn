@@ -127,6 +127,51 @@ the same card.
 layer pattern (1 upload, 8 launches, 1 read). If those land near the 0.28 ms floor, F1/F3
 below are the whole story; if they come out at 2x, bind-group/tracker churn is real.
 
+## Measured on the quiet host with the device loaded (2026-11-01) — this sizes F1
+
+`dense_bench` now has three "as called" rows: a matvec the way `linear_vec` calls it
+(upload + launch + read) and a whole MoE layer (1 upload, 4 experts x 2 dispatches, 1 read),
+both **with ~2 GB of decoy buffers resident**, because an almost-empty device is not what the
+model runs on. Run on c2, `LB_WGPU_DEVICE=discrete:0`:
+
+| | c2, loaded | what t440 said |
+|---|---|---|
+| round-trip floor | **0.1276 ms** | 0.26-0.31 ms |
+| saved per sync removed | **0.127-0.155 ms** | ~0.24 ms |
+| as-called matvec, attn_q | **0.3173 ms** | — |
+| as-called matvec, in_proj | **0.4373 ms** | — |
+| **MoE layer as called** | **0.9897 ms** | — |
+
+Three things follow, and two of them correct earlier numbers in this file:
+
+1. **The round-trip floor is HALF what t440 measured.** The sync cost was never hardware, it
+   was t440's load. So the sync-elimination arithmetic that gave a 1.46x ceiling was built on an
+   inflated per-sync figure; at 0.127 ms, all 145 syncs are 18.4 ms of a 96.7 ms token = **1.24x**.
+2. **A real matvec on a loaded device costs ~2.5x the round-trip floor** (0.317 vs 0.128 for
+   attn_q). The per-call overhead Fable inferred from the runtime source — a fresh `BindGroup`
+   per dispatch, `queue.write_buffer` per upload, a readback costing two thread wake-ups — is
+   **real and measurable**, not speculation.
+3. **The implied per-dispatch cost is 0.108 ms, 2.8x the 0.039 ms the chained microbenchmark
+   suggested.** Chaining dispatches hides exactly the per-call work that the model pays.
+
+### What that does to F1
+
+The expert side is **0.9897 x 38 = 37.6 ms**, i.e. **42% of the 89.6 ms matmul budget** of a
+real c2 token (`decode_forward_ms` 96.68, `decode_matmul_ms` 89.62, `decode_other_ms` 7.07).
+
+F1 takes a layer from 8 dispatches to 2, removing **228 dispatches a token**:
+
+| | |
+|---|---|
+| saved | 6 x 0.108 x 38 = **24.6 ms** |
+| token | 96.7 -> **72.1 ms** |
+| **speedup** | **~1.34x** (10.34 -> 13.87 tok/s) |
+
+So **F1 is worth roughly three times Fable's 1.10-1.12x estimate** and is comfortably clear of
+the 1.1x bar. **Caveat before anyone quotes 1.34x:** the bench uses 4 synthetic experts in a
+tight loop, while a real layer also routes and combines on the host, so treat this as an upper
+bound until F1 is measured end to end with the byte-identical gate.
+
 ## Ranked fixes against the 1.1x bar (decode 98 ms, so 1.1x needs >= 9 ms)
 
 1. **F1 — one launch per MoE projection per layer.** Concatenate each layer's 64 experts into
