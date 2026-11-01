@@ -322,11 +322,21 @@ This box runs photogrammetry and a llama-server at load 70-105, so sequential ar
 comparable (the CPU arm alone varied 2.1x between rounds). Arms were interleaved on the same
 card. 20 reps, medians of `timings.predicted_per_second`:
 
-| | tok/s | spread | vs CPU arm | decode ms/token |
-|---|---|---|---|---|
-| dense on the CPU | 1.822 | 2.14x | — | ~860-1040 (all passes) |
-| dense Q4_0 resident | 4.815 | 1.24x | **2.64x** | ~241-246 (all passes) |
-| + Q6_K head | 7.06 | 1.13x | **3.87x** | **142.9** |
+| | tok/s | spread | step | vs CPU arm | decode ms/token |
+|---|---|---|---|---|---|
+| dense on the CPU | 1.822 | 2.14x | — | — | ~860-1040 (all passes) |
+| 106 dense Q4_0 resident | 4.815 / 4.690 | 1.24x / 1.08x | **2.64x** | 2.64x | 218.6-221.7 |
+| + the Q6_K head | 7.333 | 1.23x | **1.56x** | **4.02x** | **141.0-143.4** |
+
+Two interleaved sets: A against Q4_0-only, then Q4_0-only against +head (the Q4_0 arm came
+out 4.815 and 4.690 in sets run an hour apart, which is the reproducibility check). 2.64 x
+1.56 = 4.12x compounded against 4.02x measured end to end.
+
+A budget that cannot take all 751 MB takes the Q4_0 matrices first: they return 0.70 ms of
+CPU per device MB against the head's 0.16 (commit 3865023; ordering by size instead spent a
+third of a 600 MB budget on the head and silently left 69 of the 106 Q4_0 matrices on the
+CPU). On the card, 751 MB of weights sits at ~15.2 GB of 16.4 GB in `nvidia-smi` once
+CubeCL's allocator and the scratch pool are counted, not the 13.7 GB the weights alone imply.
 
 Prefill on the same prompt: 4.0 s -> 0.86 s. **Every rep of every arm returned byte-identical
 greedy text** (sha 062392b8d2b0361a) — the correctness gate, passed before any speed number
@@ -344,7 +354,7 @@ happened to be the right one, for a simpler reason.
 
 ### What the numbers now point at
 
-134 ms of the 142.9 ms decode token is matmul, but the device arithmetic inside it is a small
+133 ms of the ~141 ms decode token is matmul, but the device arithmetic inside it is a small
 fraction of that. A token makes about **145 host syncs** — 107 dense matrices plus 38 expert
 layers — and under this load each costs roughly 1 ms against the 0.26-0.31 ms idle floor.
 So the next lever is **syncing once per layer instead of once per matrix** (keep a layer's
