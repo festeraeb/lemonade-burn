@@ -215,8 +215,19 @@ periodic re-tune trigger.
 
 ## 7. Phase A status (what the single-card engine still needs)
 
-Done this round: workgroup-per-output kernel (4x per expert call), `Gpu::sync` fence,
-measurement harness, VRAM from driver counters (`topology.rs`). Not done: activations
+Done this round: workgroup-per-output kernel (4x per expert call), 2-D dispatch (a
+44-token prompt had exceeded the 65,535-cube dimension cap; regression test added),
+`Gpu::sync` fence, measurement harness, VRAM from driver counters (`topology.rs`).
+
+End to end with the new kernel **[measured 2026-11-01, c4 GTX 1070, 4 GB pool, 753
+resident experts, same 3 prompts as step 2, 32 threads, lb-q4-gpu 7/7 tests on the card]**:
+GPU-path top-1 equals the CPU path at all 86 positions (75/86 vs the llama.cpp oracle,
+unchanged); resident expert calls 5868 in 5.6 s (was 10.1 s at step 2); prefill now
+faster than CPU-only (29 tokens 3.4 s vs 4.1 s; 44 tokens 4.7 s vs 6.0 s; 13 tokens
+1.7 s vs 1.9 s); decode still slower (3.4 / 3.8 / 3.6 tok/s vs 5.2 / 4.8 / 5.1 CPU-only)
+because the per-expert activation upload, the per-layer sync and the CPU dense path
+remain: exactly the Phase A items below, which the simulator prices at the difference
+between today's 3.6 and its 7.9 tok/s for this card. Not done: activations
 kept on the device across layers (dense path on Burn's wgpu backend), persistent
 per-layer buffers, plan/launch split with one sync per layer, pool buffer + slot-index
 batched kernel. These remain the step-3 list in `LFM2_CUBECL.md` §10; the simulator now
