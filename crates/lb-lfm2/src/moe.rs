@@ -104,7 +104,9 @@ impl Placement {
     /// Greedy: the hottest experts across all layers (by histogram count, normalized per
     /// layer so every layer gets a fair share) become GPU-resident until `budget_bytes`
     /// is spent; `bytes_per_expert[layer]` is the size of one expert's three matrices.
-    /// Layers with no routing data get no residents (CPU is the safe default).
+    /// Experts the histogram never saw then fill whatever budget is left, round robin by
+    /// layer (see [`Placement::fill_unseen`]), because an arbitrary resident expert still
+    /// beats serving a miss from the model file.
     pub fn plan(hist: &Histogram, bytes_per_expert: &[usize], budget_bytes: usize) -> Self {
         let n_layer = hist.counts.len();
         let mut cands: Vec<(f64, usize, usize)> = Vec::new();
@@ -130,7 +132,39 @@ impl Placement {
             p.homes[l][e] = Home::Gpu;
             p.resident_bytes += b;
         }
+        p.fill_unseen(bytes_per_expert, budget_bytes);
         p
+    }
+
+    /// Spend any budget the histogram could not spend on experts it never saw.
+    ///
+    /// Routing data is the binding constraint, not VRAM: two scrape runs name only 2066 of
+    /// the 24B's 10240 experts, so a 12 GB and a 14.5 GB budget both planned the same 2066
+    /// residents and left 3.5 GB of a 16 GB card idle. An expert chosen with no evidence is
+    /// a poor bet individually, but the alternative is serving that call from the model file
+    /// at a measured 21 ms, against 0.5 ms for any resident - so an idle card is never
+    /// right. Round robin over layers so no layer is starved, lowest expert id first, which
+    /// keeps the plan deterministic for a given budget.
+    fn fill_unseen(&mut self, bytes_per_expert: &[usize], budget_bytes: usize) {
+        let n_expert = self.homes.first().map_or(0, Vec::len);
+        for e in 0..n_expert {
+            let mut any = false;
+            for (l, row) in self.homes.iter_mut().enumerate() {
+                // layers with no MoE FFN report zero bytes: never stage those
+                let b = bytes_per_expert.get(l).copied().unwrap_or(0);
+                if b == 0 || self.resident_bytes + b > budget_bytes {
+                    continue;
+                }
+                if row[e] == Home::Cpu {
+                    row[e] = Home::Gpu;
+                    self.resident_bytes += b;
+                }
+                any = true;
+            }
+            if !any {
+                break;
+            }
+        }
     }
 
     pub fn home(&self, layer: usize, expert: usize) -> Home {
@@ -582,6 +616,26 @@ mod tests {
         assert_eq!(p.home(1, 0), Home::Cpu); // no data: nothing resident
         assert_eq!(p.n_resident(), 2);
         assert_eq!(p.resident_bytes, 200);
+    }
+
+    #[test]
+    fn leftover_budget_goes_to_experts_the_scrapes_never_saw() {
+        // Only layer 0 and layer 2 have routing data, and only some of their experts, so
+        // the histogram alone can spend at most 700 of the 1000 available.
+        let hist = Histogram { model_id: "t".into(), counts: vec![vec![10, 0, 5, 1], vec![0, 0, 0, 0], vec![3, 3, 3, 3]] };
+        let p = Placement::plan(&hist, &[100, 100, 100], 1000);
+        assert_eq!(p.resident_bytes, 1000, "the whole budget should be spent");
+        assert_eq!(p.n_resident(), 10);
+        // the unseen layer gets residents now rather than leaving the card idle
+        assert_eq!(p.home(1, 0), Home::Gpu);
+        // The fill is round robin by layer, so the 3 slots the histogram left over do not
+        // all land in one layer: the unseen layer takes 2 of them and none stays empty.
+        let per_layer: Vec<usize> = (0..3).map(|l| (0..4).filter(|&e| p.home(l, e) == Home::Gpu).count()).collect();
+        assert_eq!(per_layer, vec![4, 2, 4]);
+        // a layer whose FFN is dense (zero bytes per expert) is never staged
+        let dense = Placement::plan(&hist, &[100, 0, 100], 1000);
+        assert_eq!(dense.home(1, 0), Home::Cpu);
+        assert_eq!(dense.resident_bytes, 800);
     }
 
     #[test]
