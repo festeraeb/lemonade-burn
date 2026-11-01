@@ -179,6 +179,43 @@ kernel and 58-85% hits).
   at 4x. On c3 (12.7 ms per CPU expert) misses dominate everything: the WX 5100 single-card
   tune gives 1.3 tok/s and wants k=24-32 resident (76% hits) just to get there.
 
+## 5b. Correction (measured 2026-11-01): the bus was never the bottleneck
+
+Everything above about bandwidth rests on 0.5-1.1 GB/s "achieved h2d", measured on the only
+two cards benched: the c4 GTX 1070 (Gen1 x4) and the c3 WX 5100 (Gen2 x4) - the two worst
+links we own. Every x16 figure above is **hypothetical**. Re-measured on t440's two identical
+Tesla P100s, one in a Gen3 x8 slot and one in a Gen3 x16 slot:
+
+| card | link | `lb-gpu-bench` (our CubeCL path), 64 MB | raw `cudaMemcpy` pinned | pageable |
+|---|---|---|---|---|
+| dev0 | Gen3 x8 | 266 MB/s | **6,241 MB/s** | 5,939 MB/s |
+| dev1 | Gen3 x16 | 264 MB/s | **12,260 MB/s** | 6,661 MB/s |
+
+(`bench/t440-p100-gen3x8.json`, `bench/t440-p100-gen3x16.json`, `bench/raw-h2d-bwtest.cu`.)
+
+The links are healthy and scale exactly as the width predicts. **Our copy path loses 46x**;
+even naive pageable `malloc` beats it 25x. Two signatures confirm the cost is host-side, not
+the link: through our path the 64 MB blob is *slower* than the 5.3 MB one (266 vs 1201 MB/s),
+and the x16 card measured *slower* than the x8 one (903 vs 1201 MB/s at 5.3 MB). Activation
+handoffs are the same story - 220/599 us on the P100s against 129 us on the 1070 on Gen1 x4.
+
+Consequences for section 5:
+
+* The 12.9 GB/s needed for k=16, N=3 rolling is **met** by a real Gen3 x16 slot (12.26 GB/s
+  measured). The "85-97% stall" rows are a software limit, not a hardware verdict.
+* So **fix the copy path first** - reused pinned staging buffers, no per-call allocation,
+  batched submits - and only then re-run `bw_sweep` to judge rolling. The sweep's "4x" and
+  "8x" columns are inside reach of the hardware we already own.
+* `card_of()` dealing layers round robin is what makes the slowest card set the stall. Deal
+  layers so slow-link cards stay **static** (a static card copies zero bytes per token, so its
+  link width is irrelevant) and the x16 cards carry the rolling set. Also prefer contiguous
+  blocks over round robin: modulo hands off every layer (~37 handoffs/token), blocks pay N-1.
+* `MissPolicy` should be per card, not global: on-demand copies on an x16 card, CPU on an x4.
+
+What does **not** change: the expert kernel is still the ceiling. It takes 0.33-0.36 ms on a
+P100 against 0.430 ms on a GTX 1070 - about 1.2x for roughly 3x the fp32 throughput, so the
+kernel badly underuses the big cards. Static staging remains the right thing to ship first.
+
 **Verdict:** on our hardware the pipeline hides staging only in the static regime, which
 is the one to build: enough VRAM across the cards to hold `k=24..32` sets per layer
 (4.8-6.5 GB total; 2 x 4 GB cards or one 8 GB card with the dense weights elsewhere),

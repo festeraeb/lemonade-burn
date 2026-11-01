@@ -1,0 +1,16 @@
+{"host":"t440cesarops","device":"discrete:0","gpu":"Wgpu(WgpuDevice { kind: DiscreteGpu(0), backend: Auto })","expert_bytes":5308416}
+{"metric":"cpu_expert_ms_all_threads","value":2.1982,"note":"threads=48"}
+{"metric":"cpu_expert_ms_1_thread","value":16.7196,"note":"threads=1"}
+{"metric":"cpu_q6k_head_ms","value":43.0690,"note":"threads=48"}
+{"metric":"h2d_expert_mb_s","value":1201.3750,"note":"5308416 bytes in 4.419 ms"}
+{"metric":"h2d_bulk_mb_s","value":266.0419,"note":"67108864 bytes in 252.249 ms"}
+{"metric":"d2h_h2d_act_m1_us","value":219.6930,"note":"8192 bytes each way"}
+{"metric":"d2h_h2d_act_m4_us","value":221.4110,"note":"32768 bytes each way"}
+{"metric":"d2h_h2d_act_m32_us","value":1142.6510,"note":"262144 bytes each way"}
+{"metric":"expert_ffn_m1_ms","value":0.4691,"note":"upload x + 4 launches + readback"}
+{"metric":"expert_ffn_batch4_m1_ms_per_expert","value":0.3563,"note":"4 experts, one readback"}
+{"metric":"expert_ffn_m4_ms","value":1.0736,"note":"upload x + 4 launches + readback"}
+{"metric":"expert_ffn_batch4_m4_ms_per_expert","value":1.0791,"note":"4 experts, one readback"}
+{"metric":"dense_in_proj_6144x2048_ms","value":0.8585,"note":"launch + readback, m=1"}
+{"metric":"dense_out_proj_2048x2048_ms","value":0.3392,"note":"launch + readback, m=1"}
+{"metric":"dense_kv_512x2048_ms","value":0.7153,"note":"launch + readback, m=1"}
