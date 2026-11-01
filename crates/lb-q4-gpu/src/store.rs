@@ -182,13 +182,20 @@ impl GpuQ4Mat {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
         unsafe {
+            // `from_raw_parts` counts ELEMENTS of the kernel's slice type, not u32 words:
+            // `qs`/`qv` are `&[V4U]` and `x` is `&[V4F]`, so the word counts divide by 4. Both
+            // divide exactly by construction (a Q4_0 block repacks to 4 u32 words, and `cols` is
+            // a multiple of 32) -- assert it so a future shape change fails here instead of
+            // silently handing the kernel a length 4x too long.
+            debug_assert_eq!(self.n_qs % 4, 0);
+            debug_assert_eq!((m * self.cols) % 4, 0);
             q4_0_matvec_kernel::launch(
                 &gpu.client,
                 cube_count(n_out, gpu.per_cube()),
                 CubeDim::new_1d(gpu.cube_dim as u32),
-                BufferArg::from_raw_parts(self.qs.clone(), self.n_qs),
+                BufferArg::from_raw_parts(self.qs.clone(), self.n_qs / 4),
                 BufferArg::from_raw_parts(self.sc.clone(), self.n_sc),
-                BufferArg::from_raw_parts(x.clone(), m * self.cols),
+                BufferArg::from_raw_parts(x.clone(), m * self.cols / 4),
                 BufferArg::from_raw_parts(self.dims.clone(), 2),
                 BufferArg::from_raw_parts(out.clone(), n_out),
                 gpu.use_plane,
@@ -362,13 +369,20 @@ impl GpuQ6KMat {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
         unsafe {
+            // `from_raw_parts` counts ELEMENTS of the kernel's slice type, not u32 words:
+            // `qs`/`qv` are `&[V4U]` and `x` is `&[V4F]`, so the word counts divide by 4. Both
+            // divide exactly by construction (a Q4_0 block repacks to 4 u32 words, and `cols` is
+            // a multiple of 32) -- assert it so a future shape change fails here instead of
+            // silently handing the kernel a length 4x too long.
+            debug_assert_eq!(self.n_qv % 4, 0);
+            debug_assert_eq!((m * self.cols) % 4, 0);
             q6_k_matvec_kernel::launch(
                 &gpu.client,
                 cube_count(n_out, gpu.per_cube()),
                 CubeDim::new_1d(gpu.cube_dim as u32),
-                BufferArg::from_raw_parts(self.qv.clone(), self.n_qv),
+                BufferArg::from_raw_parts(self.qv.clone(), self.n_qv / 4),
                 BufferArg::from_raw_parts(self.sd.clone(), self.n_sd),
-                BufferArg::from_raw_parts(x.clone(), m * self.cols),
+                BufferArg::from_raw_parts(x.clone(), m * self.cols / 4),
                 BufferArg::from_raw_parts(self.dims.clone(), 2),
                 BufferArg::from_raw_parts(out.clone(), n_out),
                 gpu.use_plane,
@@ -407,15 +421,23 @@ impl GpuExpert {
         let n_h = m * n_ff;
         let h = gpu.scratch(n_h * 4);
         unsafe {
+            // `from_raw_parts` counts ELEMENTS of the kernel's slice type, not u32 words:
+            // `qs`/`qv` are `&[V4U]` and `x` is `&[V4F]`, so the word counts divide by 4. Both
+            // divide exactly by construction (a Q4_0 block repacks to 4 u32 words, and `cols` is
+            // a multiple of 32) -- assert it so a future shape change fails here instead of
+            // silently handing the kernel a length 4x too long.
+            debug_assert_eq!(self.gate.n_qs % 4, 0);
+            debug_assert_eq!(self.up.n_qs % 4, 0);
+            debug_assert_eq!((m * self.gate.cols) % 4, 0);
             q4_0_gate_up_silu_kernel::launch(
                 &gpu.client,
                 cube_count(n_h, gpu.per_cube()),
                 CubeDim::new_1d(gpu.cube_dim as u32),
-                BufferArg::from_raw_parts(self.gate.qs.clone(), self.gate.n_qs),
+                BufferArg::from_raw_parts(self.gate.qs.clone(), self.gate.n_qs / 4),
                 BufferArg::from_raw_parts(self.gate.sc.clone(), self.gate.n_sc),
-                BufferArg::from_raw_parts(self.up.qs.clone(), self.up.n_qs),
+                BufferArg::from_raw_parts(self.up.qs.clone(), self.up.n_qs / 4),
                 BufferArg::from_raw_parts(self.up.sc.clone(), self.up.n_sc),
-                BufferArg::from_raw_parts(x.clone(), m * self.gate.cols),
+                BufferArg::from_raw_parts(x.clone(), m * self.gate.cols / 4),
                 BufferArg::from_raw_parts(self.gate.dims.clone(), 2),
                 BufferArg::from_raw_parts(h.clone(), n_h),
                 gpu.use_plane,

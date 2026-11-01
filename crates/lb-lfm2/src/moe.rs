@@ -433,17 +433,26 @@ pub fn moe_ffn(
     #[cfg(not(feature = "gpu"))]
     let _ = &gpu_part;
 
-    let t = std::time::Instant::now();
+    // With every expert resident `cpu_part` is empty for all 38 MoE layers of every token, and
+    // a rayon scope still costs something to set up and tear down -- 38 times a token, inside
+    // the timed region. Skip it when there is nothing to run.
+    // `mut` is only needed with the `gpu` feature, where the resident outputs are extended in.
     #[allow(unused_mut)]
-    let mut parts: Vec<(Vec<(usize, f32)>, Vec<f32>)> = cpu_part
-        .into_par_iter()
-        .map(|(e, toks)| {
-            let xs = gather(&toks);
-            let y = expert_ffn(w, gate, up, down, e, &xs, toks.len());
-            (toks, y)
-        })
-        .collect();
-    stats.cpu_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let mut parts: Vec<(Vec<(usize, f32)>, Vec<f32>)> = if cpu_part.is_empty() {
+        Vec::new()
+    } else {
+        let t = std::time::Instant::now();
+        let v: Vec<(Vec<(usize, f32)>, Vec<f32>)> = cpu_part
+            .into_par_iter()
+            .map(|(e, toks)| {
+                let xs = gather(&toks);
+                let y = expert_ffn(w, gate, up, down, e, &xs, toks.len());
+                (toks, y)
+            })
+            .collect();
+        stats.cpu_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        v
+    };
 
     #[cfg(feature = "gpu")]
     if let Some(gpu) = store.gpu.as_ref() {
