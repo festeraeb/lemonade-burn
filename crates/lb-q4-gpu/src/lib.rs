@@ -17,7 +17,7 @@
 //! output per cube with a shared-memory tree.
 
 pub mod store;
-pub use store::{Gpu, GpuExpert, GpuQ4Mat, GpuQ6KMat};
+pub use store::{Gpu, GpuConv, GpuExpert, GpuQ4Mat, GpuQ6KMat};
 pub use cubecl::server as cubecl_server;
 
 use cubecl::prelude::*;
@@ -221,6 +221,56 @@ fn q6_k_matvec_kernel(qv: &[V4U], sd: &[f32], x: &[V4F], dims: &[u32], out: &mut
             out[o] = total;
         }
         o += step;
+    }
+}
+
+/// The whole middle of an LFM2 short-conv block, for one token, on the device.
+///
+/// `in_proj` and `out_proj` are both resident matmuls, but everything between them was Burn
+/// CPU tensor ops, so each conv layer paid two host syncs -- and 30 of the model's 40 layers
+/// are conv layers, which is 60 of a token's ~145 syncs. Measured, a sync costs ~0.24 ms more
+/// than it needs to (see `dense_bench`'s chain row), and the arithmetic here is 5 flops per
+/// channel: it is pure latency.
+///
+/// Per channel `i` of `e`, with `bcx = in_proj(h)` laid out `[b | c | x]`:
+/// ```text
+/// bx   = b[i] * x[i]
+/// acc  = sum_k conv[k][i] * z[k]      where z = [state rows ..., bx]
+/// y[i] = c[i] * acc
+/// state <- z[1..]                      (the l-1 most recent rows)
+/// ```
+/// `state` is read and rewritten in place, so it stays on the device across tokens and never
+/// costs a transfer. Unit `i` touches only indices `i, e+i, ...`, so there is no cross-unit
+/// dependency and no barrier is needed; the state shift ascends, so each row is read before
+/// it is overwritten.
+///
+/// One token only (`m = 1`). Prefill keeps the CPU path: it is a different, cheaper problem
+/// (one pass over the whole prompt) and is not the bottleneck.
+#[cube(launch)]
+fn conv_decode_kernel(bcx: &[f32], conv: &[f32], state: &mut [f32], y: &mut [f32], dims: &[u32]) {
+    let e = dims[0] as usize;
+    let l = dims[1] as usize;
+    let mut i = ABSOLUTE_POS as usize;
+    let stride = (CUBE_COUNT as usize) * (CUBE_DIM_X as usize);
+    while i < e {
+        let bx = bcx[i] * bcx[2usize * e + i];
+        let c = bcx[e + i];
+        let mut acc = 0.0f32;
+        let mut k = 0usize;
+        while k < l - 1usize {
+            acc += conv[k * e + i] * state[k * e + i];
+            k += 1usize;
+        }
+        acc += conv[(l - 1usize) * e + i] * bx;
+        y[i] = c * acc;
+        // drop the oldest row, append bx
+        let mut k = 0usize;
+        while k + 2usize < l {
+            state[k * e + i] = state[(k + 1usize) * e + i];
+            k += 1usize;
+        }
+        state[(l - 2usize) * e + i] = bx;
+        i += stride;
     }
 }
 

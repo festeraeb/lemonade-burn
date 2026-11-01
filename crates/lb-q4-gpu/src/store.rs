@@ -7,7 +7,7 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, THREADS};
+use crate::{conv_decode_kernel, cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, THREADS};
 use cubecl::bytes::Bytes;
 use cubecl::client::Client;
 use cubecl::prelude::*;
@@ -201,6 +201,93 @@ impl GpuQ4Mat {
         let xh = gpu.upload_f32(x);
         let out = self.launch(gpu, &xh, m);
         Ok(gpu.read_all(vec![(out, m * self.rows)])?.remove(0))
+    }
+}
+
+/// One LFM2 short-conv block resident on the device: `in_proj`, the taps, the rolling state
+/// and `out_proj`, so a decode step costs **one** host sync for the layer instead of two.
+///
+/// The state lives on the device and is updated in place by the kernel, so it never crosses
+/// the bus. That also means [`Self::launch`] is **stateful**: calling it advances the layer
+/// by one token, and it must be called once per token in order. `reset` clears it between
+/// sequences, and prefill (`m > 1`) must not use this path at all -- it would leave the state
+/// holding the wrong rows.
+pub struct GpuConv {
+    pub in_proj: GpuQ4Mat,
+    pub out_proj: GpuQ4Mat,
+    /// `[l_cache, n_embd]`, tap `k` at `k * n_embd`.
+    conv: Handle,
+    /// `[l_cache - 1, n_embd]`, the most recent rows of `b * x`.
+    state: Handle,
+    dims: Handle,
+    e: usize,
+    l: usize,
+}
+
+impl GpuConv {
+    /// `conv` is `[l_cache][n_embd]`, already in tap order (see `lb_lfm2::weights`).
+    pub fn upload(gpu: &Gpu, in_proj: QuantMat<'_>, conv: &[f32], out_proj: QuantMat<'_>) -> Result<Self, String> {
+        let e = out_proj.rows;
+        if conv.len() % e != 0 {
+            return Err(format!("conv taps {} not a multiple of n_embd {e}", conv.len()));
+        }
+        let l = conv.len() / e;
+        if l < 2 {
+            return Err(format!("l_cache must be at least 2, got {l}"));
+        }
+        if in_proj.rows != 3 * e {
+            return Err(format!("in_proj rows {} expected 3 x {e}", in_proj.rows));
+        }
+        Ok(Self {
+            in_proj: GpuQ4Mat::upload(gpu, in_proj)?,
+            out_proj: GpuQ4Mat::upload(gpu, out_proj)?,
+            conv: gpu.upload_f32(conv),
+            state: gpu.client.create(Bytes::from_elems(vec![0f32; (l - 1) * e])),
+            dims: gpu.upload_u32(vec![e as u32, l as u32]),
+            e,
+            l,
+        })
+    }
+
+    pub fn bytes_on_device(&self) -> usize {
+        self.in_proj.bytes_on_device() + self.out_proj.bytes_on_device() + (self.l * 2 - 1) * self.e * 4
+    }
+
+    /// Zero the rolling state: a new sequence starts with no history.
+    pub fn reset(&self, gpu: &Gpu) {
+        let zeros = vec![0f32; (self.l - 1) * self.e];
+        // overwrite in place so every handle already captured in a launch still refers to it
+        gpu.client.write(&self.state, Bytes::from_elems(zeros));
+    }
+
+    /// One decode token: `in_proj -> conv -> out_proj`, all on the device. Returns the output
+    /// handle and its length; nothing is read back, so the caller syncs once for the layer.
+    ///
+    /// Advances the rolling state by one token. `x` must be a single row (`m = 1`).
+    pub fn launch(&self, gpu: &Gpu, x: &Handle) -> (Handle, usize) {
+        let bcx = self.in_proj.launch(gpu, x, 1);
+        let y = gpu.scratch(self.e * 4);
+        unsafe {
+            conv_decode_kernel::launch(
+                &gpu.client,
+                cube_count(self.e, gpu.cube_dim),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(bcx.clone(), 3 * self.e),
+                BufferArg::from_raw_parts(self.conv.clone(), self.l * self.e),
+                BufferArg::from_raw_parts(self.state.clone(), (self.l - 1) * self.e),
+                BufferArg::from_raw_parts(y.clone(), self.e),
+                BufferArg::from_raw_parts(self.dims.clone(), 2),
+            );
+        }
+        let out = self.out_proj.launch(gpu, &y, 1);
+        (out, self.e)
+    }
+
+    /// Upload `x`, run the block, read the result (one token, one round trip).
+    pub fn forward(&self, gpu: &Gpu, x: &[f32]) -> Result<Vec<f32>, String> {
+        let xh = gpu.upload_f32(x);
+        let (out, n) = self.launch(gpu, &xh);
+        Ok(gpu.read_all(vec![(out, n)])?.remove(0))
     }
 }
 
