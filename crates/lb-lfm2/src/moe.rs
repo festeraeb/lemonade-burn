@@ -278,13 +278,21 @@ pub fn moe_ffn(
     let gpu_launched: Vec<(Vec<(usize, f32)>, (cubecl_handle::Handle, usize))> = {
         let t = std::time::Instant::now();
         let v = match store.gpu.as_ref() {
-            Some(gpu) => gpu_part
-                .iter()
-                .map(|(e, toks)| {
-                    let xh = gpu.upload_f32(&gather(toks));
-                    (toks.clone(), store.resident[&(layer, *e)].launch(gpu, &xh, toks.len()))
-                })
-                .collect(),
+            Some(gpu) => {
+                // Experts that drew the same tokens see byte-identical activations, so upload
+                // once per distinct token set and share the handle. In decode (m = 1) every
+                // expert in the layer draws token 0, so this is one upload per layer instead
+                // of one per resident expert.
+                let mut uploaded: HashMap<Vec<usize>, cubecl_handle::Handle> = HashMap::new();
+                gpu_part
+                    .iter()
+                    .map(|(e, toks)| {
+                        let key: Vec<usize> = toks.iter().map(|(t, _)| *t).collect();
+                        let xh = uploaded.entry(key).or_insert_with(|| gpu.upload_f32(&gather(toks))).clone();
+                        (toks.clone(), store.resident[&(layer, *e)].launch(gpu, &xh, toks.len()))
+                    })
+                    .collect()
+            }
             None => Vec::new(),
         };
         stats.gpu_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
