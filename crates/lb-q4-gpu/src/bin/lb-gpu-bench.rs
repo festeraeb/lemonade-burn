@@ -13,8 +13,11 @@
 //!   cpu_expert_ms       one expert on this host's CPU (lb-gguf reference path), all threads / 1 thread
 use lb_gguf::types::quantize_q4_0;
 use lb_gguf::{matvec_f32, GgmlType, QuantMat};
-use lb_q4_gpu::{Gpu, GpuExpert, GpuQ4Mat};
+use lb_q4_gpu::{Gpu, GpuExpert, GpuExpertStack, GpuQ4Mat};
 use std::time::Instant;
+
+/// Rounds queued per readback in the `*_chained_*` rows.
+const CHAIN: usize = 10;
 
 struct Rng(u64);
 impl Rng {
@@ -191,6 +194,64 @@ fn main() -> Result<(), String> {
             let per = ms / n_exp as f64;
             let gbs = es[0].bytes_on_device() as f64 / 1e9 / (per / 1e3);
             rows_out.push((format!("expert_ffn_distinct{n_exp}_m{m}_ms_per_expert"), per, format!("{gbs:.1} GB/s weight stream")));
+            // The same, but `CHAIN` rounds per readback: the fixed cost of a round trip (upload,
+            // readback, wake-up on a loaded host) is paid once, so this is the closest the host
+            // clock gets to the GPU's own time.
+            let ms = time(&mut || {
+                let xh = gpu.upload_f32(&x);
+                let mut hs = Vec::new();
+                for _ in 0..CHAIN {
+                    hs.extend(es.iter().map(|e| e.launch(&gpu, &xh, m)));
+                }
+                gpu.read_all(hs)?;
+                Ok(())
+            })?;
+            let per = ms / (CHAIN * n_exp) as f64;
+            let gbs = es[0].bytes_on_device() as f64 / 1e9 / (per / 1e3);
+            rows_out.push((format!("expert_ffn_distinct{n_exp}_m{m}_chained_ms_per_expert"), per, format!("{gbs:.1} GB/s weight stream, {CHAIN} rounds per readback")));
+        }
+    }
+
+    // The same 24 distinct experts as ONE stack: all routed experts in two dispatches. The
+    // per-expert figure is directly comparable with `expert_ffn_distinct24_m1_ms_per_expert`;
+    // top-8 is the real decode shape (8 of the 24 per call, three calls cover the 24).
+    {
+        let n_exp = 24usize;
+        let (mut gall, mut uall, mut dall) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..n_exp {
+            gall.extend(q4_bytes(&mut rng, n_ff, n_embd));
+            uall.extend(q4_bytes(&mut rng, n_ff, n_embd));
+            dall.extend(q4_bytes(&mut rng, n_embd, n_ff));
+        }
+        let stack = GpuExpertStack::upload(
+            &gpu,
+            n_exp,
+            QuantMat::new(GgmlType::Q4_0, n_exp * n_ff, n_embd, &gall),
+            QuantMat::new(GgmlType::Q4_0, n_exp * n_ff, n_embd, &uall),
+            QuantMat::new(GgmlType::Q4_0, n_exp * n_embd, n_ff, &dall),
+        )?;
+        let per_expert_bytes = stack.bytes_on_device() / n_exp;
+        let x: Vec<f32> = (0..n_embd).map(|_| rng.unit()).collect();
+        for k in [8usize, 24] {
+            let jobs: Vec<(usize, usize)> = (0..k).map(|e| (e, 0)).collect();
+            let ms = time(&mut || {
+                let xh = gpu.upload_f32(&x);
+                let hs: Vec<_> = (0..n_exp / k.min(n_exp)).map(|_| stack.launch(&gpu, &xh, 1, &jobs)).collect();
+                gpu.read_all(hs)?;
+                Ok(())
+            })?;
+            let per = ms / (k * (n_exp / k)) as f64;
+            let gbs = per_expert_bytes as f64 / 1e9 / (per / 1e3);
+            rows_out.push((format!("stack_ffn_top{k}_m1_ms_per_expert"), per, format!("{gbs:.1} GB/s weight stream, 2 dispatches per call")));
+            let ms = time(&mut || {
+                let xh = gpu.upload_f32(&x);
+                let hs: Vec<_> = (0..CHAIN * (n_exp / k.min(n_exp))).map(|_| stack.launch(&gpu, &xh, 1, &jobs)).collect();
+                gpu.read_all(hs)?;
+                Ok(())
+            })?;
+            let per = ms / (CHAIN * k * (n_exp / k)) as f64;
+            let gbs = per_expert_bytes as f64 / 1e9 / (per / 1e3);
+            rows_out.push((format!("stack_ffn_top{k}_m1_chained_ms_per_expert"), per, format!("{gbs:.1} GB/s weight stream, {CHAIN} rounds per readback")));
         }
     }
 

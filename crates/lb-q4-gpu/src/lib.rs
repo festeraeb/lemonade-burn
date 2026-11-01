@@ -17,7 +17,7 @@
 //! output per cube with a shared-memory tree.
 
 pub mod store;
-pub use store::{Gpu, GpuExpert, GpuQ4Mat};
+pub use store::{Gpu, GpuExpert, GpuExpertStack, GpuQ4Mat};
 pub use cubecl::server as cubecl_server;
 
 use cubecl::prelude::*;
@@ -162,6 +162,90 @@ fn q4_0_gate_up_silu_kernel(
         let u = lane_sum(&mut sm, pu, use_plane);
         if lane == 0usize {
             h[o] = g / (1.0f32 + Exp::exp(-g)) * u;
+        }
+        o += step;
+    }
+}
+
+/// Batched SwiGLU front half over a whole layer's experts. `jobs` holds two words per job:
+/// [expert slot, activation row]; job `j` produces `h[j * rows .. (j + 1) * rows]`. The
+/// weights are the fused GGUF tensor `[n_expert * rows, cols]` (all experts back to back),
+/// so expert `e`'s row `r` starts at global block `(e * rows + r) * bpr`. `dims` = [rows, cols].
+///
+/// One dispatch for every routed expert replaces two dispatches per expert: a per-expert
+/// launch streams only ~1.5 MB, too little in flight to fill the memory system, and wgpu
+/// puts a barrier between consecutive passes so they never overlap.
+#[cube(launch)]
+fn q4_0_stack_gate_up_silu_kernel(
+    gq: &[V4U],
+    gs: &[u32],
+    uq: &[V4U],
+    us: &[u32],
+    x: &[V4F],
+    jobs: &[u32],
+    dims: &[u32],
+    h: &mut [f32],
+    #[comptime] use_plane: bool,
+) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < h.len() {
+        let j = o / rows;
+        let r = o % rows;
+        let e = jobs[2usize * j] as usize;
+        let xr = jobs[2usize * j + 1usize] as usize;
+        let gb0 = (e * rows + r) * bpr;
+        let pg = q4_row_partial(gq, gs, x, gb0, xr * cols / 4usize, bpr, lane, width);
+        let pu = q4_row_partial(uq, us, x, gb0, xr * cols / 4usize, bpr, lane, width);
+        let g = lane_sum(&mut sm, pg, use_plane);
+        let u = lane_sum(&mut sm, pu, use_plane);
+        if lane == 0usize {
+            h[o] = g / (1.0f32 + Exp::exp(-g)) * u;
+        }
+        o += step;
+    }
+}
+
+/// Batched down projection: job `j` multiplies its own row `j` of `x` (the `h` the front
+/// half wrote) by expert `jobs[2j]`'s matrix, `out[j * rows + r]`. `dims` = [rows, cols].
+#[cube(launch)]
+fn q4_0_stack_matvec_kernel(qs: &[V4U], sc: &[u32], x: &[V4F], jobs: &[u32], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < out.len() {
+        let j = o / rows;
+        let r = o % rows;
+        let e = jobs[2usize * j] as usize;
+        let part = q4_row_partial(qs, sc, x, (e * rows + r) * bpr, j * cols / 4usize, bpr, lane, width);
+        let total = lane_sum(&mut sm, part, use_plane);
+        if lane == 0usize {
+            out[o] = total;
         }
         o += step;
     }

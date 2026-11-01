@@ -7,7 +7,10 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, repack_q4_0, QuantMat, THREADS};
+use crate::{
+    cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, q4_0_stack_gate_up_silu_kernel, q4_0_stack_matvec_kernel, repack_q4_0, QuantMat,
+    THREADS,
+};
 use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -235,6 +238,122 @@ impl GpuExpert {
     pub fn ffn(&self, gpu: &Gpu, x: &[f32], m: usize) -> Result<Vec<f32>, String> {
         let xh = gpu.upload_f32(x);
         let (out, n) = self.launch(gpu, &xh, m);
+        Ok(gpu.read_all(vec![(out, n)])?.remove(0))
+    }
+}
+
+/// One layer's routed experts resident as three fused matrices (gate, up, down), each the
+/// GGUF tensor `[n_expert, rows, cols]` repacked as a single `qs`/`sc` pair. A decode step
+/// computes every routed expert in two dispatches (see [`GpuExpertStack::launch`]) instead
+/// of two per expert.
+pub struct GpuExpertStack {
+    pub n_expert: usize,
+    pub n_ff: usize,
+    pub n_embd: usize,
+    gate: StackMat,
+    up: StackMat,
+    down: StackMat,
+}
+
+/// One fused `[n_expert * rows, cols]` matrix: the repack is over the whole run, so block `b`
+/// of expert `e`'s row `r` is global block `(e * rows + r) * bpr + b`. `sc` packs two scales
+/// per word across expert boundaries, which is why it is repacked as one array and not per expert.
+struct StackMat {
+    qs: Handle,
+    sc: Handle,
+    n_qs: usize,
+    n_sc: usize,
+    dims: Handle,
+}
+
+impl StackMat {
+    fn upload(gpu: &Gpu, w: QuantMat<'_>, n_expert: usize) -> Result<Self, String> {
+        if w.ty != lb_gguf::GgmlType::Q4_0 {
+            return Err(format!("expected Q4_0, got {}", w.ty.name()));
+        }
+        if w.cols % 32 != 0 {
+            return Err(format!("Q4_0 needs cols % 32 == 0, got {}", w.cols));
+        }
+        if n_expert == 0 || w.rows % n_expert != 0 {
+            return Err(format!("{} rows do not split into {} experts", w.rows, n_expert));
+        }
+        let (qs, sc) = repack_q4_0(w.bytes, w.rows * (w.cols / 32));
+        let dims = matvec_dims(w.rows / n_expert, w.cols);
+        Ok(Self {
+            n_qs: qs.len(),
+            n_sc: sc.len(),
+            qs: gpu.client.create_from_slice(u32::as_bytes(&qs)),
+            sc: gpu.client.create_from_slice(u32::as_bytes(&sc)),
+            dims: gpu.client.create_from_slice(u32::as_bytes(&dims)),
+        })
+    }
+}
+
+impl GpuExpertStack {
+    /// `gate`/`up` are `[n_expert * n_ff, n_embd]` and `down` is `[n_expert * n_embd, n_ff]`:
+    /// the fused GGUF expert tensors viewed as one tall matrix each (rows of expert `e`
+    /// are `e * rows .. (e + 1) * rows`), so their bytes can be passed straight through.
+    pub fn upload(gpu: &Gpu, n_expert: usize, gate: QuantMat<'_>, up: QuantMat<'_>, down: QuantMat<'_>) -> Result<Self, String> {
+        let (g, u, d) = (StackMat::upload(gpu, gate, n_expert)?, StackMat::upload(gpu, up, n_expert)?, StackMat::upload(gpu, down, n_expert)?);
+        let (n_ff, n_embd) = (gate.rows / n_expert, gate.cols);
+        if up.rows != gate.rows || up.cols != gate.cols || down.rows / n_expert != n_embd || down.cols != n_ff {
+            return Err("gate/up/down shapes disagree".to_string());
+        }
+        Ok(Self { n_expert, n_ff, n_embd, gate: g, up: u, down: d })
+    }
+
+    pub fn bytes_on_device(&self) -> usize {
+        [&self.gate, &self.up, &self.down].iter().map(|m| (m.n_qs + m.n_sc) * 4).sum()
+    }
+
+    /// Run jobs `(expert slot, row of x)` in two dispatches total; job `j` is
+    /// `down_e(silu(gate_e x_r) * up_e x_r)` and lands in `out[j * n_embd ..]`. Decode with
+    /// top-8 routing is eight jobs all reading row 0. Returns (output handle, length).
+    pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize, jobs: &[(usize, usize)]) -> (Handle, usize) {
+        assert!(jobs.iter().all(|&(e, r)| e < self.n_expert && r < m), "job out of range");
+        let flat: Vec<u32> = jobs.iter().flat_map(|&(e, r)| [e as u32, r as u32]).collect();
+        let jh = gpu.client.create_from_slice(u32::as_bytes(&flat));
+        let n_h = jobs.len() * self.n_ff;
+        let h = gpu.scratch(n_h * 4);
+        unsafe {
+            q4_0_stack_gate_up_silu_kernel::launch(
+                &gpu.client,
+                cube_count(n_h, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.gate.qs.clone(), self.gate.n_qs),
+                BufferArg::from_raw_parts(self.gate.sc.clone(), self.gate.n_sc),
+                BufferArg::from_raw_parts(self.up.qs.clone(), self.up.n_qs),
+                BufferArg::from_raw_parts(self.up.sc.clone(), self.up.n_sc),
+                BufferArg::from_raw_parts(x.clone(), m * self.n_embd),
+                BufferArg::from_raw_parts(jh.clone(), flat.len()),
+                BufferArg::from_raw_parts(self.gate.dims.clone(), 2),
+                BufferArg::from_raw_parts(h.clone(), n_h),
+                gpu.use_plane,
+            );
+        }
+        let n_out = jobs.len() * self.n_embd;
+        let out = gpu.scratch(n_out * 4);
+        unsafe {
+            q4_0_stack_matvec_kernel::launch(
+                &gpu.client,
+                cube_count(n_out, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.down.qs.clone(), self.down.n_qs),
+                BufferArg::from_raw_parts(self.down.sc.clone(), self.down.n_sc),
+                BufferArg::from_raw_parts(h.clone(), n_h),
+                BufferArg::from_raw_parts(jh.clone(), flat.len()),
+                BufferArg::from_raw_parts(self.down.dims.clone(), 2),
+                BufferArg::from_raw_parts(out.clone(), n_out),
+                gpu.use_plane,
+            );
+        }
+        (out, n_out)
+    }
+
+    /// Upload `x`, run `jobs`, read the result (one round trip).
+    pub fn ffn(&self, gpu: &Gpu, x: &[f32], m: usize, jobs: &[(usize, usize)]) -> Result<Vec<f32>, String> {
+        let xh = gpu.upload_f32(x);
+        let (out, n) = self.launch(gpu, &xh, m, jobs);
         Ok(gpu.read_all(vec![(out, n)])?.remove(0))
     }
 }

@@ -170,3 +170,53 @@ fn pooled_scratch_reuse_is_stable_across_rounds() {
         }
     }
 }
+
+/// The batched stack path must return what the per-expert path returns, for the same weights.
+/// Experts are cut out of one fused byte run (as GGUF stores them), jobs repeat an expert and
+/// read different activation rows, and the token counts straddle the plane/cube sizes. The
+/// per-expert reference is `GpuExpert::ffn`, so this isolates the batching and indexing.
+#[test]
+fn expert_stack_matches_per_expert_path() {
+    use lb_q4_gpu::{Gpu, GpuExpert, GpuExpertStack};
+    let (n_embd, n_ff, n_exp) = (256usize, 192usize, 5usize);
+    let mut rng = Rng(31);
+    let mk = |rng: &mut Rng, rows: usize, cols: usize| -> Vec<u8> {
+        let wf: Vec<f32> = (0..rows * cols).map(|_| rng.unit()).collect();
+        wf.chunks_exact(cols).flat_map(|r| quantize_q4_0(r)).collect()
+    };
+    let (gb, ub, db) = (mk(&mut rng, n_exp * n_ff, n_embd), mk(&mut rng, n_exp * n_ff, n_embd), mk(&mut rng, n_exp * n_embd, n_ff));
+    let gpu = Gpu::open().unwrap_or_else(|e| panic!("{e}"));
+    let stack = GpuExpertStack::upload(
+        &gpu,
+        n_exp,
+        QuantMat::new(GgmlType::Q4_0, n_exp * n_ff, n_embd, &gb),
+        QuantMat::new(GgmlType::Q4_0, n_exp * n_ff, n_embd, &ub),
+        QuantMat::new(GgmlType::Q4_0, n_exp * n_embd, n_ff, &db),
+    )
+    .unwrap();
+    let (gs, us, ds) = (n_ff * n_embd / 32 * 18, n_ff * n_embd / 32 * 18, n_embd * n_ff / 32 * 18);
+    let singles: Vec<GpuExpert> = (0..n_exp)
+        .map(|e| {
+            GpuExpert::upload(
+                &gpu,
+                QuantMat::new(GgmlType::Q4_0, n_ff, n_embd, &gb[e * gs..(e + 1) * gs]),
+                QuantMat::new(GgmlType::Q4_0, n_ff, n_embd, &ub[e * us..(e + 1) * us]),
+                QuantMat::new(GgmlType::Q4_0, n_embd, n_ff, &db[e * ds..(e + 1) * ds]),
+            )
+            .unwrap()
+        })
+        .collect();
+    for &m in &[1usize, 2, 3, 7] {
+        let x: Vec<f32> = (0..m * n_embd).map(|_| rng.unit()).collect();
+        // an expert twice with different rows, out-of-order slots, and the last slot
+        let jobs: Vec<(usize, usize)> = vec![(3, 0), (0, m - 1), (3, m / 2), (4, 0), (1, m - 1)];
+        let got = stack.ffn(&gpu, &x, m, &jobs).unwrap();
+        assert_eq!(got.len(), jobs.len() * n_embd);
+        for (j, &(e, r)) in jobs.iter().enumerate() {
+            let want = singles[e].ffn(&gpu, &x[r * n_embd..(r + 1) * n_embd], 1).unwrap();
+            for (i, (a, b)) in got[j * n_embd..(j + 1) * n_embd].iter().zip(&want).enumerate() {
+                assert!((a - b).abs() <= 1e-4 * (1.0 + b.abs()), "m={m} job {j} (expert {e}, row {r}) elem {i}: stack {a} single {b}");
+            }
+        }
+    }
+}
