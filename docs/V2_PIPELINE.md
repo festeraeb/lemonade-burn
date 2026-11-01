@@ -212,6 +212,37 @@ Consequences for section 5:
   blocks over round robin: modulo hands off every layer (~37 handoffs/token), blocks pay N-1.
 * `MissPolicy` should be per card, not global: on-demand copies on an x16 card, CPU on an x4.
 
+### What the copy-path fix is worth (simulated on the measured numbers)
+
+`lb-calibrate sweep`, k=16, 3 x P100, LFM2.5 scrapes in `/data/lfm2-scrapes/served`,
+`--holdout-every 2`. Only the h2d figure differs: `bench/t440-p100-gen3x16.json` (our
+CubeCL path) against `bench/t440-p100-gen3x16-rawcuda-h2d.json` (the same card's raw
+`cudaMemcpy` pinned rate):
+
+| per token, 3 cards, k=16 | our path, 903 MB/s | raw-CUDA h2d, 11,912 MB/s |
+|---|---|---|
+| tok/s, misses on CPU | 0.73 | **2.95** |
+| tok/s, `Best` misses | 0.73 | **4.85** |
+| stall | 75.3% (1029 ms) | **0.2% (0.6 ms)** |
+| total ms/token | 1367.5 | 338.7 |
+
+Three conclusions in section 5 flip:
+
+1. Rolling staging is not bus-bound on this hardware. Stall goes from 1029 ms/token to
+   0.6 ms, and throughput up 4x (6.6x with `Best`), with no change to cards, k or hit rate.
+2. `Best` (on-demand copies of misses) **wins decisively** at the real bandwidth, 4.85 vs
+   2.95 tok/s. Section 5 said it "never won at measured bandwidth and only ties at 4x" -
+   that was the broken copy path. On-demand misses at 12 GB/s cost 0.44 ms an expert.
+3. The next bottleneck is no longer the bus: at the fixed rate the breakdown is dense 42.0
+   ms, GPU experts 42.7 ms, **CPU experts 208.8 ms**, handoff 22.2 ms, stall 0.6 ms. Misses
+   on the CPU are 62% of the token, so miss handling and hit rate come next - and the 22.2 ms
+   of handoff is the round-robin artifact (contiguous blocks would leave ~1 ms).
+
+Caveat: `/data/lfm2-scrapes/served` holds only two runs and they are near-identical, so the
+62.1% hit rate at k=16 is not a generalisation test. The bandwidth and stall conclusions are
+driven by measured bytes and measured times and do not depend on it; the hit rate does, and
+needs more scrapes before it is quoted.
+
 What does **not** change: the expert kernel is still the ceiling. It takes 0.33-0.36 ms on a
 P100 against 0.430 ms on a GTX 1070 - about 1.2x for roughly 3x the fp32 throughput, so the
 kernel badly underuses the big cards. Static staging remains the right thing to ship first.
