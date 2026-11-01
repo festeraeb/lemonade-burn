@@ -159,6 +159,30 @@ fn main() -> Result<(), String> {
         rows_out.push((format!("expert_ffn_batch4_m{m}_ms_per_expert"), ms / 4.0, "4 experts, one readback".into()));
     }
 
+    // GPU-bound throughput: 24 distinct experts (no cache reuse between them), one readback.
+    // At m = 1 the per-expert time is dominated by streaming the weights, so this is the number
+    // to compare against the memory roofline.
+    {
+        let n_exp = 24usize;
+        let mut es = Vec::new();
+        for _ in 0..n_exp {
+            let (g, u, d) = (q4_bytes(&mut rng, n_ff, n_embd), q4_bytes(&mut rng, n_ff, n_embd), q4_bytes(&mut rng, n_embd, n_ff));
+            es.push(GpuExpert::upload(&gpu, QuantMat::new(GgmlType::Q4_0, n_ff, n_embd, &g), QuantMat::new(GgmlType::Q4_0, n_ff, n_embd, &u), QuantMat::new(GgmlType::Q4_0, n_embd, n_ff, &d))?);
+        }
+        for m in [1usize, 4] {
+            let x: Vec<f32> = (0..m * n_embd).map(|_| rng.unit()).collect();
+            let ms = time(&mut || {
+                let xh = gpu.upload_f32(&x);
+                let hs: Vec<_> = es.iter().map(|e| e.launch(&gpu, &xh, m)).collect();
+                gpu.read_all(hs)?;
+                Ok(())
+            })?;
+            let per = ms / n_exp as f64;
+            let gbs = es[0].bytes_on_device() as f64 / 1e9 / (per / 1e3);
+            rows_out.push((format!("expert_ffn_distinct{n_exp}_m{m}_ms_per_expert"), per, format!("{gbs:.1} GB/s weight stream")));
+        }
+    }
+
     // dense projections
     for (label, rows, cols) in [("dense_in_proj_6144x2048_ms", 6144usize, n_embd), ("dense_out_proj_2048x2048_ms", 2048, n_embd), ("dense_kv_512x2048_ms", 512, n_embd)] {
         let wb = q4_bytes(&mut rng, rows, cols);

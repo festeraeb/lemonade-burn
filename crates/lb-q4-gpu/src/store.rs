@@ -7,7 +7,7 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, QuantMat, THREADS};
+use crate::{cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, repack_q4_0, QuantMat, THREADS};
 use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -22,6 +22,12 @@ const POOL_PER_SIZE: usize = 64;
 pub struct Gpu {
     pub client: Client,
     pub name: String,
+    /// Units per cube for the matvec kernels (`LB_Q4_CUBE` overrides).
+    pub cube_dim: usize,
+    /// Reduce with `plane_sum` (device has subgroup ops); otherwise one output per cube.
+    pub use_plane: bool,
+    /// Plane (warp/wave) size range the driver reports.
+    pub plane_size: (u32, u32),
     /// Recycled scratch buffers, keyed by byte size.
     free: Mutex<HashMap<usize, Vec<Handle>>>,
     /// Scratch handed out since the last sync. Reusing one before the GPU has run would
@@ -35,7 +41,31 @@ impl Gpu {
         let device = pick_device()?;
         let dev = cubecl::Device::Wgpu(device);
         let client = std::panic::catch_unwind(|| dev.client()).map_err(|_| "no wgpu adapter available".to_string())?;
-        Ok(Self { client, name: format!("{dev:?}"), free: Mutex::new(HashMap::new()), in_flight: Mutex::new(Vec::new()) })
+        let props = client.properties();
+        let (pmin, pmax) = (props.hardware.plane_size_min, props.hardware.plane_size_max);
+        let has_ops = props.features.plane.contains(cubecl::ir::features::Plane::Ops);
+        let use_plane = has_ops && pmax > 0 && std::env::var("LB_NO_PLANE").is_err();
+        let mut cube_dim = std::env::var("LB_Q4_CUBE").ok().and_then(|v| v.parse().ok()).unwrap_or(THREADS);
+        if use_plane {
+            // a whole number of planes, or `PLANE_DIM`-sized groups would straddle the cube
+            let p = pmax as usize;
+            cube_dim = cube_dim.div_ceil(p).max(1) * p;
+        }
+        let cube_dim = cube_dim.clamp(1, 256).next_power_of_two().min(256);
+        Ok(Self {
+            client,
+            name: format!("{dev:?}"),
+            cube_dim,
+            use_plane,
+            plane_size: (pmin, pmax),
+            free: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Outputs one cube produces with the current cube size and reduction.
+    pub fn per_cube(&self) -> usize {
+        if self.use_plane { self.cube_dim / (self.plane_size.1 as usize).max(1) } else { 1 }
     }
 
     pub fn upload_f32(&self, x: &[f32]) -> Handle {
@@ -91,13 +121,15 @@ impl Gpu {
     }
 }
 
-/// A Q4_0 matrix resident on the device.
+/// A Q4_0 matrix resident on the device, repacked (see [`repack_q4_0`]).
 pub struct GpuQ4Mat {
     pub rows: usize,
     pub cols: usize,
     pub row_bytes: usize,
-    words: Handle,
-    n_words: usize,
+    qs: Handle,
+    sc: Handle,
+    n_qs: usize,
+    n_sc: usize,
     dims: Handle,
 }
 
@@ -106,19 +138,26 @@ impl GpuQ4Mat {
         if w.ty != lb_gguf::GgmlType::Q4_0 {
             return Err(format!("expected Q4_0, got {}", w.ty.name()));
         }
-        let mut bytes = w.bytes.to_vec();
-        while bytes.len() % 4 != 0 {
-            bytes.push(0);
+        if w.cols % 32 != 0 {
+            return Err(format!("Q4_0 needs cols % 32 == 0, got {}", w.cols));
         }
-        let n_words = bytes.len() / 4;
-        let words = gpu.client.create_from_slice(&bytes);
-        let dims = matvec_dims(w.rows, w.cols, w.row_bytes());
-        let dims = gpu.client.create_from_slice(u32::as_bytes(&dims));
-        Ok(Self { rows: w.rows, cols: w.cols, row_bytes: w.row_bytes(), words, n_words, dims })
+        let n_blocks = w.rows * (w.cols / 32);
+        let (qs, sc) = repack_q4_0(w.bytes, n_blocks);
+        let dims = matvec_dims(w.rows, w.cols);
+        Ok(Self {
+            rows: w.rows,
+            cols: w.cols,
+            row_bytes: w.row_bytes(),
+            n_qs: qs.len(),
+            n_sc: sc.len(),
+            qs: gpu.client.create_from_slice(u32::as_bytes(&qs)),
+            sc: gpu.client.create_from_slice(u32::as_bytes(&sc)),
+            dims: gpu.client.create_from_slice(u32::as_bytes(&dims)),
+        })
     }
 
     pub fn bytes_on_device(&self) -> usize {
-        self.n_words * 4
+        (self.n_qs + self.n_sc) * 4
     }
 
     /// Launch `out = x @ W^T` for `m` rows of `x` already on the device; returns the output handle.
@@ -128,12 +167,14 @@ impl GpuQ4Mat {
         unsafe {
             q4_0_matvec_kernel::launch(
                 &gpu.client,
-                cube_count(n_out),
-                CubeDim::new_1d(THREADS as u32),
-                BufferArg::from_raw_parts(self.words.clone(), self.n_words),
+                cube_count(n_out, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.qs.clone(), self.n_qs),
+                BufferArg::from_raw_parts(self.sc.clone(), self.n_sc),
                 BufferArg::from_raw_parts(x.clone(), m * self.cols),
-                BufferArg::from_raw_parts(self.dims.clone(), 4),
+                BufferArg::from_raw_parts(self.dims.clone(), 2),
                 BufferArg::from_raw_parts(out.clone(), n_out),
+                gpu.use_plane,
             );
         }
         out
@@ -171,13 +212,16 @@ impl GpuExpert {
         unsafe {
             q4_0_gate_up_silu_kernel::launch(
                 &gpu.client,
-                cube_count(n_h),
-                CubeDim::new_1d(THREADS as u32),
-                BufferArg::from_raw_parts(self.gate.words.clone(), self.gate.n_words),
-                BufferArg::from_raw_parts(self.up.words.clone(), self.up.n_words),
+                cube_count(n_h, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.gate.qs.clone(), self.gate.n_qs),
+                BufferArg::from_raw_parts(self.gate.sc.clone(), self.gate.n_sc),
+                BufferArg::from_raw_parts(self.up.qs.clone(), self.up.n_qs),
+                BufferArg::from_raw_parts(self.up.sc.clone(), self.up.n_sc),
                 BufferArg::from_raw_parts(x.clone(), m * self.gate.cols),
-                BufferArg::from_raw_parts(self.gate.dims.clone(), 4),
+                BufferArg::from_raw_parts(self.gate.dims.clone(), 2),
                 BufferArg::from_raw_parts(h.clone(), n_h),
+                gpu.use_plane,
             );
         }
         let out = self.down.launch(gpu, &h, m);

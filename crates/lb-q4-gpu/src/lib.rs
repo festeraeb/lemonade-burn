@@ -3,11 +3,18 @@
 //! value j, high nibble = value j + 16, each minus 8). Same numbers as
 //! `lb_gguf::matvec_f32` up to f32 summation order.
 //!
-//! Layout on the device: the row bytes are uploaded unchanged, viewed as little-endian
-//! u32 words (a row of `cols` values is `cols / 32 * 18` bytes; 18 is not a multiple of
-//! 4, so blocks are addressed at byte granularity through word/shift arithmetic; the
-//! whole matrix is padded to a multiple of 4 bytes). The f16 scale is decoded in the
-//! kernel from its 16 bits (sign, 5-bit exponent, 10-bit mantissa; subnormals included).
+//! Device layout (repacked once at upload, see [`repack_q4_0`]): GGUF blocks are 18 bytes
+//! and never 4-byte aligned, so the matrix is split into two aligned arrays.
+//!   * `qs`: 4 u32 words per block, read as one `Vector<u32, 4>` (16-byte load). Nibble `j`
+//!     (bits 4j..4j+3) of word `k` holds value `4j + k` of the block, so
+//!     `(qs >> 4j) & 15` is exactly the quants of x's 4-wide vector number `j`.
+//!   * `sc`: the f16 scales, two per u32, decoded in the kernel.
+//!
+//! One plane (warp/wave/subgroup) computes one output element: its lanes take consecutive
+//! blocks (coalesced 16-byte loads) and `plane_sum` reduces. A cube holds several planes, so
+//! it produces several output rows; the plane size is read at run time (`PLANE_DIM`), so the
+//! same kernel is right for wave32 and wave64. Devices without subgroup ops fall back to one
+//! output per cube with a shared-memory tree.
 
 pub mod store;
 pub use store::{Gpu, GpuExpert, GpuQ4Mat};
@@ -15,13 +22,9 @@ pub use cubecl::server as cubecl_server;
 
 use cubecl::prelude::*;
 use lb_gguf::QuantMat;
-use lb_ternary_gpu::pick_device;
 
-/// Little-endian byte `i` of the byte stream held in `w` (u32 words).
-#[cube]
-fn byte_at(w: &[u32], i: usize) -> u32 {
-    (w[i / 4] >> (((i % 4) * 8) as u32)) & 255u32
-}
+type V4F = Vector<f32, Const<4>>;
+type V4U = Vector<u32, Const<4>>;
 
 /// f16 bits -> f32, exactly: normal numbers are rebuilt bit for bit (exponent rebased
 /// 15 -> 127, mantissa widened 10 -> 23 bits); subnormals are `man * 2^-24`.
@@ -43,124 +46,162 @@ fn f16_to_f32(bits: u32) -> f32 {
     v
 }
 
-/// Partial dot of one Q4_0 row with `x[x_off..]`: this unit sums the blocks `b` with
-/// `b % CUBE_DIM_X == UNIT_POS` (`n_iter` = ceil(blocks / CUBE_DIM_X), passed in).
+/// This lane's partial dot of one row (`bpr` blocks starting at global block `gb0`) with the
+/// activation row starting at `x4_0` (in 4-wide vectors): blocks `lane, lane + width, ...`.
 #[cube]
-fn q4_row_partial(w: &[u32], base: usize, x: &[f32], x_off: usize, blocks: usize, n_iter: usize) -> f32 {
-    let mut acc = 0.0f32;
-    for i in 0..n_iter {
-        let b = UNIT_POS as usize + i * CUBE_DIM_X as usize;
-        if b < blocks {
-            let bb = base + b * 18;
-            let d = f16_to_f32(byte_at(w, bb) | (byte_at(w, bb + 1) << 8u32));
-            let mut s = 0.0f32;
-            for j in 0..16usize {
-                let byte = byte_at(w, bb + 2 + j);
-                let lo = (byte & 15u32) as i32 - 8;
-                let hi = (byte >> 4u32) as i32 - 8;
-                s += lo as f32 * x[x_off + b * 32 + j];
-                s += hi as f32 * x[x_off + b * 32 + j + 16];
-            }
-            acc += d * s;
+fn q4_row_partial(qs: &[V4U], sc: &[u32], x: &[V4F], gb0: usize, x4_0: usize, bpr: usize, lane: usize, width: usize) -> f32 {
+    let mut acc = V4F::new(0.0f32);
+    let mut b = lane;
+    while b < bpr {
+        let gb = gb0 + b;
+        let q = qs[gb];
+        let d = f16_to_f32((sc[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+        let xb = x4_0 + b * 8usize;
+        let mut s = V4F::new(0.0f32);
+        #[unroll]
+        for j in 0..8u32 {
+            let nib = (q >> V4U::new(4u32 * j)) & V4U::new(15u32);
+            let f = V4F::cast_from(nib) - V4F::new(8.0f32);
+            s += f * x[xb + j as usize];
         }
+        acc += V4F::new(d) * s;
+        b += width;
     }
-    acc
+    acc.extract(0usize) + acc.extract(1usize) + acc.extract(2usize) + acc.extract(3usize)
 }
 
-/// Sum the 64 partials of this cube (CUBE_DIM_X must be 64); valid in unit 0 after return.
+/// Sum a per-lane partial across the lanes working on one output; valid in every lane.
+/// Plane path: `plane_sum`. Fallback: the whole cube is one output, shared-memory tree.
 #[cube]
-fn reduce64(sm: &mut Shared<[f32]>, v: f32) -> f32 {
-    sm[UNIT_POS as usize] = v;
-    sync_cube();
-    if UNIT_POS < 32u32 {
-        sm[UNIT_POS as usize] += sm[UNIT_POS as usize + 32];
+fn lane_sum(sm: &mut Shared<[f32]>, v: f32, #[comptime] use_plane: bool) -> f32 {
+    let mut r = v;
+    if use_plane {
+        r = plane_sum(v);
+    } else {
+        sm[UNIT_POS as usize] = v;
+        sync_cube();
+        let mut s = CUBE_DIM_X / 2u32;
+        while s > 0u32 {
+            if UNIT_POS < s {
+                sm[UNIT_POS as usize] += sm[(UNIT_POS + s) as usize];
+            }
+            sync_cube();
+            s = s / 2u32;
+        }
+        r = sm[0usize];
+        sync_cube();
     }
-    sync_cube();
-    if UNIT_POS < 16u32 {
-        sm[UNIT_POS as usize] += sm[UNIT_POS as usize + 16];
-    }
-    sync_cube();
-    if UNIT_POS < 8u32 {
-        sm[UNIT_POS as usize] += sm[UNIT_POS as usize + 8];
-    }
-    sync_cube();
-    if UNIT_POS < 4u32 {
-        sm[UNIT_POS as usize] += sm[UNIT_POS as usize + 4];
-    }
-    sync_cube();
-    if UNIT_POS < 2u32 {
-        sm[UNIT_POS as usize] += sm[UNIT_POS as usize + 2];
-    }
-    sync_cube();
-    let r = sm[0] + sm[1];
-    sync_cube();
     r
 }
 
-/// One cube of 64 units per output element (token t, row r): the units split the row's
-/// blocks and reduce through shared memory. `dims` = [rows, cols, row_bytes, n_iter].
+/// `dims` = [rows, cols]. One plane (or, in the fallback, one cube) per output element
+/// `o = t * rows + r`, grid-strided so the result is right for any launched cube count.
 #[cube(launch)]
-fn q4_0_matvec_kernel(w: &[u32], x: &[f32], dims: &[u32], out: &mut [f32]) {
-    let pos = CUBE_POS as usize;
+fn q4_0_matvec_kernel(qs: &[V4U], sc: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
-    let row_bytes = dims[2] as usize;
-    let n_iter = dims[3] as usize;
-    let mut sm = Shared::<[f32]>::new_slice(64usize);
-    let mut part = 0.0f32;
-    if pos < out.len() {
-        let t = pos / rows;
-        let r = pos % rows;
-        part = q4_row_partial(w, r * row_bytes, x, t * cols, cols / 32, n_iter);
+    let bpr = cols / 32usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
     }
-    let total = reduce64(&mut sm, part);
-    if pos < out.len() && UNIT_POS == 0u32 {
-        out[pos] = total;
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < out.len() {
+        let t = o / rows;
+        let r = o % rows;
+        let part = q4_row_partial(qs, sc, x, r * bpr, t * cols / 4usize, bpr, lane, width);
+        let total = lane_sum(&mut sm, part, use_plane);
+        if lane == 0usize {
+            out[o] = total;
+        }
+        o += step;
     }
 }
 
-/// Fused SwiGLU front half: `h[t, r] = silu(x_t . gate_r) * (x_t . up_r)`. One cube per
-/// output element reads the same row of both weight matrices (same shape, same `dims`)
-/// and reduces the two partials separately, so gate/up/silu are one dispatch and the
-/// intermediate `g`/`u` buffers never exist.
+/// Fused SwiGLU front half: `h[t, r] = silu(x_t . gate_r) * (x_t . up_r)`. Gate and up have
+/// the same shape (`dims`), so one dispatch reads both and the `g`/`u` buffers never exist.
 #[cube(launch)]
-fn q4_0_gate_up_silu_kernel(wg: &[u32], wu: &[u32], x: &[f32], dims: &[u32], h: &mut [f32]) {
-    let pos = CUBE_POS as usize;
+fn q4_0_gate_up_silu_kernel(
+    gq: &[V4U],
+    gs: &[u32],
+    uq: &[V4U],
+    us: &[u32],
+    x: &[V4F],
+    dims: &[u32],
+    h: &mut [f32],
+    #[comptime] use_plane: bool,
+) {
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
-    let row_bytes = dims[2] as usize;
-    let n_iter = dims[3] as usize;
-    let mut sm_g = Shared::<[f32]>::new_slice(64usize);
-    let mut sm_u = Shared::<[f32]>::new_slice(64usize);
-    let mut pg = 0.0f32;
-    let mut pu = 0.0f32;
-    if pos < h.len() {
-        let t = pos / rows;
-        let r = pos % rows;
-        pg = q4_row_partial(wg, r * row_bytes, x, t * cols, cols / 32, n_iter);
-        pu = q4_row_partial(wu, r * row_bytes, x, t * cols, cols / 32, n_iter);
+    let bpr = cols / 32usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
     }
-    let g = reduce64(&mut sm_g, pg);
-    let u = reduce64(&mut sm_u, pu);
-    if pos < h.len() && UNIT_POS == 0u32 {
-        h[pos] = g / (1.0f32 + Exp::exp(-g)) * u;
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < h.len() {
+        let t = o / rows;
+        let r = o % rows;
+        let pg = q4_row_partial(gq, gs, x, r * bpr, t * cols / 4usize, bpr, lane, width);
+        let pu = q4_row_partial(uq, us, x, r * bpr, t * cols / 4usize, bpr, lane, width);
+        let g = lane_sum(&mut sm, pg, use_plane);
+        let u = lane_sum(&mut sm, pu, use_plane);
+        if lane == 0usize {
+            h[o] = g / (1.0f32 + Exp::exp(-g)) * u;
+        }
+        o += step;
     }
 }
 
-/// Cube size used by every kernel here (the reduction assumes it).
+/// Default cube size (units) when the device is not asked: see `Gpu::open`.
 pub const THREADS: usize = 64;
 
-/// Cube count for `n` outputs: wgpu caps each dispatch dimension at 65535, so the cubes
-/// are laid out in two dimensions and the kernel reads the linear `CUBE_POS`.
-pub fn cube_count(n: usize) -> CubeCount {
-    let x = n.clamp(1, 65535);
-    let y = n.div_ceil(x).max(1);
+/// Repack GGUF Q4_0 rows into the device layout (`qs` words, packed f16 `sc` words).
+/// `bytes` is the unchanged GGUF data: `n_blocks` blocks of 18 bytes.
+pub fn repack_q4_0(bytes: &[u8], n_blocks: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut qs = vec![0u32; n_blocks * 4];
+    let mut sc = vec![0u32; n_blocks.div_ceil(2).max(1)];
+    for b in 0..n_blocks {
+        let blk = &bytes[b * 18..b * 18 + 18];
+        let d = u16::from_le_bytes([blk[0], blk[1]]) as u32;
+        sc[b / 2] |= d << (16 * (b % 2));
+        let q = &blk[2..];
+        for v in 0..32usize {
+            let nib = if v < 16 { q[v] & 15 } else { q[v - 16] >> 4 } as u32;
+            let (j, k) = (v / 4, v % 4);
+            qs[b * 4 + k] |= nib << (4 * j);
+        }
+    }
+    (qs, sc)
+}
+
+/// Cube count for `n` outputs given `per_cube` outputs per cube: wgpu caps each dispatch
+/// dimension at 65535, so the cubes are laid out in two dimensions and the kernel reads the
+/// linear `CUBE_POS`.
+pub fn cube_count(n: usize, per_cube: usize) -> CubeCount {
+    let cubes = n.div_ceil(per_cube.max(1)).max(1);
+    let x = cubes.min(65535);
+    let y = cubes.div_ceil(x).max(1);
     CubeCount::Static(x as u32, y as u32, 1)
 }
 
-/// `dims` for [`q4_0_matvec_kernel`].
-pub fn matvec_dims(rows: usize, cols: usize, row_bytes: usize) -> [u32; 4] {
-    [rows as u32, cols as u32, row_bytes as u32, (cols / 32).div_ceil(THREADS) as u32]
+/// `dims` for the kernels: [rows, cols].
+pub fn matvec_dims(rows: usize, cols: usize) -> [u32; 2] {
+    [rows as u32, cols as u32]
 }
 
 /// `x`: `m` rows of `w.cols` f32. Returns `m * w.rows` values, token-major like the CPU kernel.
@@ -171,39 +212,11 @@ pub fn q4_0_matvec_gpu(w: QuantMat<'_>, x: &[f32], m: usize) -> Result<Vec<f32>,
     if x.len() != m * w.cols {
         return Err(format!("x has {} values, expected {} x {}", x.len(), m, w.cols));
     }
-    let n_out = m * w.rows;
-    if n_out == 0 {
+    if m * w.rows == 0 {
         return Ok(Vec::new());
     }
-    let device = pick_device()?;
-    let client = std::panic::catch_unwind(|| cubecl::Device::Wgpu(device.clone()).client())
-        .map_err(|_| "no wgpu adapter available (WgpuRuntime::client panicked)".to_string())?;
-
-    let mut bytes = w.bytes.to_vec();
-    while bytes.len() % 4 != 0 {
-        bytes.push(0);
-    }
-    let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-    let dims = matvec_dims(w.rows, w.cols, w.row_bytes());
-
-    let w_h = client.create_from_slice(u32::as_bytes(&words));
-    let x_h = client.create_from_slice(f32::as_bytes(x));
-    let d_h = client.create_from_slice(u32::as_bytes(&dims));
-    let o_h = client.empty(n_out * std::mem::size_of::<f32>());
-
-    unsafe {
-        q4_0_matvec_kernel::launch(
-            &client,
-            cube_count(n_out),
-            CubeDim::new_1d(THREADS as u32),
-            BufferArg::from_raw_parts(w_h, words.len()),
-            BufferArg::from_raw_parts(x_h, x.len()),
-            BufferArg::from_raw_parts(d_h, 4),
-            BufferArg::from_raw_parts(o_h.clone(), n_out),
-        );
-    }
-    let out = client.read_one(o_h).map_err(|e| format!("GPU read failed: {e:?}"))?;
-    Ok(f32::from_bytes(&out).to_vec())
+    let gpu = Gpu::open()?;
+    GpuQ4Mat::upload(&gpu, w)?.matvec(&gpu, x, m)
 }
 
 // ---- Seeds for forge lanes (bodies to be written; tests in tests/q6k_matches_scalar.rs and
