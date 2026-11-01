@@ -51,14 +51,28 @@ pub struct DenseStore {
     pub bytes: usize,
 }
 
-/// `LB_NO_CONV_BLOCK=1` keeps the conv projections as loose resident matrices and runs the
-/// block's arithmetic on the host, as before `dc1665a`. It exists so the device conv path can
-/// be measured against its own absence **in one binary**: on this box arms have to be
-/// interleaved to mean anything, and two binaries cannot be interleaved. Also a kill switch.
+/// Whole short-conv blocks on the device: **off unless `LB_CONV_BLOCK=1`**, because measured
+/// interleaved it does not pay.
+///
+/// It removes 30 of a token's ~145 host syncs, which looked like the next lever. Measured
+/// against its own absence in this same binary, 15 reps an arm interleaved over three rounds:
+/// loose matrices **9.185 tok/s**, whole blocks **8.245** -- **0.90x**, no win. Both arms had
+/// a spread above 2x, so the truthful statement is "no measurable gain, possibly a small
+/// loss", not "a 10% regression".
+///
+/// The arithmetic says why, and it was available before the kernel was written: a sync costs
+/// ~0.24 ms more than it needs to, so 30 of them is **7 ms of a ~110 ms token, 1.07x** --
+/// inside this box's noise. Removing *every* sync in the token would be 35 ms, 1.46x, still
+/// under our 1.5x bar. The chain microbenchmark that motivated this (6.71x) compared 106
+/// matvecs *in isolation*, where syncs are nearly all of the 29.76 ms; in the real model the
+/// dense side costs 85-105 ms and syncs are only about a quarter of it.
+///
+/// The code stays, with its tests, because it is correct and the trade changes on a quieter
+/// host or with a model whose layers are cheaper. Turn it on and measure before believing it.
 #[cfg(feature = "gpu")]
 pub fn conv_blocks_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LB_NO_CONV_BLOCK").is_err())
+    *ON.get_or_init(|| std::env::var("LB_CONV_BLOCK").is_ok())
 }
 
 impl DenseStore {

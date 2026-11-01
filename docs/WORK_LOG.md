@@ -150,30 +150,51 @@ and a 14.5 GB budget both planned the same 2066 residents and left 3.5 GB idle. 
   shaders.
 * **`LB-Q8GPU`.** This model has no Q8_0 tensor at all. Zero value here.
 
-## The live lever: host syncs, not arithmetic
+## Host syncs: measured, and NOT the lever after all **[corrected 2026-11-01]**
 
-A decode token makes about **145 host syncs** -- 107 dense matrices + 38 expert layers -- at
-roughly **1 ms each under load**, against the 0.26-0.31 ms idle floor.
-
-Measured directly (chain N square matvecs, each eating the last one's output; identical
-arithmetic and identical dispatch count, the only difference is host syncs):
+**I had this wrong for about two hours and the correction is the useful part.** A decode
+token makes ~145 host syncs (107 dense matrices + 38 expert layers), and a chain
+microbenchmark said removing them was worth 6.71x:
 
 | depth | one sync at the end | one sync per step | |
 |---|---|---|---|
 | 8 | 0.621 ms | 2.658 ms | 4.28x |
 | 32 | 1.439 ms | 7.128 ms | 4.95x |
-| 106 | **4.436 ms** | **29.760 ms** | **6.71x** |
+| 106 | 4.436 ms | 29.760 ms | 6.71x |
 
-~0.24 ms saved per sync removed. So the dense side's ~85 ms is mostly *waiting*, and the work
-is to keep a layer's activations and intermediates on the device:
+That ratio is real but **does not transfer**, because it compares 106 matvecs *in isolation*,
+where syncs are nearly the whole 29.76 ms. In the model the dense side costs 85-105 ms and
+syncs are only about a quarter of it; the rest is real device work plus the tensor-to-vector
+hops and Burn ops around every call.
 
-* ~~conv layer~~ **done (`dc1665a`)**: 1 sync per layer, 30 removed
-* attention: `q,k,v` batched -> the attention math -> `o` = 2 syncs, not 8
-* dense FFN: `gate,up` fused (kernel already exists) -> `down` = 1 sync, not 3
+The number that matters is the **~0.24 ms saved per sync removed**, and it was available
+before any kernel was written:
 
-The blocker is that the arithmetic *between* the matmuls is currently Burn CPU tensor ops, so
-each one forces a readback. Those elementwise/attention steps need device kernels.
-**In progress by claude-t440.**
+| | syncs removed | time | end to end |
+|---|---|---|---|
+| the conv block | 30 | 7.2 ms of a ~110 ms token | **1.07x** |
+| *every* sync in a token | 145 | 34.8 ms | **1.46x** |
+
+So the entire sync-elimination programme tops out **below our 1.5x bar**, and any single step
+in it is unmeasurable on this box. Confirmed by building it: whole conv blocks on the device
+(`dc1665a`, `22f7a60`) measured **0.90x** against their own absence, interleaved, 15 reps an
+arm over 3 rounds -- loose matrices 9.185 tok/s, whole blocks 8.245. It is **off unless
+`LB_CONV_BLOCK=1`**. The code and its 6 tests stay: it is correct, and the trade changes on a
+quieter host or a model with cheaper layers.
+
+**Do not spend a lane on sync elimination.** If someone wants it, the honest pitch is "up to
+1.46x if you remove all 145, and you cannot measure the steps."
+
+### The thing this run actually established: how noisy this box is
+
+The **same configuration** (107 resident matrices, 751 MB, unchanged binary behaviour)
+measured **7.333 tok/s** in one hour and **9.185** in another -- **1.25x drift with nothing
+changed.** Both arms of the conv test had a spread above **2x**.
+
+That is why the rules at the top of this file exist, and it sets a floor on what can be
+learned here: **a change worth less than ~1.5x cannot be measured on t440 at all**, no matter
+how many reps. Today's 2.64x and 4.02x survived because they were far outside that. Anything
+smaller needs a quiet host.
 
 ## Open questions a lane could genuinely help with
 
