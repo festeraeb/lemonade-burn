@@ -177,6 +177,17 @@ fn main() -> Result<(), String> {
                 gpu.read_all(hs)?;
                 Ok(())
             })?;
+            // host-side cost of just enqueueing the launches (no wait): if this is close to the
+            // total, the run is bound by dispatch overhead on the CPU, not by the kernels
+            let mut enq = Vec::new();
+            for _ in 0..reps {
+                let xh = gpu.upload_f32(&x);
+                let t = Instant::now();
+                let hs: Vec<_> = es.iter().map(|e| e.launch(&gpu, &xh, m)).collect();
+                enq.push(t.elapsed().as_secs_f64() * 1e3);
+                gpu.read_all(hs)?;
+            }
+            rows_out.push((format!("expert_ffn_distinct{n_exp}_m{m}_enqueue_ms_per_expert"), median(enq) / n_exp as f64, "host time to enqueue only".into()));
             let per = ms / n_exp as f64;
             let gbs = es[0].bytes_on_device() as f64 / 1e9 / (per / 1e3);
             rows_out.push((format!("expert_ffn_distinct{n_exp}_m{m}_ms_per_expert"), per, format!("{gbs:.1} GB/s weight stream")));

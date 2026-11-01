@@ -45,7 +45,10 @@ impl Gpu {
         let (pmin, pmax) = (props.hardware.plane_size_min, props.hardware.plane_size_max);
         let has_ops = props.features.plane.contains(cubecl::ir::features::Plane::Ops);
         let use_plane = has_ops && pmax > 0 && std::env::var("LB_NO_PLANE").is_err();
-        let mut cube_dim = std::env::var("LB_Q4_CUBE").ok().and_then(|v| v.parse().ok()).unwrap_or(THREADS);
+        // Default: two planes per cube, from the plane size the driver reports (wave32 NVIDIA/RDNA:
+        // 64 units, wave64 Polaris/GCN: 128). Measured flat from 32 to 256 on a P100 (see
+        // the commit message), so this only needs to be a whole number of planes.
+        let mut cube_dim = std::env::var("LB_Q4_CUBE").ok().and_then(|v| v.parse().ok()).unwrap_or(if use_plane { 2 * pmax as usize } else { THREADS });
         if use_plane {
             // a whole number of planes, or `PLANE_DIM`-sized groups would straddle the cube
             let p = pmax as usize;
