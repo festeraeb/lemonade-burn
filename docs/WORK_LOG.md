@@ -95,6 +95,112 @@ at the moment). t440 also runs with swap 23/23 full. Treat t440 as a serving box
 
 ---
 
+## Where the 90.63 ms actually goes (Fable code audit, 2026-11-01) — **"107 matvecs" was wrong**
+
+I had been reasoning from "107 launches x ~0.3 ms = 32 ms, so 58 ms is unexplained". The
+launch count was wrong by **4x**. Per decode token the device actually receives:
+
+| source | dispatches | syncs | uploads |
+|---|---|---|---|
+| 106 dense Q4_0 + 1 Q6_K (`linear_vec` -> `GpuQ4Mat::matvec`) | 107 | 107 | 107 |
+| 38 MoE layers x 4 experts x **2** kernels (`GpuExpert::launch`: gate_up_silu + down) | **304** | 38 | 38 |
+| **total** | **411** | **145** | **145** |
+
+The 152 expert FFNs reconcile with "107 matvecs" because each expert is already fused to 2
+launches and syncs once per *layer*, not per expert. Cost model, using the repo's own
+`dense_bench` chain (depth 8 = 0.621 ms, depth 106 = 4.436 ms, so **0.039 ms per chained
+dispatch**):
+
+* 411 dispatches x ~0.04 ms = **16-19 ms**
+* 145 syncs x 0.26-0.31 ms = **38-45 ms**
+* Q6_K head above the floor **1.3 ms**; host-side MoE routing inside the timer **2-4 ms**
+
+= **~58-70 ms of the 90.63**. The remaining ~20-30 ms is per-call wgpu overhead no benchmark
+has isolated: a fresh `BindGroup` per dispatch (411/token), `queue.write_buffer` per upload
+(`host_ptr` is `None` on discrete Vulkan so the mapped path is never taken), and a readback
+that costs **two thread wake-ups** (a separate `WgpuPoll` thread, then `block_on`) — which is
+the part most sensitive to host load, and so is the likely mechanism behind c2 beating t440 on
+the same card.
+
+**Next measurement, before building anything:** add two "as-called" rows to `dense_bench` —
+`upload + launch + read` per real shape *with ~2 GB of decoy buffers resident*, and the MoE
+layer pattern (1 upload, 8 launches, 1 read). If those land near the 0.28 ms floor, F1/F3
+below are the whole story; if they come out at 2x, bind-group/tracker churn is real.
+
+## Ranked fixes against the 1.1x bar (decode 98 ms, so 1.1x needs >= 9 ms)
+
+1. **F1 — one launch per MoE projection per layer.** Concatenate each layer's 64 experts into
+   one buffer per projection (64 x 1.77 MB = 113 MB, under the 128 MiB binding limit) + a small
+   `routes` buffer; the kernel maps output -> slot -> expert -> row. **2 dispatches per layer
+   instead of 8.** Decode **~9-10 ms (1.10-1.12x)**, prefill **~1.35x**. Byte-identical: same
+   dot in the same lane order, only the buffer base changes. Touches `lib.rs` (two kernel
+   variants), `store.rs` (`GpuExpertLayer`), `moe.rs` (`ExpertStore::load`, `moe_ffn`,
+   `Placement` residency becomes per-layer).
+2. **F3 — concatenate q/k/v into one 3072-row matrix per attention layer.** `attn_block` issues
+   3 `linear` calls on the *same* `h` = 3 round trips. ~6 ms alone (**below the bar**), but
+   **F1+F3 together ~15-16 ms = ~1.19x**, both byte-identical. **Do NOT also fuse the dense
+   FFN gate/up** into `q4_0_gate_up_silu_kernel`: the device computes `g/(1+exp(-g))*u` while
+   the CPU path uses Burn's `silu(g)*u`, and WGSL `exp` differs from CPU libm — `text_sha`
+   will move.
+3. **F2 — in `moe_ffn`, do all uploads before all launches** (prefill only, ~10 lines).
+   `enqueue_task(Write)` calls `submit()` *before* `queue.write_buffer`, so the interleaved
+   upload/launch loop turns every upload into its own `vkQueueSubmit`: ~45 submits per layer,
+   **~1700 per prefill** instead of 38. Worth **85-170 ms of ~850 ms prefill**. Zero on decode
+   (one upload per layer, before any launch).
+
+**Below the bar, stated plainly:** a better Q6_K head access pattern saves <= 0.9 ms (1.01x);
+the scratch pool, `Handle` clones and `read_all`'s `to_vec` are microseconds. One correction to
+the sync section below: removing a sync also removes an upload and two wake-ups, so a *whole
+layer on device including router top-k* ceilings nearer **2x** than the 1.46x stated — but
+every step short of the end is still unmeasurable.
+
+## VRAM: the route to a smaller card (deterministic, load-immune)
+
+1. **Q3_K / Q2_K expert kernels.** The CPU side already dequantizes Q2K-Q6K, so a Q3_K_M GGUF
+   of this model *runs today* — entirely on the CPU path, because only Q4_0 and Q6_K have
+   device kernels. Experts are 12.9 GB of 15.2. Q3_K is 110 B/256 vs Q4_0's 144: experts ->
+   **~9.9 GB (fits 12 GB)**. Q2_K 84 B/256 -> **~7.5 GB (8-10 GB card)**. Follow the
+   `repack_q6_k` pattern. Quality must be scored on a frozen held-out set.
+2. **Q6_K head at ~212 B/superblock** instead of 320 (file is 210): keep the file's
+   `ql`/`qh` packing + 16 i8 scales + one f32 `d`, do the `v/16` lookup and 4-case extraction
+   in-kernel. Saves **~110 MB**; the kernel is latency-bound so the extra ALU is free. Keep
+   `sd` f32 — `d * sc` with `sc` in -128..127 overflows f16.
+3. **The 1.5 GB allocator gap** (15.2 GB used vs 13.66 GB of weights): 1 MiB page granules
+   plus **7,403 separate 8-byte `dims` buffers** (one `create` per matrix) and 14,592 expert
+   buffers in sliced pools. One shared `dims` buffer per shape (9 dense + 1 expert) and F1's
+   concatenation cut 7,296 allocations to 114. Plausibly 0.5-1 GB back — inferred; read
+   `client.memory_usage()` to confirm.
+4. **`--gpu-budget-mb` and `--gpu-dense-mb` are never checked against each other** or against
+   the card. 14500 + 900 on a 16.4 GB card worked by luck of correct Q6_K accounting. Fail loudly.
+
+## Prefill: there is no GEMM path at all
+
+Every kernel maps one plane to one `(t, r)` output, so at m tokens each weight row is streamed
+from DRAM **m times** (outputs are `t*rows + r` ordered, so the 12.6 MB `in_proj` is re-read
+20x before a 4 MB L2 can help). ~15 GB of dense traffic for 20 tokens. A variant where a plane
+owns row `r` and keeps `m` accumulators (comptime M <= 32) with `x` in shared memory is ~1.09x
+on prefill — but **F1+F2 matter more**, because prefill's real cost is dispatch and submit
+count, not bandwidth.
+
+## Two latent bugs found and verified by hand
+
+* **`BufferArg::from_raw_parts` lengths are in the wrong unit** (`store.rs:189-193`, `:301-305`,
+  `:369-373`, `:414-420`): `qs` is `&[V4U]` but gets `n_qs` **u32 words** (4x too many
+  elements); `x: &[V4F]` gets `m * cols` f32s (4x). Harmless *today* only because the kernels
+  read nothing but `out.len()` (verified: `while o < out.len()`), and `out` is correct. Any
+  bounds-check mode, or a future kernel reading `qs.len()`, reads 4x past the buffer. Pass
+  `n_qs / 4` and `m * cols / 4`.
+* **tok/s is overstated by `n/(n-1)` = 3.2% at 32 tokens** (`lb-server/src/main.rs:189-250`):
+  the loop breaks at `n >= max_tokens` *before* the final forward and the first token comes
+  from prefill logits sampled before the timer starts, so `completion_tokens = 32` while
+  `decode_s` covers **31** forwards. **The bias is systematic and identical in both arms of
+  every A/B, so every ratio in this file stands** — only absolute headline figures were 3.2%
+  high. Quote `decode_forward_ms` from `/v1/placement`, not tok/s. (This is why 10.5 tok/s and
+  97.98 ms/forward looked inconsistent: 1000/97.98 = 10.2.)
+* Minor: `moe_ffn` runs `into_par_iter` on an **empty** `cpu_part` every layer inside the timed
+  region — a rayon scope per layer for nothing. `LB_CONV_BLOCK=1` is **single-sequence only**
+  (device conv state is per model, `Cache` is per request); off by default, so no live hazard.
+
 ## State: where a decode token goes (2026-11-01, measured)
 
 | | ms per decode token | |
