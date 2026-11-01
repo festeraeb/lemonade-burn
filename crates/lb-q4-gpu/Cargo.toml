@@ -12,3 +12,4 @@ lb-gguf.workspace = true
 lb-ternary-gpu = { path = "../lb-ternary-gpu" }
 cubecl.workspace = true
 half = "2"
+rayon.workspace = true

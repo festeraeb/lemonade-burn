@@ -43,33 +43,88 @@ fn f16_to_f32(bits: u32) -> f32 {
     v
 }
 
-/// One unit per output element (token t, row r). `dims` = [rows, cols, row_bytes].
-#[cube(launch)]
-fn q4_0_matvec_kernel(w: &[u32], x: &[f32], dims: &[u32], out: &mut [f32]) {
-    let pos = ABSOLUTE_POS;
-    if pos < out.len() {
-        let rows = dims[0] as usize;
-        let cols = dims[1] as usize;
-        let row_bytes = dims[2] as usize;
-        let t = pos / rows;
-        let r = pos % rows;
-        let blocks = cols / 32;
-        let mut acc = 0.0f32;
-        for b in 0..blocks {
-            let base = r * row_bytes + b * 18;
-            let d = f16_to_f32(byte_at(w, base) | (byte_at(w, base + 1) << 8u32));
+/// Partial dot of one Q4_0 row with `x[x_off..]`: this unit sums the blocks `b` with
+/// `b % CUBE_DIM_X == UNIT_POS` (`n_iter` = ceil(blocks / CUBE_DIM_X), passed in).
+#[cube]
+fn q4_row_partial(w: &[u32], base: usize, x: &[f32], x_off: usize, blocks: usize, n_iter: usize) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..n_iter {
+        let b = UNIT_POS as usize + i * CUBE_DIM_X as usize;
+        if b < blocks {
+            let bb = base + b * 18;
+            let d = f16_to_f32(byte_at(w, bb) | (byte_at(w, bb + 1) << 8u32));
             let mut s = 0.0f32;
             for j in 0..16usize {
-                let byte = byte_at(w, base + 2 + j);
+                let byte = byte_at(w, bb + 2 + j);
                 let lo = (byte & 15u32) as i32 - 8;
                 let hi = (byte >> 4u32) as i32 - 8;
-                s += lo as f32 * x[t * cols + b * 32 + j];
-                s += hi as f32 * x[t * cols + b * 32 + j + 16];
+                s += lo as f32 * x[x_off + b * 32 + j];
+                s += hi as f32 * x[x_off + b * 32 + j + 16];
             }
             acc += d * s;
         }
-        out[pos] = acc;
     }
+    acc
+}
+
+/// Sum the 64 partials of this cube (CUBE_DIM_X must be 64); valid in unit 0 after return.
+#[cube]
+fn reduce64(sm: &mut Shared<[f32]>, v: f32) -> f32 {
+    sm[UNIT_POS as usize] = v;
+    sync_cube();
+    if UNIT_POS < 32u32 {
+        sm[UNIT_POS as usize] += sm[UNIT_POS as usize + 32];
+    }
+    sync_cube();
+    if UNIT_POS < 16u32 {
+        sm[UNIT_POS as usize] += sm[UNIT_POS as usize + 16];
+    }
+    sync_cube();
+    if UNIT_POS < 8u32 {
+        sm[UNIT_POS as usize] += sm[UNIT_POS as usize + 8];
+    }
+    sync_cube();
+    if UNIT_POS < 4u32 {
+        sm[UNIT_POS as usize] += sm[UNIT_POS as usize + 4];
+    }
+    sync_cube();
+    if UNIT_POS < 2u32 {
+        sm[UNIT_POS as usize] += sm[UNIT_POS as usize + 2];
+    }
+    sync_cube();
+    let r = sm[0] + sm[1];
+    sync_cube();
+    r
+}
+
+/// One cube of 64 units per output element (token t, row r): the units split the row's
+/// blocks and reduce through shared memory. `dims` = [rows, cols, row_bytes, n_iter].
+#[cube(launch)]
+fn q4_0_matvec_kernel(w: &[u32], x: &[f32], dims: &[u32], out: &mut [f32]) {
+    let pos = CUBE_POS as usize;
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let row_bytes = dims[2] as usize;
+    let n_iter = dims[3] as usize;
+    let mut sm = Shared::<[f32]>::new_slice(64usize);
+    let mut part = 0.0f32;
+    if pos < out.len() {
+        let t = pos / rows;
+        let r = pos % rows;
+        part = q4_row_partial(w, r * row_bytes, x, t * cols, cols / 32, n_iter);
+    }
+    let total = reduce64(&mut sm, part);
+    if pos < out.len() && UNIT_POS == 0u32 {
+        out[pos] = total;
+    }
+}
+
+/// Cube size used by every kernel here (the reduction assumes it).
+pub const THREADS: usize = 64;
+
+/// `dims` for [`q4_0_matvec_kernel`].
+pub fn matvec_dims(rows: usize, cols: usize, row_bytes: usize) -> [u32; 4] {
+    [rows as u32, cols as u32, row_bytes as u32, (cols / 32).div_ceil(THREADS) as u32]
 }
 
 /// `x`: `m` rows of `w.cols` f32. Returns `m * w.rows` values, token-major like the CPU kernel.
@@ -93,23 +148,21 @@ pub fn q4_0_matvec_gpu(w: QuantMat<'_>, x: &[f32], m: usize) -> Result<Vec<f32>,
         bytes.push(0);
     }
     let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-    let dims = [w.rows as u32, w.cols as u32, w.row_bytes() as u32];
+    let dims = matvec_dims(w.rows, w.cols, w.row_bytes());
 
     let w_h = client.create_from_slice(u32::as_bytes(&words));
     let x_h = client.create_from_slice(f32::as_bytes(x));
     let d_h = client.create_from_slice(u32::as_bytes(&dims));
     let o_h = client.empty(n_out * std::mem::size_of::<f32>());
 
-    let threads = 64usize;
-    let cubes = n_out.div_ceil(threads) as u32;
     unsafe {
         q4_0_matvec_kernel::launch(
             &client,
-            CubeCount::Static(cubes, 1, 1),
-            CubeDim::new_1d(threads as u32),
+            CubeCount::Static(n_out as u32, 1, 1),
+            CubeDim::new_1d(THREADS as u32),
             BufferArg::from_raw_parts(w_h, words.len()),
             BufferArg::from_raw_parts(x_h, x.len()),
-            BufferArg::from_raw_parts(d_h, 3),
+            BufferArg::from_raw_parts(d_h, 4),
             BufferArg::from_raw_parts(o_h.clone(), n_out),
         );
     }

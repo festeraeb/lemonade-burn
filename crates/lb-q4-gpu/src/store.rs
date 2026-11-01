@@ -7,7 +7,7 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{q4_0_matvec_kernel, QuantMat};
+use crate::{matvec_dims, q4_0_matvec_kernel, QuantMat, THREADS};
 use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -41,6 +41,11 @@ impl Gpu {
         self.client.create_from_slice(f32::as_bytes(x))
     }
 
+    /// Wait for everything submitted so far (a timing fence).
+    pub fn sync(&self) -> Result<(), String> {
+        cubecl::future::block_on(self.client.sync()).map_err(|e| format!("GPU sync failed: {e:?}"))
+    }
+
     /// Read several f32 outputs back in one synchronisation.
     pub fn read_all(&self, handles: Vec<(Handle, usize)>) -> Result<Vec<Vec<f32>>, String> {
         let lens: Vec<usize> = handles.iter().map(|(_, n)| *n).collect();
@@ -71,7 +76,7 @@ impl GpuQ4Mat {
         }
         let n_words = bytes.len() / 4;
         let words = gpu.client.create_from_slice(&bytes);
-        let dims = [w.rows as u32, w.cols as u32, w.row_bytes() as u32];
+        let dims = matvec_dims(w.rows, w.cols, w.row_bytes());
         let dims = gpu.client.create_from_slice(u32::as_bytes(&dims));
         Ok(Self { rows: w.rows, cols: w.cols, row_bytes: w.row_bytes(), words, n_words, dims })
     }
@@ -84,15 +89,14 @@ impl GpuQ4Mat {
     pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
         let n_out = m * self.rows;
         let out = gpu.client.empty(n_out * 4);
-        let threads = 64usize;
         unsafe {
             q4_0_matvec_kernel::launch(
                 &gpu.client,
-                CubeCount::Static(n_out.div_ceil(threads) as u32, 1, 1),
-                CubeDim::new_1d(threads as u32),
+                CubeCount::Static(n_out as u32, 1, 1),
+                CubeDim::new_1d(THREADS as u32),
                 BufferArg::from_raw_parts(self.words.clone(), self.n_words),
                 BufferArg::from_raw_parts(x.clone(), m * self.cols),
-                BufferArg::from_raw_parts(self.dims.clone(), 3),
+                BufferArg::from_raw_parts(self.dims.clone(), 4),
                 BufferArg::from_raw_parts(out.clone(), n_out),
             );
         }
