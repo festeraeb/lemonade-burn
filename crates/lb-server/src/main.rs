@@ -58,6 +58,12 @@ struct Args {
     /// runs it there, which measured 45.2 ms against about 4 ms a call on the 24B.
     #[arg(long, default_value = "cpu")]
     miss_policy: String,
+    /// LFM2 only, with `--gpu`: byte budget (MB) for resident *dense* weights — the
+    /// short-conv projections, attention q/k/v/o and the leading dense FFNs. These run for
+    /// every token, so there is nothing to plan: give it enough and all of them go over
+    /// (424 MB on the 24B). 0 = leave the dense side on the CPU.
+    #[arg(long, default_value_t = 0)]
+    gpu_dense_mb: usize,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8000)]
@@ -102,6 +108,8 @@ struct AppState {
     threads: usize,
     /// LFM2 only: the live expert-placement counters, shared with the model thread.
     placement: Option<Arc<lb_lfm2::moe::PlacementStats>>,
+    /// LFM2 only: the forward-pass time split, shared with the model thread.
+    timings: Option<Arc<lb_lfm2::model::Timings>>,
 }
 
 fn now() -> u64 {
@@ -443,12 +451,24 @@ async fn placement_stats(State(st): State<Arc<AppState>>) -> Json<Value> {
         return Json(json!({"placement": "none (not an LFM2 model)"}));
     };
     let t = s.snapshot();
-    Json(json!({
+    let mut v = json!({
         "schema": "lemonade-burn.placement.v1",
         "gpu_hits": t.gpu_hits, "cpu_calls": t.cpu_calls, "on_demand": t.on_demand,
         "gpu_hit_rate": t.hit_rate,
         "gpu_s": t.gpu_s, "cpu_s": t.cpu_s, "on_demand_s": t.on_demand_s
-    }))
+    });
+    // Where a forward pass went, so "what is left to optimise" is read off the server
+    // instead of inferred from the token rate.
+    if let Some(tm) = st.timings.as_ref() {
+        let r2 = |x: f64| (x * 100.0).round() / 100.0;
+        for (prefix, s) in [("all", tm.snapshot()), ("decode", tm.decode())] {
+            v[format!("{prefix}_passes")] = json!(s.passes);
+            v[format!("{prefix}_forward_ms")] = json!(r2(s.forward_ms));
+            v[format!("{prefix}_matmul_ms")] = json!(r2(s.matmul_ms));
+            v[format!("{prefix}_other_ms")] = json!(r2(s.other_ms));
+        }
+    }
+    Json(v)
 }
 
 async fn topology(State(st): State<Arc<AppState>>) -> Json<Value> {
@@ -468,8 +488,8 @@ fn main() -> Result<()> {
     let dev = Device::flex();
     let is_gguf = args.model.extension().map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false);
     let (jtx, jrx) = std_mpsc::channel::<Job>();
-    type Loaded = (Arc<TextCodec>, usize, String, &'static str, Option<Arc<lb_lfm2::moe::PlacementStats>>);
-    let (codec, ctx, model_id, kernel, placement): Loaded = if is_gguf {
+    type Loaded = (Arc<TextCodec>, usize, String, &'static str, Option<Arc<lb_lfm2::moe::PlacementStats>>, Option<Arc<lb_lfm2::model::Timings>>);
+    let (codec, ctx, model_id, kernel, placement, timings): Loaded = if is_gguf {
         let mut model = lb_lfm2::Lfm2::load(&args.model, &dev)?;
         let cfg = model.cfg().clone();
         model.store.miss = lb_lfm2::moe::MissPolicy::parse(&args.miss_policy).map_err(|e| anyhow::anyhow!(e))?;
@@ -484,15 +504,30 @@ fn main() -> Result<()> {
                 eprintln!("uploaded {n} experts ({:.0} MB) to the GPU", model.store.bytes as f64 / 1e6);
             }
         }
+        if args.gpu && args.gpu_dense_mb > 0 {
+            #[cfg(feature = "gpu")]
+            {
+                let want = lb_lfm2::dense::DenseStore::candidate_bytes(&model.w);
+                let n = model.load_dense(args.gpu_dense_mb * 1_000_000).map_err(|e| anyhow::anyhow!(e))?;
+                eprintln!(
+                    "dense: {n} matrices resident ({:.0} MB of {:.0} MB available)",
+                    model.dense.bytes as f64 / 1e6,
+                    want as f64 / 1e6
+                );
+            }
+            #[cfg(not(feature = "gpu"))]
+            anyhow::bail!("--gpu-dense-mb needs the `gpu` feature");
+        }
         let dir = args.model.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
         let codec = Arc::new(TextCodec::load_with(&dir.join("tokenizer.json"), cfg.bos, ChatStyle::ChatMl, vec![cfg.eos])?);
         let ctx = args.ctx.min(cfg.n_ctx);
         let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "lfm2".into()));
         let kernel = model.kernel_name();
         let stats = model.stats.clone();
+        let tm = model.timings.clone();
         let wc = codec.clone();
         std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
-        (codec, ctx, model_id, kernel, Some(stats))
+        (codec, ctx, model_id, kernel, Some(stats), Some(tm))
     } else {
         let model = BitNet::load(&args.model, &dev)?;
         let codec = Arc::new(TextCodec::load(&args.model, model.cfg.bos_token_id)?);
@@ -501,7 +536,7 @@ fn main() -> Result<()> {
         let kernel = model.kernel_name();
         let wc = codec.clone();
         std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
-        (codec, ctx, model_id, kernel, None)
+        (codec, ctx, model_id, kernel, None, None)
     };
     eprintln!(
         "lemonade-burn-server: loaded {} in {:.1}s (kernel {}, {} threads, ctx {ctx})",
@@ -520,6 +555,7 @@ fn main() -> Result<()> {
         kernel,
         threads: rayon::current_num_threads(),
         placement,
+        timings,
     });
     let app = Router::new()
         .route("/health", get(health))

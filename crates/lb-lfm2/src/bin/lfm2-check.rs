@@ -126,7 +126,7 @@ fn main() -> Result<()> {
         let logits = model.forward(&ids, &mut cache, true);
         let ours = Lfm2::argmax_rows(&logits);
         let dt = t.elapsed().as_secs_f32();
-        let mm = model.matmul_ns.swap(0, std::sync::atomic::Ordering::Relaxed) as f32 / 1e9;
+        let mm = model.timings.matmul_ns.swap(0, std::sync::atomic::Ordering::Relaxed) as f32 / 1e9;
         eprintln!("prompt {n} tokens: our forward {dt:.1}s ({mm:.1}s in quantized matmuls)");
         if let Some(p) = model.scraper.flush("prefill", &ids)? {
             eprintln!("scrape written: {}", p.display());

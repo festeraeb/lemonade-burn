@@ -14,6 +14,7 @@
 //! everything else is ordinary Burn tensor ops.
 
 use crate::config::Config;
+use crate::dense::DenseStore;
 use crate::moe::{moe_ffn, ExpertStore, Placement, PlacementStats, Scraper};
 use crate::weights::{Ffn, MatRef, Operator, Weights};
 use anyhow::Result;
@@ -21,6 +22,7 @@ use burn::tensor::activation::{silu, softmax};
 use burn::tensor::{Bool, Device, Tensor, TensorData};
 use lb_gguf::{matvec_f32, Gguf};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -30,12 +32,65 @@ pub struct Lfm2 {
     pub placement: Placement,
     /// Experts made resident on the GPU from `placement` (see [`Lfm2::load_residents`]).
     pub store: ExpertStore,
+    /// Dense weights made resident on the same device (see [`Lfm2::load_dense`]). The device
+    /// itself is owned by `store`, which is the one place that opens it.
+    pub dense: DenseStore,
     /// Shared so a host (the server) can read the counters while the model runs on its
     /// own thread: this is the only view of where a token's time actually went.
     pub stats: Arc<PlacementStats>,
     pub scraper: Scraper,
-    /// Wall time inside quantized matmuls (ns), for profiling.
-    pub matmul_ns: std::sync::atomic::AtomicU64,
+    /// Where a forward pass spent its time. Shared for the same reason as `stats`: the
+    /// model runs on its own thread and the host has to be able to read this while it does.
+    pub timings: Arc<Timings>,
+}
+
+/// Cumulative wall time inside a forward pass, split at the one boundary that decides what
+/// to optimise next: quantized matmuls against everything else.
+///
+/// `forward_ns - matmul_ns` is the norms, RoPE, softmax, residuals, the conv taps and the
+/// tensor-to-vector hops in and out of every kernel — all Burn CPU tensor ops. When the
+/// matmuls move to the device that remainder is what is left, so it needs its own number
+/// rather than an inference from the token rate.
+/// A prefill pass costs many times a decode pass, so they are counted apart: averaged
+/// together, six prefills in two hundred passes move the per-token figure by more than the
+/// change being measured.
+#[derive(Default)]
+pub struct Timings {
+    pub forward_ns: AtomicU64,
+    /// Dense `linear` plus `moe_ffn`.
+    pub matmul_ns: AtomicU64,
+    pub forwards: AtomicU64,
+    /// The same three, restricted to single-token (decode) passes.
+    pub decode_forward_ns: AtomicU64,
+    pub decode_matmul_ns: AtomicU64,
+    pub decodes: AtomicU64,
+}
+
+/// Mean ms per pass over the passes counted, split at the matmul boundary.
+pub struct Split {
+    pub passes: u64,
+    pub forward_ms: f64,
+    pub matmul_ms: f64,
+    pub other_ms: f64,
+}
+
+impl Timings {
+    /// Over every pass, prefill included.
+    pub fn snapshot(&self) -> Split {
+        Self::split(&self.forwards, &self.forward_ns, &self.matmul_ns)
+    }
+
+    /// Over decode passes only: what a generated token actually costs.
+    pub fn decode(&self) -> Split {
+        Self::split(&self.decodes, &self.decode_forward_ns, &self.decode_matmul_ns)
+    }
+
+    fn split(n: &AtomicU64, fwd: &AtomicU64, mm: &AtomicU64) -> Split {
+        let passes = n.load(Ordering::Relaxed);
+        let per = |x: &AtomicU64| if passes > 0 { x.load(Ordering::Relaxed) as f64 / 1e6 / passes as f64 } else { 0.0 };
+        let (forward_ms, matmul_ms) = (per(fwd), per(mm));
+        Split { passes, forward_ms, matmul_ms, other_ms: forward_ms - matmul_ms }
+    }
 }
 
 /// Per-layer state: K/V `[kv_heads, cap, head_dim]` for attention layers, the last
@@ -60,9 +115,10 @@ impl Lfm2 {
             device: device.clone(),
             placement,
             store: ExpertStore::default(),
+            dense: DenseStore::default(),
             stats: Arc::new(PlacementStats::default()),
             scraper: Scraper::from_env(&model_id),
-            matmul_ns: Default::default(),
+            timings: Arc::new(Timings::default()),
         })
     }
 
@@ -71,6 +127,17 @@ impl Lfm2 {
     pub fn load_residents(&mut self) -> Result<usize, String> {
         let Self { w, placement, store, .. } = self;
         store.load(w, placement)
+    }
+
+    /// Upload dense Q4_0 weights to the device, up to `budget_bytes`. Returns how many.
+    /// Opens the device if `load_residents` has not already.
+    #[cfg(feature = "gpu")]
+    pub fn load_dense(&mut self, budget_bytes: usize) -> Result<usize, String> {
+        if self.store.gpu.is_none() {
+            self.store.gpu = Some(lb_q4_gpu::Gpu::open()?);
+        }
+        let Self { w, store, dense, .. } = self;
+        dense.load(store.gpu.as_ref().expect("device just opened"), w, budget_bytes)
     }
 
     pub fn cfg(&self) -> &Config {
@@ -90,16 +157,40 @@ impl Lfm2 {
         Tensor::from_data(TensorData::new(v, [rows, cols]), &self.device)
     }
 
-    /// `x [m, cols] @ W^T -> [m, rows]` through the quantized kernel.
+    /// `x [m, cols] @ W^T -> [m, rows]` through the quantized kernel: the resident device
+    /// copy when [`DenseStore`] holds this matrix, else the CPU reference kernel.
     pub fn linear(&self, x: Tensor<2>, w: &MatRef) -> Tensor<2> {
         let [m, cols] = x.dims();
         assert_eq!(cols, w.cols, "linear: input width");
         let xv = Self::to_vec(x);
-        let mut out = vec![0f32; m * w.rows];
         let t = Instant::now();
-        matvec_f32(self.w.mat(w), &xv, m, &mut out);
-        self.matmul_ns.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let out = self.linear_vec(&xv, w, m);
+        self.timings.matmul_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.from_vec(out, m, w.rows)
+    }
+
+    /// The matmul itself, on whichever side holds the weights.
+    fn linear_vec(&self, xv: &[f32], w: &MatRef, m: usize) -> Vec<f32> {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.store.gpu.as_ref() {
+            // a device fault here would be silent corruption if we guessed at the result:
+            // say which matrix, then let the CPU kernel finish the token.
+            let report = |e| eprintln!("dense matvec on device failed for [{}, {}]: {e}; using the CPU kernel", w.rows, w.cols);
+            if let Some(mat) = self.dense.resident.get(&w.start) {
+                match mat.matvec(gpu, xv, m) {
+                    Ok(v) => return v,
+                    Err(e) => report(e),
+                }
+            } else if let Some(mat) = self.dense.q6.get(&w.start) {
+                match mat.matvec(gpu, xv, m) {
+                    Ok(v) => return v,
+                    Err(e) => report(e),
+                }
+            }
+        }
+        let mut out = vec![0f32; m * w.rows];
+        matvec_f32(self.w.mat(w), xv, m, &mut out);
+        out
     }
 
     fn rms_norm<const D: usize>(&self, x: Tensor<D>, w: &[f32]) -> Tensor<D> {
@@ -258,6 +349,22 @@ impl Lfm2 {
     /// Run `tokens` at positions `cache.len ..`. Returns logits `[m, vocab]` when
     /// `all_logits`, else `[1, vocab]` for the last position.
     pub fn forward(&self, tokens: &[u32], cache: &mut Cache, all_logits: bool) -> Tensor<2> {
+        let mm0 = self.timings.matmul_ns.load(Ordering::Relaxed);
+        let t_fwd = Instant::now();
+        let out = self.forward_inner(tokens, cache, all_logits);
+        let dt = t_fwd.elapsed().as_nanos() as u64;
+        let t = &self.timings;
+        t.forward_ns.fetch_add(dt, Ordering::Relaxed);
+        t.forwards.fetch_add(1, Ordering::Relaxed);
+        if tokens.len() == 1 {
+            t.decode_forward_ns.fetch_add(dt, Ordering::Relaxed);
+            t.decode_matmul_ns.fetch_add(t.matmul_ns.load(Ordering::Relaxed).wrapping_sub(mm0), Ordering::Relaxed);
+            t.decodes.fetch_add(1, Ordering::Relaxed);
+        }
+        out
+    }
+
+    fn forward_inner(&self, tokens: &[u32], cache: &mut Cache, all_logits: bool) -> Tensor<2> {
         let cfg = self.cfg();
         let m = tokens.len();
         let pos0 = cache.len;
@@ -302,7 +409,7 @@ impl Lfm2 {
                     let hv = Self::to_vec(h2);
                     let t = Instant::now();
                     let (out, routes) = moe_ffn(&self.w, router, bias, gate, up, down, &hv, m, &self.store, li, &self.stats);
-                    self.matmul_ns.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.timings.matmul_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     self.scraper.record(li, pos0, &routes);
                     self.from_vec(out, m, e)
                 }
