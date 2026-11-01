@@ -1,6 +1,8 @@
-//! Forge seed: the GPU Q6_K matvec must match `lb_gguf::matvec_f32` (whose Q6_K dequant
-//! is checked against gguf-py on the real file in lb-gguf's tests). Ignored until the
-//! kernel exists; the forge check runs `--include-ignored` on c3 (LB_WGPU_DEVICE=discrete:1).
+//! The GPU Q6_K matvec must match `lb_gguf::matvec_f32` (whose Q6_K dequant is checked
+//! against gguf-py on the real file in lb-gguf's tests). These were forge seeds, ignored
+//! until the kernel existed; it does now, so they run like the crate's other GPU tests.
+//! Both reductions have to pass: plain, and `LB_NO_PLANE=1` for devices without
+//! subgroup ops.
 mod common;
 use common::{assert_close, Rng};
 use lb_gguf::{matvec_f32, GgmlType, QuantMat};
@@ -29,26 +31,22 @@ fn check(rows: usize, cols: usize, m: usize, seed: u64) {
 }
 
 #[test]
-#[ignore]
 fn q6_k_one_superblock_rows() {
     check(8, 256, 1, 1);
 }
 
 #[test]
-#[ignore]
 fn q6_k_odd_rows_three_tokens() {
     check(37, 512, 3, 2);
 }
 
 #[test]
-#[ignore]
 fn q6_k_lfm2_head_slice() {
     // 4096 rows of the 128000 x 2048 tied head
     check(4096, 2048, 1, 3);
 }
 
 #[test]
-#[ignore]
 fn q6_k_real_embedding_rows_if_present() {
     let path = std::path::Path::new("/mnt/t440/raid0/models/lfm25/LFM2.5-24B-A2B-QAD-Q4_0.gguf");
     if !path.exists() {

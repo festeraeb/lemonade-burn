@@ -17,7 +17,7 @@
 //! output per cube with a shared-memory tree.
 
 pub mod store;
-pub use store::{Gpu, GpuExpert, GpuQ4Mat};
+pub use store::{Gpu, GpuExpert, GpuQ4Mat, GpuQ6KMat};
 pub use cubecl::server as cubecl_server;
 
 use cubecl::prelude::*;
@@ -167,6 +167,107 @@ fn q4_0_gate_up_silu_kernel(
     }
 }
 
+/// This lane's partial dot of one Q6_K row (`gpr` groups of 16 from global group `gg0`).
+///
+/// Mirrors [`q4_row_partial`]: byte `j` of word `k` of a group holds value `4j + k`, so a
+/// vector-wide `(w >> 8j) & 255` lands exactly on x's 4-wide vector `j`. The group scale is
+/// already `d * sc[g]` (see [`repack_q6_k`]), so there is no f16 decode in the inner loop.
+#[cube]
+fn q6_row_partial(qv: &[V4U], sd: &[f32], x: &[V4F], gg0: usize, x4_0: usize, gpr: usize, lane: usize, width: usize) -> f32 {
+    let mut acc = V4F::new(0.0f32);
+    let mut g = lane;
+    while g < gpr {
+        let gg = gg0 + g;
+        let w = qv[gg];
+        let s = sd[gg];
+        let xb = x4_0 + g * 4usize;
+        let mut part = V4F::new(0.0f32);
+        #[unroll]
+        for j in 0..4u32 {
+            let q = (w >> V4U::new(8u32 * j)) & V4U::new(255u32);
+            let f = V4F::cast_from(q) - V4F::new(32.0f32);
+            part += f * x[xb + j as usize];
+        }
+        acc += V4F::new(s) * part;
+        g += width;
+    }
+    acc.extract(0usize) + acc.extract(1usize) + acc.extract(2usize) + acc.extract(3usize)
+}
+
+/// Q6_K matvec. `dims` = [rows, cols]; one plane (or cube, in the fallback) per output.
+#[cube(launch)]
+fn q6_k_matvec_kernel(qv: &[V4U], sd: &[f32], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let gpr = cols / 16usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < out.len() {
+        let t = o / rows;
+        let r = o % rows;
+        let part = q6_row_partial(qv, sd, x, r * gpr, t * cols / 4usize, gpr, lane, width);
+        let total = lane_sum(&mut sm, part, use_plane);
+        if lane == 0usize {
+            out[o] = total;
+        }
+        o += step;
+    }
+}
+
+/// Repack GGUF Q6_K super-blocks into the device layout.
+///
+/// A super-block is 256 values in 210 bytes: `ql[128]` low nibbles, `qh[64]` two high bits
+/// each, `scales[16]` i8, then the f16 `d`. Three things make that unusable as it stands:
+/// it is not 4-byte aligned, the 6 bits of a value are split across two arrays at indices
+/// that depend on which quarter of a half it is in, and the scale lookup in the reference
+/// reads as if it needed the same case analysis.
+///
+/// It does not: for value `v` the scale index works out to exactly `v / 16`, so the 256
+/// values are 16 contiguous groups of 16, each with one scale. So the repack writes
+///   * `qv`: 4 u32 words per group — one `Vector<u32, 4>`, 16 values, the 6-bit quants
+///     widened to a byte each and left unsigned (0..63; the kernel subtracts 32)
+///   * `sd`: one f32 per group, already `d * scales[g]`, so `d` never reaches the kernel
+///
+/// 320 bytes per super-block against the file's 210 (1.52x: the tied head goes 215 MB to
+/// 327 MB on the device), in exchange for an inner loop with no bit surgery in it.
+pub fn repack_q6_k(bytes: &[u8], n_super: usize) -> (Vec<u32>, Vec<f32>) {
+    use rayon::prelude::*;
+    let mut qv = vec![0u32; n_super * 64];
+    let mut sd = vec![0f32; n_super * 16];
+    qv.par_chunks_mut(64).zip(sd.par_chunks_mut(16)).enumerate().for_each(|(b, (qv, sd))| {
+        let blk = &bytes[b * 210..(b + 1) * 210];
+        let d = half::f16::from_le_bytes([blk[208], blk[209]]).to_f32();
+        for (g, s) in sd.iter_mut().enumerate() {
+            *s = d * (blk[192 + g] as i8) as f32;
+        }
+        for v in 0..256usize {
+            let (h, r) = (v / 128, v % 128);
+            let (sub, l) = (r / 32, r % 32);
+            let ql = &blk[64 * h..];
+            let qh = &blk[128 + 32 * h..];
+            let q = match sub {
+                0 => (ql[l] & 0x0f) | ((qh[l] & 3) << 4),
+                1 => (ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 3) << 4),
+                2 => (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4),
+                _ => (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4),
+            } as u32;
+            let (g, u) = (v / 16, v % 16);
+            qv[g * 4 + u % 4] |= q << (8 * (u / 4) as u32);
+        }
+    });
+    (qv, sd)
+}
+
 /// Default cube size (units) when the device is not asked: see `Gpu::open`.
 pub const THREADS: usize = 64;
 
@@ -255,6 +356,12 @@ pub fn q6_k_matvec_gpu(w: QuantMat<'_>, x: &[f32], m: usize) -> Result<Vec<f32>,
     if w.ty != lb_gguf::GgmlType::Q6K {
         return Err(format!("expected Q6_K, got {}", w.ty.name()));
     }
-    let _ = (x, m);
-    Err("q6_k_matvec_gpu: not implemented yet (forge seed)".to_string())
+    if x.len() != m * w.cols {
+        return Err(format!("x has {} values, expected {} x {}", x.len(), m, w.cols));
+    }
+    if m * w.rows == 0 {
+        return Ok(Vec::new());
+    }
+    let gpu = Gpu::open()?;
+    GpuQ6KMat::upload(&gpu, w)?.matvec(&gpu, x, m)
 }

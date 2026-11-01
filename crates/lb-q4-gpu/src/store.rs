@@ -7,7 +7,7 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, repack_q4_0, QuantMat, THREADS};
+use crate::{cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, THREADS};
 use cubecl::bytes::Bytes;
 use cubecl::client::Client;
 use cubecl::prelude::*;
@@ -188,6 +188,73 @@ impl GpuQ4Mat {
                 CubeDim::new_1d(gpu.cube_dim as u32),
                 BufferArg::from_raw_parts(self.qs.clone(), self.n_qs),
                 BufferArg::from_raw_parts(self.sc.clone(), self.n_sc),
+                BufferArg::from_raw_parts(x.clone(), m * self.cols),
+                BufferArg::from_raw_parts(self.dims.clone(), 2),
+                BufferArg::from_raw_parts(out.clone(), n_out),
+                gpu.use_plane,
+            );
+        }
+        out
+    }
+
+    pub fn matvec(&self, gpu: &Gpu, x: &[f32], m: usize) -> Result<Vec<f32>, String> {
+        let xh = gpu.upload_f32(x);
+        let out = self.launch(gpu, &xh, m);
+        Ok(gpu.read_all(vec![(out, m * self.rows)])?.remove(0))
+    }
+}
+
+/// A Q6_K matrix resident on the device, repacked (see [`repack_q6_k`]).
+///
+/// The one Q6_K tensor in LFM2.5 is `token_embd`, which is also the tied LM head: 128000 x
+/// 2048, the largest dense matrix in the model and 55 ms of CPU per token on its own.
+pub struct GpuQ6KMat {
+    pub rows: usize,
+    pub cols: usize,
+    qv: Handle,
+    sd: Handle,
+    n_qv: usize,
+    n_sd: usize,
+    dims: Handle,
+}
+
+impl GpuQ6KMat {
+    pub fn upload(gpu: &Gpu, w: QuantMat<'_>) -> Result<Self, String> {
+        if w.ty != lb_gguf::GgmlType::Q6K {
+            return Err(format!("expected Q6_K, got {}", w.ty.name()));
+        }
+        if w.cols % 256 != 0 {
+            return Err(format!("Q6_K needs cols % 256 == 0, got {}", w.cols));
+        }
+        let n_super = w.rows * (w.cols / 256);
+        let (qv, sd) = repack_q6_k(w.bytes, n_super);
+        let dims = matvec_dims(w.rows, w.cols);
+        Ok(Self {
+            rows: w.rows,
+            cols: w.cols,
+            n_qv: qv.len(),
+            n_sd: sd.len(),
+            qv: gpu.upload_u32(qv),
+            sd: gpu.upload_f32(&sd),
+            dims: gpu.upload_u32(dims.to_vec()),
+        })
+    }
+
+    pub fn bytes_on_device(&self) -> usize {
+        (self.n_qv + self.n_sd) * 4
+    }
+
+    /// Launch `out = x @ W^T` for `m` rows of `x` already on the device.
+    pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        let n_out = m * self.rows;
+        let out = gpu.scratch(n_out * 4);
+        unsafe {
+            q6_k_matvec_kernel::launch(
+                &gpu.client,
+                cube_count(n_out, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.qv.clone(), self.n_qv),
+                BufferArg::from_raw_parts(self.sd.clone(), self.n_sd),
                 BufferArg::from_raw_parts(x.clone(), m * self.cols),
                 BufferArg::from_raw_parts(self.dims.clone(), 2),
                 BufferArg::from_raw_parts(out.clone(), n_out),
