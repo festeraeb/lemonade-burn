@@ -170,22 +170,37 @@ fn q4_0_gate_up_silu_kernel(
 /// Default cube size (units) when the device is not asked: see `Gpu::open`.
 pub const THREADS: usize = 64;
 
+/// Blocks per repack work unit. Even, so an `sc` word (two blocks) never straddles two units.
+const REPACK_CHUNK: usize = 1024;
+
 /// Repack GGUF Q4_0 rows into the device layout (`qs` words, packed f16 `sc` words).
 /// `bytes` is the unchanged GGUF data: `n_blocks` blocks of 18 bytes.
+///
+/// Parallel over blocks, because this is on the critical path twice. It runs for every
+/// resident expert at load (2066 of them on a 12 GB budget, 23.5 ms each single-threaded
+/// was 49 s of a 147 s load), and an on-demand upload of a non-resident expert has to pay
+/// it before the copy, where it was over half the cost of serving the miss.
 pub fn repack_q4_0(bytes: &[u8], n_blocks: usize) -> (Vec<u32>, Vec<u32>) {
+    use rayon::prelude::*;
     let mut qs = vec![0u32; n_blocks * 4];
     let mut sc = vec![0u32; n_blocks.div_ceil(2).max(1)];
-    for b in 0..n_blocks {
-        let blk = &bytes[b * 18..b * 18 + 18];
-        let d = u16::from_le_bytes([blk[0], blk[1]]) as u32;
-        sc[b / 2] |= d << (16 * (b % 2));
-        let q = &blk[2..];
-        for v in 0..32usize {
-            let nib = if v < 16 { q[v] & 15 } else { q[v - 16] >> 4 } as u32;
-            let (j, k) = (v / 4, v % 4);
-            qs[b * 4 + k] |= nib << (4 * j);
-        }
-    }
+    qs.par_chunks_mut(4 * REPACK_CHUNK)
+        .zip(sc.par_chunks_mut(REPACK_CHUNK / 2))
+        .enumerate()
+        .for_each(|(ci, (qs, sc))| {
+            let b0 = ci * REPACK_CHUNK;
+            for b in 0..(qs.len() / 4) {
+                let blk = &bytes[(b0 + b) * 18..(b0 + b) * 18 + 18];
+                sc[b / 2] |= (u16::from_le_bytes([blk[0], blk[1]]) as u32) << (16 * (b % 2));
+                // byte i of the block holds value i in its low nibble and value i + 16 in its
+                // high one; both land in word i % 4, at nibbles i / 4 and i / 4 + 4.
+                let w = &mut qs[b * 4..b * 4 + 4];
+                for i in 0..16usize {
+                    let byte = blk[2 + i] as u32;
+                    w[i % 4] |= ((byte & 15) << (4 * (i / 4))) | ((byte >> 4) << (4 * (i / 4) + 16));
+                }
+            }
+        });
     (qs, sc)
 }
 
