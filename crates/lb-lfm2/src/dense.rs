@@ -67,13 +67,34 @@ impl DenseStore {
         v
     }
 
-    /// Upload dense matrices until `budget_bytes` is spent, largest first (the CPU kernel's
-    /// cost tracks bytes read, so the largest matrix saves the most). Returns how many were
+    /// CPU ms saved per device MB, measured (`dense_bench`, P100, 2026-11-01): the 106 dense
+    /// Q4_0 matvecs are 273-316 ms of CPU for 423 device MB, the Q6_K head 54.1 ms for 328 MB.
+    ///
+    /// So a Q4_0 matrix is worth about 4.2x as much per byte as the head, and ordering by
+    /// size alone would have it backwards: the head is the single largest candidate, so a
+    /// budget that cannot take everything would spend a third of itself on the matrix with
+    /// the worst return. (Found by a 600 MB budget quietly taking the head plus 37 of the 106
+    /// Q4_0 matrices instead of all 106.)
+    fn saving_per_byte(ty: lb_gguf::GgmlType) -> f64 {
+        match ty {
+            lb_gguf::GgmlType::Q4_0 => 0.70,
+            lb_gguf::GgmlType::Q6K => 0.16,
+            _ => 0.0,
+        }
+    }
+
+    /// Upload order: best return per device byte first, larger matrices first within a type.
+    fn by_return(a: &MatRef, b: &MatRef) -> std::cmp::Ordering {
+        Self::saving_per_byte(b.ty).total_cmp(&Self::saving_per_byte(a.ty)).then(b.len.cmp(&a.len))
+    }
+
+    /// Upload dense matrices until `budget_bytes` is spent, best return per device byte
+    /// first and larger matrices before smaller within a type. Returns how many were
     /// uploaded. Without the `gpu` feature: an error.
     #[cfg(feature = "gpu")]
     pub fn load(&mut self, gpu: &lb_q4_gpu::Gpu, w: &Weights, budget_bytes: usize) -> Result<usize, String> {
         let mut cand = Self::candidates(w);
-        cand.sort_by_key(|m| std::cmp::Reverse(m.len));
+        cand.sort_by(|a, b| Self::by_return(a, b));
         let mut n = 0;
         for m in cand {
             if self.resident.contains_key(&m.start) || self.q6.contains_key(&m.start) {
@@ -124,5 +145,53 @@ impl DenseStore {
             .filter(|m| matches!(m.ty, lb_gguf::GgmlType::Q4_0 | lb_gguf::GgmlType::Q6K))
             .map(|m| Self::device_bytes(m))
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lb_gguf::GgmlType;
+
+    fn mat(ty: GgmlType, len: usize, start: usize) -> MatRef {
+        MatRef { ty, rows: 1, cols: 32, start, len }
+    }
+
+    /// A budget that cannot take everything must not spend a third of itself on the Q6_K
+    /// head: it saves 0.16 ms per device MB against a dense Q4_0 matrix's 0.70, so every
+    /// Q4_0 matrix comes first however much larger the head is. Ordering by size alone put
+    /// the head first and silently dropped 69 of the 106 Q4_0 matrices at a 600 MB budget.
+    #[test]
+    fn the_head_is_taken_after_the_q4_0_matrices_however_large_it_is() {
+        let head = mat(GgmlType::Q6K, 215_000_000, 0);
+        let big = mat(GgmlType::Q4_0, 13_570_000, 1);
+        let small = mat(GgmlType::Q4_0, 2_360_000, 2);
+        let mut v = vec![&head, &small, &big];
+        v.sort_by(|a, b| DenseStore::by_return(a, b));
+        assert_eq!(v.iter().map(|m| m.start).collect::<Vec<_>>(), vec![1, 2, 0], "Q4_0 largest-first, then the head");
+    }
+
+    /// A type with no kernel must never be ordered ahead of one that has it, and never be
+    /// counted as a candidate.
+    #[test]
+    fn types_without_a_kernel_sort_last_and_do_not_count() {
+        let q8 = mat(GgmlType::Q8_0, 99_000_000, 0);
+        let q4 = mat(GgmlType::Q4_0, 1_000, 1);
+        let mut v = vec![&q8, &q4];
+        v.sort_by(|a, b| DenseStore::by_return(a, b));
+        assert_eq!(v[0].start, 1, "the Q4_0 matrix is worth more than any byte count of Q8_0");
+        assert_eq!(DenseStore::saving_per_byte(GgmlType::Q8_0), 0.0);
+    }
+
+    /// Q6_K takes 320 device bytes per 256 values against the file's 210, so a budget check
+    /// against the file size would overcommit the card by half the head.
+    #[test]
+    fn q6_k_is_budgeted_at_its_device_size_not_its_file_size() {
+        let head = mat(GgmlType::Q6K, 215_000_000, 0);
+        let head = MatRef { rows: 128_000, cols: 2048, ..head };
+        assert_eq!(DenseStore::device_bytes(&head), 128_000 * 8 * 320);
+        assert!(DenseStore::device_bytes(&head) > head.len, "device copy is larger than the file's");
+        let q4 = mat(GgmlType::Q4_0, 13_570_000, 1);
+        assert_eq!(DenseStore::device_bytes(&q4), q4.len, "Q4_0 repacks to the same size");
     }
 }
