@@ -7,7 +7,7 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{matvec_dims, q4_0_matvec_kernel, QuantMat, THREADS};
+use crate::{cube_count, matvec_dims, q4_0_matvec_kernel, QuantMat, THREADS};
 use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -92,7 +92,7 @@ impl GpuQ4Mat {
         unsafe {
             q4_0_matvec_kernel::launch(
                 &gpu.client,
-                CubeCount::Static(n_out as u32, 1, 1),
+                cube_count(n_out),
                 CubeDim::new_1d(THREADS as u32),
                 BufferArg::from_raw_parts(self.words.clone(), self.n_words),
                 BufferArg::from_raw_parts(x.clone(), m * self.cols),

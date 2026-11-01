@@ -58,6 +58,14 @@ fn lfm2_expert_down_four_tokens() {
     check(2048, 1536, 4, 4);
 }
 
+/// 48 tokens x 1536 rows = 73,728 outputs: more cubes than one dispatch dimension holds
+/// (65,535); the launch must spill into the second dimension. Regression for the
+/// 2026-11-01 failure on a 44-token prompt.
+#[test]
+fn prefill_batch_beyond_one_dispatch_dimension() {
+    check(1536, 2048, 48, 5);
+}
+
 #[test]
 fn real_q4_0_rows_from_gguf_if_present() {
     // A real expert matrix from the QAD-Q4_0 file, when it is on disk.

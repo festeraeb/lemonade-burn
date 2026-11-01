@@ -122,6 +122,14 @@ fn q4_0_matvec_kernel(w: &[u32], x: &[f32], dims: &[u32], out: &mut [f32]) {
 /// Cube size used by every kernel here (the reduction assumes it).
 pub const THREADS: usize = 64;
 
+/// Cube count for `n` outputs: wgpu caps each dispatch dimension at 65535, so the cubes
+/// are laid out in two dimensions and the kernel reads the linear `CUBE_POS`.
+pub fn cube_count(n: usize) -> CubeCount {
+    let x = n.clamp(1, 65535);
+    let y = n.div_ceil(x).max(1);
+    CubeCount::Static(x as u32, y as u32, 1)
+}
+
 /// `dims` for [`q4_0_matvec_kernel`].
 pub fn matvec_dims(rows: usize, cols: usize, row_bytes: usize) -> [u32; 4] {
     [rows as u32, cols as u32, row_bytes as u32, (cols / 32).div_ceil(THREADS) as u32]
@@ -158,7 +166,7 @@ pub fn q4_0_matvec_gpu(w: QuantMat<'_>, x: &[f32], m: usize) -> Result<Vec<f32>,
     unsafe {
         q4_0_matvec_kernel::launch(
             &client,
-            CubeCount::Static(n_out as u32, 1, 1),
+            cube_count(n_out),
             CubeDim::new_1d(THREADS as u32),
             BufferArg::from_raw_parts(w_h, words.len()),
             BufferArg::from_raw_parts(x_h, x.len()),
