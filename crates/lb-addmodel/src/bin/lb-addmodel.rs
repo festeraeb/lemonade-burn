@@ -21,6 +21,18 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Dequantize one tensor from two GGUFs of the same model and compare: how a new
+    /// dequantizer is verified against a quantization that already works.
+    Compare {
+        #[arg(long)]
+        a: PathBuf,
+        #[arg(long)]
+        b: PathBuf,
+        #[arg(long)]
+        tensor: String,
+        #[arg(long, default_value_t = 8)]
+        rows: usize,
+    },
     Scaffold {
         #[arg(long)]
         gguf: PathBuf,
@@ -77,6 +89,14 @@ fn main() -> Result<()> {
             for n in &p.notes {
                 println!("\nnote: {n}");
             }
+        }
+        Cmd::Compare { a, b, tensor, rows } => {
+            let c = lb_addmodel::compare::compare(&a, &b, &tensor, rows)?;
+            println!("{tensor}: {} vs {}  ({} values)", c.ty_a, c.ty_b, c.n);
+            println!("  max |diff|   {:.6}", c.max_abs);
+            println!("  mean |diff|  {:.6}", c.mean_abs);
+            println!("  rel RMS      {:.4}  (diff RMS / a RMS)", c.rel_rms);
+            println!("  cosine       {:.6}", c.cosine);
         }
         Cmd::Scaffold { gguf, out } => {
             let p = probe(&gguf)?;

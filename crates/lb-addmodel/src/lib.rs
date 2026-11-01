@@ -8,6 +8,7 @@
 
 pub mod probe;
 pub mod scaffold;
+pub mod compare;
 
 // Known gaps, found by running the probe on the qwen35moe family (2026-11-01):
 // * `n_vocab` and `n_ff` report MISSING although `token_embd`/`output` dims state the vocab
