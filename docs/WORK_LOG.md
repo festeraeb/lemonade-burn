@@ -474,3 +474,39 @@ smaller needs a quiet host.
 * *"The rest of the token is attention and the short-conv operator."* No -- that work is
   **8 ms of 141**. A token is ~94% quantized matmuls. The fix this wrong reading pointed at
   happened to be the right one, which is exactly why it went unnoticed.
+
+## The two routed-expert implementations, resolved (2026-11-02)
+
+Both exist and **each has what the other lacks**, so neither should be merged as-is. A `git merge`
+of `9867255` onto `lfm2-cubecl` produces 8 interleaved conflicts across `lib.rs` and `store.rs`
+(the two sides use different buffer conventions in similarly-shaped code) — resolving those by hand
+is how you ship the bug below. Port deliberately instead.
+
+**`GpuExpertStack` (branch `feat/expert-stack-alt`, commit 9867255) has the better design.**
+`StackMat::upload(gpu, w: QuantMat, n_expert)` takes **one** matrix spanning
+`[n_expert * rows, cols]` — the GGUF tensor as it already is on disk — and repacks over the whole
+run. `GpuExpertLayer` on `lfm2-cubecl` instead takes an iterator of per-expert `QuantMat`s and
+concatenates them, which is wasted work: `ExpertMats::expert(i) == start + i * per_expert` means
+the experts are **already contiguous**.
+
+**But `GpuExpertStack` has the `from_raw_parts` element-count bug.** `StackMat` stores
+`n_qs: qs.len()` where `qs: Vec<u32>`, while `q4_0_stack_matvec_kernel` takes `qs: &[V4U]` and
+`x: &[V4F]`. It then calls `BufferArg::from_raw_parts(self.down.qs, self.down.n_qs)` and
+`from_raw_parts(h, n_h)` with **no `/4`** — a 4x too-large element count on both, letting the kernel
+index past the logical end. This is the same class of bug fixed on `lfm2-cubecl` in
+`fix/buffer-arg-element-counts`, where the counts became `self.n_qs / 4` and `n_h / 4` behind
+`debug_assert_eq!(.. % 4, 0)`.
+
+Its single parity test passes anyway, which is the lesson worth keeping: an over-large element count
+usually does **not** fault on wgpu — the binding is byte-sized by the handle, so the kernel simply
+may index beyond where the data logically ends, and whether that is observed depends on launch
+geometry. One happy-path parity test cannot see it. `lfm2-cubecl` has 7 bit-equality tests
+(`expert_layer_matches_per_expert.rs`) covering the last expert in the buffer, a repeated expert, a
+repeated token, interleaved tokens, out-of-range refusals and the even-block invariant — those are
+the ones that would catch it.
+
+**So the resolution is:** keep the stack *design* (one contiguous `QuantMat` per projection, a jobs
+buffer of `(expert, row)`), apply the `/4` element counts and the `debug_assert`s to it, delete the
+concat-based `GpuExpertLayer` and its `q4_0_routed_*` kernels, and re-point the 7 tests at the stack
+API. Then integrate behind `LB_EXPERT_LAYER` so the A/B is same-binary, and gate on the greedy sha
+`062392b8d2b0361a` with the 1.1x c2 bar — t440's 25% drift cannot support the projected 1.34x.
