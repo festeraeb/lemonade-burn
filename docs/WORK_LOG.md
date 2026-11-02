@@ -172,6 +172,54 @@ the 1.1x bar. **Caveat before anyone quotes 1.34x:** the bench uses 4 synthetic 
 tight loop, while a real layer also routes and combines on the host, so treat this as an upper
 bound until F1 is measured end to end with the byte-identical gate.
 
+## F1 state, and two things the next person must know before integrating it
+
+**Built and verified, NOT wired into the model.** `GpuExpertLayer` + two routed kernels
+(`q4_0_routed_gate_up_silu_kernel`, `q4_0_routed_matvec_kernel`) are on `lfm2-cubecl`, with 7
+tests asserting **f32 bit equality** against the per-expert path. `moe.rs` still runs the old
+path, so nothing in the model has changed yet.
+
+### 1. There are now TWO implementations of this idea. Retire one.
+
+A subagent built the same thing this morning — `GpuExpertStack`, commit `9867255` on branch
+`worktree-agent-adfe745a464a8aa36`: "One fused qs/sc pair per matrix (the GGUF
+`[n_expert, rows, cols]` tensor) and a jobs buffer of (expert, activation row); one kernel for
+gate+up+silu, one for down." Same design, different names. **It was in fleet memory and I did
+not look before rebuilding it.**
+
+Differences: mine has a dedicated test file asserting bit equality plus the odd-block invariant
+and out-of-range refusals, and carries the measured justification (0.108 ms a dispatch, so
+~1.34x not ~1.1x). Theirs is unmerged on a worktree branch and put its parity test into
+`gpu_matches_scalar.rs`. **Before integrating, diff the two and keep one** — do not let both
+survive.
+
+### 2. The upload path is doing redundant work, and theirs says why
+
+`ExpertMats::expert(i)` (`lb-lfm2/src/weights.rs:41`) returns a `MatRef` at
+`start + i * per_expert`, so **the experts of a layer are ALREADY contiguous in the GGUF** as
+one `[n_expert, rows, cols]` tensor. `GpuExpertLayer::upload` takes an iterator of per-expert
+`QuantMat`s and concatenates them, which re-does what the file already did: 64 separate repacks
+and a concatenation per projection per layer.
+
+It should instead upload the whole tensor as **one `QuantMat` of `n_expert * rows` rows** — one
+repack, rayon-parallel over the lot, one upload. **The kernels need no change at all**: their
+`e * rows * bpr + r * bpr` is exactly row `e * rows + r` of one tall matrix. That is both simpler
+and much faster to load, and loading currently takes minutes.
+
+### 3. What integration still has to do
+
+* `ExpertStore::load` builds one `GpuExpertLayer` per layer instead of 2432 `GpuExpert`s.
+* `moe_ffn` builds the `[expert, token]` routes buffer and makes one `launch` call.
+* `Placement` residency becomes **per-layer all-or-nothing**, which changes the budget maths and
+  the `MissPolicy` interaction — a partially resident layer has no meaning any more.
+* Put it behind `LB_EXPERT_LAYER` so it can be measured **against its own absence in one
+  binary**. That discipline is what caught the conv block at 0.90x when a microbenchmark had
+  promised 6.71x; the 1.34x here is an upper bound from 4 synthetic experts in a tight loop and
+  has not been through the byte-identical gate.
+* Watch the allocator: this collapses ~14,600 buffers to ~114, which should return part of the
+  1.5 GB gap between 13.66 GB of weights and the 15.2 GB `nvidia-smi` reports. Read
+  `client.memory_usage()` before and after rather than guessing.
+
 ## Ranked fixes against the 1.1x bar (decode 98 ms, so 1.1x needs >= 9 ms)
 
 1. **F1 — one launch per MoE projection per layer.** Concatenate each layer's 64 experts into
