@@ -510,3 +510,60 @@ buffer of `(expert, row)`), apply the `/4` element counts and the `debug_assert`
 concat-based `GpuExpertLayer` and its `q4_0_routed_*` kernels, and re-point the 7 tests at the stack
 API. Then integrate behind `LB_EXPERT_LAYER` so the A/B is same-binary, and gate on the greedy sha
 `062392b8d2b0361a` with the 1.1x c2 bar — t440's 25% drift cannot support the projected 1.34x.
+
+## cubecl-cuda measured on c2 (2026-11-03): copy gate fails, decode 1.47x, parity 22/22
+
+Blocker B1 of `~/agentnotes/fable-vs-gemini-engine-compare-2026-11-02.md`: nobody had measured
+cubecl-cuda h2d on our cards (the "~12 GB/s" above is raw `cudaMemcpy`; the 46x loss was wgpu).
+Commit 603512f adds a `cuda` feature (`LB_CUDA_DEVICE=N`, driver order) beside the wgpu path and
+`examples/copy_bench.rs`. Built on t440 with `CUDARC_CUDA_VERSION=12080` (without it cudarc falls
+back to CUDA 13, which dropped Pascal); run on **cesarops2**, load 0.1-0.5, GPU2 = Tesla P100 at
+bus `0000:0D:00.0`, Gen3 x16, driver 580.178.04. Both runtimes were confirmed on that bus by
+`nvidia-smi --query-compute-apps` sampled mid-run (wgpu `discrete:2` happens to be the same card).
+c2 has no CUDA toolkit: `libnvrtc.so.12.8.93`, `libnvrtc-builtins` and `nvvm/libdevice/libdevice.10.bc`
+from t440's 12.8 are bundled in `~/lb-measure/{lib,cuda-path}` on c2 (`LD_LIBRARY_PATH`, `CUDA_PATH`);
+without libdevice every kernel that calls `exp` (the silu-fused ones) fails to compile for sm_60.
+
+**Copy path, c2 GPU2, medians of 20 reps after a warm-up, MB/s** (raw `bench/raw-h2d-bwtest.cu`
+on the same card: pinned 11,845 at 5.3 MB / 12,030 at 64 MB; pageable 6,901 / 5,939; the x4 P100 GPU0
+is 3,159 pinned):
+
+| path (as the engine would use it) | cuda 5.3 MB | wgpu 5.3 MB | cuda 64 MB | wgpu 64 MB |
+|---|---|---|---|---|
+| `create(Bytes::from_elems(vec))` fresh Vec (= `Gpu::upload_u32`) | 1,090 | 4,002 | 2,948 | 2,145 |
+| `Client::staging` into pooled pinned memory, then `create` | 2,416 | 3,966 | 3,691 | 1,777 |
+| `write` into a handle allocated once, fresh Vec | 3,325 | 3,243 | 2,449 | 1,964 |
+| `write` into a handle allocated once, pinned-staged | 3,229 | 3,239 | 3,705 | 1,852 |
+| `create_from_slice` (double host copy; what lb-gpu-bench measured) | 506 | 504 | 708 | 668 |
+| `GpuExpert::upload` minus repack (3 x 1.77 MB; what an on-demand miss pays) | **4,705** | 3,508 | - | - |
+
+Activation handoff through the host (`read_all` + `upload_f32` + sync): m=1 **51.6 us** cuda vs
+130.9 wgpu; m=4 62.6 vs 144.1; m=32 156 vs 270.
+
+**Gate (>= 6 GB/s at 5.3 MB): FAIL on every CubeCL path, both runtimes.** Best 5.3 MB number is the
+expert upload at 4.7 GB/s on cuda (1.34x wgpu, above the 1.1x bar, real). Readings: (a) the 46x was
+`create_from_slice` + t440's host load, and is ~0.5 GB/s here on both runtimes; (b) the runtime switch
+does not reach the bus - pre-allocated, pinned-staged `write` still sits at ~3.3 GB/s against 11.8 raw,
+so the remaining ~3x is inside CubeCL's per-command write path on both runtimes, and three 1.77 MB
+writes (0.38 ms each) beat one 5.3 MB write (1.6 ms) - size-dependent, not per-call. Where that time
+goes is **unmeasured**; the next probe is a cudarc-level timer around `memcpy_htod_async` inside
+cubecl-cuda's `copy_to_device` (an upstream-side question, not engine code). On-demand misses are
+still a non-starter at these rates for the streaming design; static residency is unaffected.
+
+**Parity under cuda on sm_60: 22/22** (gpu_matches_scalar 8, q6k 4, expert_layer 7, conv_block 3;
+q8_0's 3 are `#[ignore]`), the same set wgpu passes on the same card. Answers B9: the plane-op
+kernels compile and match under the cuda runtime.
+
+**End to end, same binary, same card, `c2_e2e.sh` (32 tokens, temperature 0, 3 reps + warm-up),
+2432 experts + 107 dense matrices resident, hit rate 1.0, 0 CPU calls:**
+
+| runtime | decode tok/s (reps) | decode forward ms | prefill s | greedy sha |
+|---|---|---|---|---|
+| cuda, `LB_CUDA_DEVICE=2` | **16.35** (18.11 / 15.90 / 16.35; warm-up 16.00) | 61.8 (matmul 55.3) | 0.52-0.60 | `062392b8d2b0361a` x4 |
+| wgpu, `discrete:2` | 11.09 (11.09 / 11.49 / 11.10; warm-up 11.72) | 90.4 (matmul 84.0) | 0.64-0.70 | `062392b8d2b0361a` x4 |
+
+**1.47x decode on the cuda runtime with byte-identical output**, above c2's 1.1x bar (rep spreads
+1.14x and 1.04x, non-overlapping). Only 3 reps a run and one run each; a repeat an hour later would
+close it the way the 11-01 bar was closed. The gain is on the resident path (dispatch/sync cost, not
+copies), consistent with "a token is ~145 host syncs" above. Raw outputs: c2
+`~/lb-measure/out/cuda-b1/`, kit in `~/lb-measure/cuda-bin/`, driver `~/lb-measure/cuda_bench.sh`.
