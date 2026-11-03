@@ -7,13 +7,14 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{conv_decode_kernel, cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, q4_0_routed_gate_up_silu_kernel, q4_0_routed_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, THREADS};
+use crate::{conv_decode_kernel, cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, q4_0_repack_kernel, q4_0_routed_gate_up_silu_kernel, q4_0_routed_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, REPACK_CUBE, THREADS};
 use cubecl::bytes::Bytes;
 use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 use lb_ternary_gpu::pick_device;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Most free buffers to keep per size. Decode reuses a handful of sizes, so this only caps
@@ -38,6 +39,20 @@ pub struct Gpu {
     /// `pinned.rs` for the measurement behind it). `None` on wgpu or with `LB_NO_PINNED=1`.
     #[cfg(feature = "cuda")]
     pinned: Option<crate::pinned::PinnedPool>,
+    /// CUDA device index (driver order) when the cuda runtime is open; what the host-side
+    /// driver calls (page-locking) need.
+    #[cfg(feature = "cuda")]
+    cuda_index: Option<usize>,
+    /// Page-locked file mappings (`register_mapping`): a slice inside one is handed to the
+    /// driver as it is, no host copy, and repacked on the device.
+    #[cfg(feature = "cuda")]
+    registered: Mutex<Vec<std::sync::Arc<crate::registered::HostRegistration>>>,
+    /// Repack on the host even when the bytes are registered (`LB_HOST_REPACK=1`, or
+    /// `set_host_repack`): the A/B switch for the device repack.
+    host_repack: AtomicBool,
+    /// Small constant buffers (`dims`, kernel counts) keyed by their words. Every matrix of a
+    /// shape shares one, so a miss uploads no tiny buffers (three per expert before).
+    consts: Mutex<HashMap<Vec<u32>, Handle>>,
 }
 
 /// The device to open. `LB_CUDA_DEVICE=N` opens CUDA device N through the cubecl-cuda runtime,
@@ -92,7 +107,92 @@ impl Gpu {
             in_flight: Mutex::new(Vec::new()),
             #[cfg(feature = "cuda")]
             pinned,
+            #[cfg(feature = "cuda")]
+            cuda_index: match &dev {
+                cubecl::Device::Cuda(d) => Some(d.index),
+                _ => None,
+            },
+            #[cfg(feature = "cuda")]
+            registered: Mutex::new(Vec::new()),
+            host_repack: AtomicBool::new(std::env::var_os("LB_HOST_REPACK").is_some()),
+            consts: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// A device buffer holding exactly `words`, shared by every caller asking for the same
+    /// words (kernel `dims` and counts). Never freed: there are a few dozen distinct ones.
+    pub fn const_u32(&self, words: &[u32]) -> Handle {
+        let mut c = self.consts.lock().expect("consts");
+        if let Some(h) = c.get(words) {
+            return h.clone();
+        }
+        let h = self.upload_u32(words.to_vec());
+        c.insert(words.to_vec(), h.clone());
+        h
+    }
+
+    /// Repack Q4_0 on the host even for registered bytes (A/B switch; see `host_repack`).
+    pub fn set_host_repack(&self, on: bool) {
+        self.host_repack.store(on, Ordering::Relaxed);
+    }
+
+    /// Page-lock a read-only file mapping with the driver (`cuMemHostRegister`, read-only), so
+    /// that every later `upload_q4_0` of a slice inside it DMAs the raw bytes straight out of
+    /// the page cache and repacks on the device: no host copy, no host repack. Returns the
+    /// bytes locked. Measured on c2 GPU2 (P100, driver 580): 48 ms per GB to register, then
+    /// 11.2 GB/s per 1.77 MB slice against 4.6-4.9 GB/s from the unregistered mapping.
+    ///
+    /// # Safety
+    /// `map` must stay mapped and unchanged for as long as this `Gpu` lives: uploads keep a
+    /// raw pointer into it and the driver reads from it asynchronously. A `memmap2::Mmap` the
+    /// caller holds for the model's lifetime satisfies this.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn register_mapping(&self, map: &[u8]) -> Result<usize, String> {
+        let dev = self.cuda_index.ok_or("register_mapping: not a CUDA device")?;
+        // SAFETY: forwarded to the caller's contract.
+        let reg = unsafe { crate::registered::HostRegistration::new(dev, map)? };
+        let n = reg.len();
+        self.registered.lock().expect("registered").push(std::sync::Arc::new(reg));
+        Ok(n)
+    }
+
+    /// Bytes page-locked by `register_mapping` so far (0 without the cuda runtime).
+    pub fn registered_bytes(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        {
+            self.registered.lock().expect("registered").iter().map(|r| r.len()).sum()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            0
+        }
+    }
+
+    /// `bytes` as driver-ready `Bytes` when they lie inside a registered mapping.
+    #[cfg(feature = "cuda")]
+    fn registered_slice(&self, bytes: &[u8]) -> Option<Bytes> {
+        let regs = self.registered.lock().expect("registered");
+        let reg = regs.iter().find(|r| r.contains(bytes))?;
+        Some(crate::registered::RegisteredSlice::bytes(reg.clone(), bytes))
+    }
+
+    /// The registration holding `bytes`, for benches that build the raw `Bytes` themselves.
+    #[cfg(feature = "cuda")]
+    pub fn registration_of(&self, bytes: &[u8]) -> Option<std::sync::Arc<crate::registered::HostRegistration>> {
+        self.registered.lock().expect("registered").iter().find(|r| r.contains(bytes)).cloned()
+    }
+
+    /// Whether `upload_q4_0` of these bytes would take the zero-copy device-repack path.
+    pub fn is_registered(&self, bytes: &[u8]) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.registered.lock().expect("registered").iter().any(|r| r.contains(bytes))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = bytes;
+            false
+        }
     }
 
     /// Outputs one cube produces with the current cube size and reduction.
@@ -176,6 +276,15 @@ impl Gpu {
     /// the only copy is the DMA; otherwise into `Vec`s, as before.
     pub fn upload_q4_0(&self, bytes: &[u8], n_blocks: usize) -> ((Handle, usize), (Handle, usize)) {
         let (n_qs, n_sc) = (n_blocks * 4, n_blocks.div_ceil(2).max(1));
+        // zero-copy: raw bytes from the page-locked mapping, repacked by the device. An even
+        // block count keeps the raw buffer 4-byte aligned (the kernel reads word pairs).
+        #[cfg(feature = "cuda")]
+        if n_blocks > 0 && n_blocks % 2 == 0 && !self.host_repack.load(Ordering::Relaxed) {
+            if let Some(raw) = self.registered_slice(&bytes[..n_blocks * 18]) {
+                let raw = self.client.create(raw);
+                return self.repack_on_device(raw, n_blocks);
+            }
+        }
         #[cfg(feature = "cuda")]
         if let Some(pool) = self.pinned.as_ref() {
             if let (Some(mut qs), Some(mut sc)) = (pool.take(n_qs * 4), pool.take(n_sc * 4)) {
@@ -185,6 +294,44 @@ impl Gpu {
         }
         let (qs, sc) = crate::repack_q4_0(bytes, n_blocks);
         ((self.upload_u32(qs), n_qs), (self.upload_u32(sc), n_sc))
+    }
+
+    /// Repack `n_blocks` (even) raw Q4_0 blocks already on the device (`raw`: their
+    /// `n_blocks * 18` file bytes) into fresh `qs`/`sc` buffers with [`q4_0_repack_kernel`].
+    /// Any runtime. The raw buffer is released when `raw` drops.
+    pub fn repack_on_device(&self, raw: Handle, n_blocks: usize) -> ((Handle, usize), (Handle, usize)) {
+        assert!(n_blocks > 0 && n_blocks % 2 == 0, "device repack needs an even block count, got {n_blocks}");
+        let (n_qs, n_sc) = (n_blocks * 4, n_blocks / 2);
+        let qs = self.client.empty(n_qs * 4);
+        let sc = self.client.empty(n_sc * 4);
+        let n = self.const_u32(&[n_sc as u32]);
+        unsafe {
+            q4_0_repack_kernel::launch(
+                &self.client,
+                cube_count(n_sc, REPACK_CUBE),
+                CubeDim::new_1d(REPACK_CUBE as u32),
+                BufferArg::from_raw_parts(raw, n_blocks * 18 / 4),
+                BufferArg::from_raw_parts(qs.clone(), n_qs),
+                BufferArg::from_raw_parts(sc.clone(), n_sc),
+                BufferArg::from_raw_parts(n, 1),
+            );
+        }
+        ((qs, n_qs), (sc, n_sc))
+    }
+
+    /// Upload the raw file bytes of `n_blocks` (even) Q4_0 blocks through the ordinary path
+    /// and repack on the device: the any-runtime form of the zero-copy path, for tests and
+    /// for sources that are not a registered mapping.
+    pub fn upload_q4_0_raw(&self, bytes: &[u8], n_blocks: usize) -> ((Handle, usize), (Handle, usize)) {
+        let words: Vec<u32> = bytes[..n_blocks * 18].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let raw = self.upload_u32(words);
+        self.repack_on_device(raw, n_blocks)
+    }
+
+    /// Read `n` u32 words of a buffer back (synchronises).
+    pub fn read_u32(&self, h: &Handle, n: usize) -> Result<Vec<u32>, String> {
+        let bytes = self.client.read(vec![h.clone()]).map_err(|e| format!("GPU read failed: {e:?}"))?;
+        Ok(u32::from_bytes(&bytes[0])[..n].to_vec())
     }
 
     /// Wait for everything submitted so far (a timing fence).
@@ -259,7 +406,7 @@ impl GpuQ4Mat {
         let n_blocks = w.rows * (w.cols / 32);
         let ((qs, n_qs), (sc, n_sc)) = gpu.upload_q4_0(w.bytes, n_blocks);
         let dims = matvec_dims(w.rows, w.cols);
-        Ok(Self { rows: w.rows, cols: w.cols, row_bytes: w.row_bytes(), n_qs, n_sc, qs, sc, dims: gpu.upload_u32(dims.to_vec()) })
+        Ok(Self { rows: w.rows, cols: w.cols, row_bytes: w.row_bytes(), n_qs, n_sc, qs, sc, dims: gpu.const_u32(&dims) })
     }
 
     pub fn bytes_on_device(&self) -> usize {
@@ -339,7 +486,7 @@ impl GpuConv {
             out_proj: GpuQ4Mat::upload(gpu, out_proj)?,
             conv: gpu.upload_f32(conv),
             state: gpu.client.create(Bytes::from_elems(vec![0f32; (l - 1) * e])),
-            dims: gpu.upload_u32(vec![e as u32, l as u32]),
+            dims: gpu.const_u32(&[e as u32, l as u32]),
             e,
             l,
         })
@@ -445,7 +592,7 @@ impl GpuQ6KMat {
             n_sd: sd.len(),
             qv: gpu.upload_u32(qv),
             sd: gpu.upload_f32(&sd),
-            dims: gpu.upload_u32(dims.to_vec()),
+            dims: gpu.const_u32(&dims),
         })
     }
 
@@ -614,8 +761,8 @@ impl GpuExpertLayer {
             gate: (gpu.upload_u32(gq), ngq, gpu.upload_u32(gs), ngs),
             up: (gpu.upload_u32(uq), nuq, gpu.upload_u32(us), nus),
             down: (gpu.upload_u32(dq), ndq, gpu.upload_u32(ds), nds),
-            gu_dims: gpu.upload_u32(matvec_dims(n_ff, n_embd).to_vec()),
-            dn_dims: gpu.upload_u32(matvec_dims(n_embd, n_ff).to_vec()),
+            gu_dims: gpu.const_u32(&matvec_dims(n_ff, n_embd)),
+            dn_dims: gpu.const_u32(&matvec_dims(n_embd, n_ff)),
             bytes,
         })
     }

@@ -685,3 +685,101 @@ servers each), the upload of the 2432 residents. Lesson for the harness: two ser
 back to back on one card OOM'd (`out of device memory allocating 2097152 bytes`, both pool
 on and off) because the previous 13 GB context was still tearing down; `c2_e2e.sh` callers
 must wait for the card to read empty first.
+
+## The repack lever: misses now DMA raw bytes from the page cache and repack on the device (2026-11-03, evening)
+
+Raw outputs on c2: `~/lb-measure/out/repack-*` (host repack), `devrepack-b1/` (parity, miss bench,
+nine e2e runs, `devrepack-ab.log`), `register_bench` lines in `docs` below. Scripts:
+`bench/cubecl-probe/c2_devrepack_ab.sh`; benches `examples/repack_bench.rs`, `miss_bench.rs`,
+`register_bench.rs`. Host: cesarops2 GPU2 (P100, Gen3 x16), beside the live llama-server seat on
+the same card (so the on-demand config, 602 residents, as in the pool A/B), load 0.05-9 during
+the back-to-back servers; the e2e deltas below are far above the 1.4-2.7 % this box drifts.
+
+**First, a correction to this morning's split.** The "repack 0.26 ms a matrix" quoted above came
+from `copy_bench`, which timed the *allocating* `repack_q4_0` (a fresh `Vec` per call: page
+faults) and subtracted it. The pool path never paid that. Measured properly (`repack_bench`,
+`repack_q4_0_into` into reused words, 40-rep medians, three runs each, output FNV identical):
+
+| repack of one expert (3 matrices), ms | 16 threads | 8 | 1 |
+|---|---|---|---|
+| old inner loop (byte-wise shifts) | 0.297 / 0.297 / 0.301 | 0.303 / 0.302 / 0.315 | 1.793 / 1.795 / 1.797 |
+| new (SSSE3: one `pshufb` 4x4 byte transpose + nibble packs per block; scalar twin for the unit test) | **0.193 / 0.191 / 0.191** | **0.182 / 0.206 / 0.183** | **1.039 / 1.040 / 1.040** |
+| allocating `repack_q4_0`, either loop | 0.64-0.73 | 0.64-0.73 | 1.27-1.58 |
+
+So the host repack was 0.10 ms a matrix, is now 0.063 (1.57x; 1.73x single-threaded), and the
+scalar bit-trick fallback is *slower* than the old loop (3.48 ms at 8 threads) so it is only the
+non-x86 path. That is a small lever: the miss's real cost was elsewhere.
+
+**Where a miss actually goes (`miss_bench`, 30-rep medians after 40 warm, `LB_PINNED_POOL_MB=768`,
+expert slices carved from the model's largest Q4_0 tensor so the bytes are the file's):**
+
+| per expert, ms | run 1 | run 2 | run 3 (bench fixed, see note) | run 4 |
+|---|---|---|---|---|
+| host path, whole (`GpuExpert::upload` + sync; repack into pool, six `create`s) | 1.310 / 1.353 | 1.343 / 1.359 | 1.441 / 1.409 | 1.366 / 1.366 |
+| host repack alone (three `repack_q4_0_into` into pool slots) | 0.203 | 0.200 | 0.215 | 0.203 |
+| host DMA alone (six `create`s of pre-filled pool buffers + sync) | (timed the fill too) | (same) | 0.588 | 0.605 |
+| **device path, whole (three raw `create`s from the registered mapping + repack kernel + sync)** | **0.635 / 0.629** | **0.642 / 0.666** | **0.653 / 0.666** | **0.657 / 0.643** |
+| device DMA alone (three raw `create`s + sync) | 0.590 | 0.577 | 0.588 | 0.589 |
+
+Reading: on the host path, repack (0.20) plus DMA (0.59) leave ~0.6 ms that is in neither alone
+(the interleaving of repack and `create`, or the pool's take between them); not chased, because
+the device path makes it moot. On the device path the repack kernel plus freeing costs 0.05 ms
+over the DMA, and the DMA of 3 x 1.77 MB raw at 0.59 ms is 9.0 GB/s, the same bus speed the copy
+gate measured this morning. Register of the whole 12.9 GB mapping: 737 ms.
+
+**What was built (`lb-q4-gpu`, cuda feature; nothing changes off it):**
+- `registered.rs`: `cuMemHostRegister(CU_MEMHOSTREGISTER_READ_ONLY)` on the GGUF's `Mmap`
+  (`Gguf::mapping()`), once, at `ExpertStore::open_gpu` (`LB_NO_REGISTER=1` skips it). A slice
+  inside it becomes CubeCL `Bytes` reporting `Pinned` through the public `AllocationController`
+  trait (`memory_mut` refuses: the mapping is read-only), so `write_to_gpu` hands the pointer
+  to the driver as it is. `register_bench` on GPU2: both driver attributes 1, 1 GB in 44.5 ms,
+  whole file 602.7 ms (47.7 ms/GB), unregister 103 ms; 1.77 MB slice copies **11.25 GB/s
+  (0.157 ms)** registered vs 4.6-4.9 GB/s (0.36-0.39 ms) from the same mapping unregistered.
+- `q4_0_repack_kernel` (`lib.rs`): one unit per block pair reads nine raw words and writes
+  eight `qs` words and one `sc` word; the same arithmetic as the host `pack_block`.
+  `Gpu::repack_on_device`, `upload_q4_0_raw` (any runtime, for tests), `read_u32`.
+- `Gpu::upload_q4_0` takes the device path when the bytes lie in a registered mapping and the
+  block count is even (every matrix in this model); `LB_HOST_REPACK=1` / `set_host_repack`
+  is the A/B switch in one process. Residents at load take the same path.
+- `Gpu::const_u32`: kernel `dims`/count buffers shared per value, so a miss uploads no tiny
+  buffers (it uploaded three before).
+- `copy_bench` now times the reused-buffer repack, so its `copy_ms` no longer hides page faults.
+
+**Parity:** `tests/device_repack_matches_host.rs` (device words == host words at 2, 64, 510,
+4096 and 98,304 blocks) passes on GPU2; `gpu_matches_scalar` 8/8 on the same card; the host
+unit test (SIMD, scalar and reference agree on dirty slices across chunk boundaries) passes.
+
+**End to end, same binary, same card, same on-demand config as the pool A/B (`--gpu-budget-mb
+3200 --gpu-dense-mb 600 --miss-policy on-demand`, 602 residents, 9,465 misses and 8,682 hits per
+32-token completion), three interleaved rounds x 2 timed completions:**
+
+| server | decode tok/s (6 completions) | `on_demand_s` per run -> per miss | load | greedy sha |
+|---|---|---|---|---|
+| previous build (`fbdec14`, pool, old repack) | 5.13 / 5.18 / 5.47 / 5.43 / 5.25 / 5.28 | 10.97 / 9.57 / 10.48 s -> 1.01-1.16 ms | 2.4-2.5 s | `062392b8d2b0361a` x9 |
+| this build, `LB_NO_REGISTER=1` (SIMD host repack, pool) | 5.43 / 5.44 / 5.56 / 5.56 / 5.59 / 5.56 | 9.31 / 9.00 / 8.96 s -> 0.95-0.98 ms | 2.3 s | `062392b8d2b0361a` x9 |
+| **this build, mapping registered (device repack)** | **7.40 / 7.43 / 7.54 / 7.53 / 7.57 / 7.48** | **2.66 / 2.65 / 2.65 s -> 0.280 ms** | 2.2 s (+0.74 s register) | `062392b8d2b0361a` x9 |
+
+**Gate, as set before the run: a served miss at no more than half the previous cost per expert,
+output sha unchanged.** PASS: 0.28 ms against 1.01-1.16 (3.6-4.1x) by the engine's own counter;
+the bench's per-expert-synced whole is 0.63-0.67 against 1.31-1.44 (2.1x). Decode in this config
+**1.40x** over the previous build (7.40-7.57 vs 5.13-5.47), sha identical in all 27 completions.
+The SIMD host repack on its own is 0.95-0.98 vs 1.01-1.16 ms a miss and 5.43-5.59 vs 5.13-5.47
+tok/s: real on the counter, but not a decode delta this box can swear to; it stays as the
+fallback (wgpu, `LB_NO_REGISTER`, odd block counts).
+
+**Not done / caveats.** The all-resident 16 tok/s reference was not re-run (needs the card
+free; residents upload once so decode is unaffected in principle; load should drop since the
+2432 uploads now skip the host repack, unmeasured). The page-lock holds the whole GGUF (13.58 GB
+here) in RAM for the model's lifetime: fine on 46-48 GB hosts, a knob (`LB_NO_REGISTER`) on a
+small one; it pins pages the hot mapping would hold anyway. `cuMemHostRegister` is per process
+and per device context: a second `Gpu` on another card would register again (not exercised).
+Load went 2.3 -> 2.2 s plus 0.74 s to register at this 602-resident size, i.e. slightly longer
+end to end at small residency; at full residency the 2432 skipped host repacks should repay it
+(unmeasured). The pool path's unexplained ~0.6 ms stays unexplained.
+
+**Next lever on a miss, measured not guessed:** `create` count. Three raw `create`s cost 0.59 ms
+for 5.3 MB (0.197 each, of which 0.157 is bus time); the host path's six cost about the same
+per call whatever the size (the 196 KB `sc` upload costs what the 1.57 MB `qs` one does). One
+`create` per expert (gate/up/down are separate tensors, so that needs a gather on the host or
+three-handle kernels) or a batched write in CubeCL would take a miss toward the 0.47 ms of
+pure bus time; and layer-ahead prefetch (stage 5) now has a 0.28 ms miss to hide instead of 1.1.

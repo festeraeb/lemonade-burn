@@ -245,6 +245,13 @@ impl Gguf {
         &self.mmap[self.data_start + t.offset..self.data_start + t.offset + nb]
     }
 
+    /// The whole file mapping (page aligned, read only): what a device driver can page-lock
+    /// so that tensor slices DMA straight out of the page cache. Tensor data starts at
+    /// `data_start` within it.
+    pub fn mapping(&self) -> &[u8] {
+        &self.mmap
+    }
+
     /// Raw bytes at `[start, start + len)` of the data section (a sub-range of a tensor).
     pub fn tensor_bytes_at(&self, start: usize, len: usize) -> &[u8] {
         &self.mmap[self.data_start + start..self.data_start + start + len]

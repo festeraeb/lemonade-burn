@@ -210,8 +210,17 @@ fn main() -> Result<(), String> {
         let bytes: Vec<u8> = (0..nb * 18).map(|i| (i % 251) as u8).collect();
         let mat = || QuantMat::new(GgmlType::Q4_0, rows, cols, &bytes);
         let dmat = || QuantMat::new(GgmlType::Q4_0, cols, rows, &bytes);
+        // the repack as the engine pays it: into reused buffers (pool slots or the same
+        // Vecs), not a fresh `Vec` per call, whose page faults were most of the old number
+        // (c2: 0.22-0.24 ms a matrix allocating vs 0.06-0.10 into reused words)
+        let (mut rq, mut rs) = (vec![0u32; nb * 4], vec![0u32; nb.div_ceil(2)]);
         let (repack, _, _) = time(&mut || {
-            std::hint::black_box(lb_q4_gpu::repack_q4_0(&bytes, nb));
+            #[cfg(feature = "cuda")]
+            if let (Some(mut q), Some(mut s)) = (gpu.take_pinned(nb * 4), gpu.take_pinned(nb.div_ceil(2))) {
+                lb_q4_gpu::repack_q4_0_into(&bytes, nb, q.as_mut_u32(), s.as_mut_u32());
+                return Ok(());
+            }
+            lb_q4_gpu::repack_q4_0_into(&bytes, nb, &mut rq, &mut rs);
             Ok(())
         })?;
         eprintln!("section: h2d_expert_upload");

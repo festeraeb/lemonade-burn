@@ -20,6 +20,8 @@ pub mod store;
 pub use store::{pick_cube_device, Gpu, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat};
 #[cfg(feature = "cuda")]
 pub mod pinned;
+#[cfg(feature = "cuda")]
+pub mod registered;
 pub use cubecl::server as cubecl_server;
 
 use cubecl::prelude::*;
@@ -324,7 +326,10 @@ pub fn repack_q6_k(bytes: &[u8], n_super: usize) -> (Vec<u32>, Vec<f32>) {
 pub const THREADS: usize = 64;
 
 /// Blocks per repack work unit. Even, so an `sc` word (two blocks) never straddles two units.
-const REPACK_CHUNK: usize = 1024;
+/// 2048 blocks = 36 KB in, 32 KB out: with the SIMD inner loop below a unit is ~10 us of work,
+/// so a 1536x2048 matrix (98,304 blocks) is 48 units, enough to spread and not so many that
+/// rayon's per-task cost shows (measured on c2, `examples/repack_bench.rs`).
+const REPACK_CHUNK: usize = 2048;
 
 /// Repack GGUF Q4_0 rows into the device layout (`qs` words, packed f16 `sc` words).
 /// `bytes` is the unchanged GGUF data: `n_blocks` blocks of 18 bytes.
@@ -344,39 +349,174 @@ pub fn repack_q4_0(bytes: &[u8], n_blocks: usize) -> (Vec<u32>, Vec<u32>) {
 /// `ceil(n_blocks / 2).max(1)`. **Every word is assigned**, none is accumulated into, so the
 /// slices need no zeroing first and can be page-locked memory the device DMAs from directly
 /// (`Gpu::upload_q4_0`): that is the whole point of the `_into` form (see `pinned.rs`).
+///
+/// The quant words come from [`pack_block`] (one block = one 4x4 byte transpose and two
+/// nibble packs); on x86-64 with SSSE3 that is one `pshufb` and a dozen vector ops per block
+/// ([`repack_quants_ssse3`]), the scalar form is the same arithmetic in `u32`s and is what the
+/// unit test checks both against.
 pub fn repack_q4_0_into(bytes: &[u8], n_blocks: usize, qs: &mut [u32], sc: &mut [u32]) {
     use rayon::prelude::*;
     assert_eq!(qs.len(), n_blocks * 4, "qs words");
     assert_eq!(sc.len(), n_blocks.div_ceil(2).max(1), "sc words");
+    assert!(bytes.len() >= n_blocks * 18, "{} bytes for {n_blocks} Q4_0 blocks", bytes.len());
     if n_blocks == 0 {
         sc[0] = 0;
         return;
     }
-    let scale = |b: usize| u16::from_le_bytes([bytes[b * 18], bytes[b * 18 + 1]]) as u32;
+    #[cfg(target_arch = "x86_64")]
+    let simd = std::is_x86_feature_detected!("ssse3") && std::env::var_os("LB_REPACK_SCALAR").is_none();
+    #[cfg(not(target_arch = "x86_64"))]
+    let simd = false;
     qs.par_chunks_mut(4 * REPACK_CHUNK)
         .zip(sc.par_chunks_mut(REPACK_CHUNK / 2))
         .enumerate()
         .for_each(|(ci, (qs, sc))| {
             let b0 = ci * REPACK_CHUNK;
             let nb = qs.len() / 4;
-            // two f16 scales per word, the odd block in the high half; a missing last block is 0
-            for (j, w) in sc.iter_mut().enumerate() {
-                let lo = if 2 * j < nb { scale(b0 + 2 * j) } else { 0 };
-                let hi = if 2 * j + 1 < nb { scale(b0 + 2 * j + 1) } else { 0 };
-                *w = lo | (hi << 16);
+            let src = &bytes[b0 * 18..(b0 + nb) * 18];
+            repack_scales(src, nb, sc);
+            #[cfg(target_arch = "x86_64")]
+            if simd {
+                // SAFETY: `ssse3` was detected at run time just above.
+                unsafe { repack_quants_ssse3(src, nb, qs) };
+                return;
             }
-            for b in 0..nb {
-                let blk = &bytes[(b0 + b) * 18..(b0 + b) * 18 + 18];
-                // byte i of the block holds value i in its low nibble and value i + 16 in its
-                // high one; both land in word i % 4, at nibbles i / 4 and i / 4 + 4.
-                let mut w = [0u32; 4];
-                for i in 0..16usize {
-                    let byte = blk[2 + i] as u32;
-                    w[i % 4] |= ((byte & 15) << (4 * (i / 4))) | ((byte >> 4) << (4 * (i / 4) + 16));
-                }
-                qs[b * 4..b * 4 + 4].copy_from_slice(&w);
-            }
+            repack_quants_scalar(src, nb, qs);
         });
+}
+
+/// The packed f16 scales of `nb` blocks at `src`: two per word, the odd block in the high
+/// half; a missing last block is 0.
+fn repack_scales(src: &[u8], nb: usize, sc: &mut [u32]) {
+    let scale = |b: usize| u16::from_le_bytes([src[b * 18], src[b * 18 + 1]]) as u32;
+    for (j, w) in sc.iter_mut().enumerate() {
+        let lo = if 2 * j < nb { scale(2 * j) } else { 0 };
+        let hi = if 2 * j + 1 < nb { scale(2 * j + 1) } else { 0 };
+        *w = lo | (hi << 16);
+    }
+}
+
+/// Four nibbles at bits 0, 8, 16, 24 of `x` (the rest zero) -> bits 0, 4, 8, 12.
+#[inline(always)]
+fn nibbles16(x: u32) -> u32 {
+    let x = (x | (x >> 4)) & 0x00ff_00ff;
+    (x | (x >> 8)) & 0x0000_ffff
+}
+
+/// The 16 nibble bytes of one block, as four little-endian words (`a[j]` = bytes 4j..4j+4,
+/// so byte k of `a[j]` is value 4j+k) -> the block's 4 device words. Word k gathers byte k
+/// of every `a[j]` (a 4x4 byte transpose), then packs those bytes' low nibbles into its low
+/// half and their high nibbles into its high half: value 4j+k at nibble j, value 4j+k+16
+/// at nibble j+4, which is the layout the kernels read (module doc).
+#[inline(always)]
+fn pack_block(a: [u32; 4]) -> [u32; 4] {
+    let mut w = [0u32; 4];
+    for (k, w) in w.iter_mut().enumerate() {
+        let col = |j: usize| (a[j] >> (8 * k)) & 0xff;
+        let t = col(0) | (col(1) << 8) | (col(2) << 16) | (col(3) << 24);
+        *w = nibbles16(t & 0x0f0f_0f0f) | (nibbles16((t >> 4) & 0x0f0f_0f0f) << 16);
+    }
+    w
+}
+
+fn repack_quants_scalar(src: &[u8], nb: usize, qs: &mut [u32]) {
+    for (b, out) in qs.chunks_exact_mut(4).enumerate().take(nb) {
+        let q = &src[b * 18 + 2..b * 18 + 18];
+        let a = [
+            u32::from_le_bytes([q[0], q[1], q[2], q[3]]),
+            u32::from_le_bytes([q[4], q[5], q[6], q[7]]),
+            u32::from_le_bytes([q[8], q[9], q[10], q[11]]),
+            u32::from_le_bytes([q[12], q[13], q[14], q[15]]),
+        ];
+        out.copy_from_slice(&pack_block(a));
+    }
+}
+
+/// [`pack_block`] on 128-bit vectors: the 16 nibble bytes are one unaligned load, the 4x4
+/// byte transpose is one `pshufb`, and the two nibble packs run on all four words at once.
+///
+/// # Safety
+/// The caller has checked that SSSE3 is available. `src` holds `nb` whole 18-byte blocks and
+/// `qs` at least `4 * nb` words (the slice bounds are asserted; the loads never pass `src`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn repack_quants_ssse3(src: &[u8], nb: usize, qs: &mut [u32]) {
+    use std::arch::x86_64::*;
+    assert!(src.len() >= nb * 18 && qs.len() >= nb * 4);
+    // lane k <- bytes k, 4+k, 8+k, 12+k (byte k of each a[j], low to high)
+    let shuf = _mm_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    let m_nib = _mm_set1_epi32(0x0f0f_0f0f);
+    let m_pair = _mm_set1_epi32(0x00ff_00ff);
+    let m_half = _mm_set1_epi32(0x0000_ffff);
+    for b in 0..nb {
+        // SAFETY: bytes b*18+2 .. b*18+18 are inside `src` (asserted above); qs[4b..4b+4] inside `qs`.
+        unsafe {
+            let v = _mm_loadu_si128(src.as_ptr().add(b * 18 + 2) as *const __m128i);
+            let t = _mm_shuffle_epi8(v, shuf);
+            let lo = _mm_and_si128(t, m_nib);
+            let hi = _mm_and_si128(_mm_srli_epi32(t, 4), m_nib);
+            let lo = _mm_and_si128(_mm_or_si128(lo, _mm_srli_epi32(lo, 4)), m_pair);
+            let lo = _mm_and_si128(_mm_or_si128(lo, _mm_srli_epi32(lo, 8)), m_half);
+            let hi = _mm_and_si128(_mm_or_si128(hi, _mm_srli_epi32(hi, 4)), m_pair);
+            let hi = _mm_and_si128(_mm_or_si128(hi, _mm_srli_epi32(hi, 8)), m_half);
+            let w = _mm_or_si128(lo, _mm_slli_epi32(hi, 16));
+            _mm_storeu_si128(qs.as_mut_ptr().add(b * 4) as *mut __m128i, w);
+        }
+    }
+}
+
+/// [`pack_block`] on the device: `a0..a3` are the 16 nibble bytes of one block as
+/// little-endian words, the result is the block's device word `k`.
+#[cube]
+fn pack_word(a0: u32, a1: u32, a2: u32, a3: u32, k: u32) -> u32 {
+    let s = 8u32 * k;
+    let t = ((a0 >> s) & 0xffu32) | (((a1 >> s) & 0xffu32) << 8u32) | (((a2 >> s) & 0xffu32) << 16u32) | (((a3 >> s) & 0xffu32) << 24u32);
+    let lo = t & 0x0f0f_0f0fu32;
+    let lo = (lo | (lo >> 4u32)) & 0x00ff_00ffu32;
+    let lo = (lo | (lo >> 8u32)) & 0x0000_ffffu32;
+    let hi = (t >> 4u32) & 0x0f0f_0f0fu32;
+    let hi = (hi | (hi >> 4u32)) & 0x00ff_00ffu32;
+    let hi = (hi | (hi >> 8u32)) & 0x0000_ffffu32;
+    lo | (hi << 16u32)
+}
+
+/// Units per cube for [`q4_0_repack_kernel`].
+pub const REPACK_CUBE: usize = 256;
+
+/// Repack raw GGUF Q4_0 blocks that are already on the device. `raw` is the file's bytes
+/// as u32 words: two 18-byte blocks are exactly 9 words, so an even block count is 4-byte
+/// aligned and one unit handles one pair. Block `2p` has its f16 scale in the low half of
+/// word `9p` and its nibble bytes straddling words `9p..9p+5` by a half word; block `2p+1`
+/// has its scale in the high half of word `9p+4` and its nibble bytes exactly in words
+/// `9p+5..9p+9`. `n[0]` is the pair count. Output is what [`repack_q4_0_into`] writes.
+///
+/// This is how a miss is served with no host work at all: the file mapping is page-locked
+/// once (`Gpu::register_mapping`), the driver DMAs the expert's raw bytes straight out of
+/// the page cache, and the device does the repack (measured 2026-11-03 on c2, `docs/WORK_LOG.md`).
+#[cube(launch)]
+fn q4_0_repack_kernel(raw: &[u32], qs: &mut [u32], sc: &mut [u32], n: &[u32]) {
+    let p = CUBE_POS * CUBE_DIM_X as usize + UNIT_POS_X as usize;
+    if p < n[0] as usize {
+        let w0 = raw[9 * p];
+        let w1 = raw[9 * p + 1];
+        let w2 = raw[9 * p + 2];
+        let w3 = raw[9 * p + 3];
+        let w4 = raw[9 * p + 4];
+        let w5 = raw[9 * p + 5];
+        let w6 = raw[9 * p + 6];
+        let w7 = raw[9 * p + 7];
+        let w8 = raw[9 * p + 8];
+        let a0 = (w0 >> 16u32) | (w1 << 16u32);
+        let a1 = (w1 >> 16u32) | (w2 << 16u32);
+        let a2 = (w2 >> 16u32) | (w3 << 16u32);
+        let a3 = (w3 >> 16u32) | (w4 << 16u32);
+        sc[p] = (w0 & 0xffffu32) | (w4 & 0xffff_0000u32);
+        #[unroll]
+        for k in 0..4u32 {
+            qs[8 * p + k as usize] = pack_word(a0, a1, a2, a3, k);
+            qs[8 * p + 4 + k as usize] = pack_word(w5, w6, w7, w8, k);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +563,17 @@ mod repack_tests {
             repack_q4_0_into(&bytes, n, &mut dq, &mut ds);
             assert_eq!(dq, rq, "qs into dirty slice differ at n_blocks={n}");
             assert_eq!(ds, rs, "sc into dirty slice differ at n_blocks={n}");
+            // the scalar inner loop, whatever the host supports (the SIMD one is what
+            // `repack_q4_0` took above on an SSSE3 host)
+            let mut sq = vec![0xFFFF_FFFFu32; n * 4];
+            repack_quants_scalar(&bytes, n, &mut sq);
+            assert_eq!(sq, rq, "scalar qs differ at n_blocks={n}");
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("ssse3") {
+                let mut vq = vec![0xFFFF_FFFFu32; n * 4];
+                unsafe { repack_quants_ssse3(&bytes, n, &mut vq) };
+                assert_eq!(vq, rq, "ssse3 qs differ at n_blocks={n}");
+            }
         }
     }
 }

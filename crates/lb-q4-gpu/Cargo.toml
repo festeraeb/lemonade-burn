@@ -24,3 +24,7 @@ cubecl.workspace = true
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "fallback-dynamic-loading", "cuda-version-from-build-system", "fallback-latest"] }
 half = "2"
 rayon.workspace = true
+
+[[example]]
+name = "register_bench"
+required-features = ["cuda"]

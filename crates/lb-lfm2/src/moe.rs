@@ -284,13 +284,37 @@ impl ExpertStore {
         0
     }
 
+    /// The device for this store, opened (`LB_CUDA_DEVICE` / `LB_WGPU_DEVICE`) and, on the
+    /// cuda runtime, with the model's file mapping page-locked so that expert uploads DMA
+    /// the raw bytes out of the page cache and repack on the device (`lb-q4-gpu`
+    /// `registered.rs`; `LB_NO_REGISTER=1` keeps the host repack). The page-lock holds the
+    /// whole GGUF in RAM for the model's lifetime, which is what the mapping does anyway once
+    /// it is hot.
+    #[cfg(feature = "gpu")]
+    pub fn open_gpu(w: &Weights) -> Result<lb_q4_gpu::Gpu, String> {
+        let gpu = lb_q4_gpu::Gpu::open()?;
+        #[cfg(feature = "cuda")]
+        if std::env::var_os("LB_NO_REGISTER").is_none() {
+            let t = std::time::Instant::now();
+            // SAFETY: the mapping is `w.gguf`'s, an `Arc<Gguf>` the model holds as long as its
+            // store, and so this `Gpu`, exists; nothing writes a read-only mapping.
+            match unsafe { gpu.register_mapping(w.gguf.mapping()) } {
+                Ok(n) => eprintln!("lb-lfm2: page-locked {:.2} GB of the GGUF mapping in {:.0} ms; expert uploads DMA raw bytes and repack on the device", n as f64 / 1e9, t.elapsed().as_secs_f64() * 1e3),
+                Err(e) => eprintln!("lb-lfm2: mapping not page-locked ({e}); uploads repack on the host"),
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = w;
+        Ok(gpu)
+    }
+
     /// Upload every `Home::Gpu` expert of `placement` to the device chosen by
     /// `LB_WGPU_DEVICE`. Returns the number uploaded. Without the `gpu` feature: an error.
     #[cfg(feature = "gpu")]
     pub fn load(&mut self, w: &Weights, placement: &Placement) -> Result<usize, String> {
         use crate::weights::Ffn;
         if self.gpu.is_none() {
-            self.gpu = Some(lb_q4_gpu::Gpu::open()?);
+            self.gpu = Some(Self::open_gpu(w)?);
         }
         let gpu = self.gpu.as_ref().unwrap();
         let mut n = 0;

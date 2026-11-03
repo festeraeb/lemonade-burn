@@ -134,7 +134,7 @@ impl Lfm2 {
     #[cfg(feature = "gpu")]
     pub fn load_dense(&mut self, budget_bytes: usize) -> Result<usize, String> {
         if self.store.gpu.is_none() {
-            self.store.gpu = Some(lb_q4_gpu::Gpu::open()?);
+            self.store.gpu = Some(crate::moe::ExpertStore::open_gpu(&self.w)?);
         }
         let Self { w, store, dense, .. } = self;
         dense.load(store.gpu.as_ref().expect("device just opened"), w, budget_bytes)
