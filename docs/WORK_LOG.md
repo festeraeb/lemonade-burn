@@ -567,3 +567,99 @@ kernels compile and match under the cuda runtime.
 close it the way the 11-01 bar was closed. The gain is on the resident path (dispatch/sync cost, not
 copies), consistent with "a token is ~145 host syncs" above. Raw outputs: c2
 `~/lb-measure/out/cuda-b1/`, kit in `~/lb-measure/cuda-bin/`, driver `~/lb-measure/cuda_bench.sh`.
+
+## Probe: where the copy path loses 3x, and the fix (2026-11-03, later the same day)
+
+The 11-03 table above left the ~3x between CubeCL's `create(Bytes)` and raw `cudaMemcpy`
+unexplained. Answered with a timer probe inside cubecl-server 0.11.2 `write_to_gpu` and
+cubecl-cuda 0.11.2 `copy_to_device` (local patch, `bench/cubecl-probe/`, never upstream),
+run on **cesarops2 GPU2** (Tesla P100 at bus `0D:00.0`, Gen3 x16, driver 580.178.04) beside an
+idle seat on the same card (0 % util at every start, 5 GB free, which is enough for the blobs).
+Host: Xeon E5-2450 v2 (Ivy Bridge, 2.5 GHz), load 0.1-0.8. Raw per-call lines: c2
+`~/lb-measure/out/probe-b2/`; medians over the 20 timed reps after one warm-up.
+
+**What the probe measured, 5.31 MB writes, microseconds per call** (`copy_to_device`'s host
+pointer was page-locked in 100 % of calls, so the driver side is not it):
+
+| path | reserve pinned | host memcpy into it | enqueue (`memcpy_htod_async`) | DMA (stream sync right after) | whole `write_to_gpu` |
+|---|---|---|---|---|---|
+| `create(Bytes)` of a fresh Vec, first 21 calls | **2,896** (= one `cuMemAllocHost` of 7.34 MB per call, 2.8-3.1 ms each) | **1,288** | 55 (10) | 516 | 4,248 |
+| `write` into a pre-allocated handle, pool warm | 18 | **840** | 52 (8) | 514 | 910 |
+| `Bytes` already pinned (`client.staging` first) | 0 | 0 | 67 (11) | 514 | **70** |
+| 64 MB fresh Vec | 5 | **17,950** | 125 (28) | 6,418 | 18,236 |
+| 1.57 MB expert matrix (3 per expert) | 2 | 246 | 53 (8) | 136 | 310 |
+
+Reading: CubeCL's driver path reaches the bus (5.3 MB in 0.51 ms = **10.3 GB/s**, 64 MB in
+6.4 ms = 10.5, 1.57 MB in 0.136 ms = 11.6). Everything lost is host-side and in front of the
+DMA: (1) `Staging::of` stages every Native `Bytes` under 100 MB through a pooled pinned slice,
+and that slice is only released by the drop queue two flushes (~2 x 64 MiB of uploads) later,
+so a cold run page-locks a fresh 7.34 MB page per call at 2.9 ms; (2) the host memcpy into the
+slice runs at 4-6 GB/s on this Xeon (0.84-1.29 ms for 5.3 MB, 18 ms for 64 MB), serialised
+before a 0.51 ms DMA. The size dependence in the earlier table (three 1.77 MB writes beating
+one 5.3 MB write) is this memcpy. Neither is the wgpu runtime's problem specifically; wgpu has
+the same shape without pinned memory at all. The probe itself changed the headline numbers by
+< 3 % (probe / probe+sync / no-probe runs in `probe-b2`).
+
+**Fix, engine side, no CubeCL patch** (`crates/lb-q4-gpu/src/pinned.rs`, `cuda` feature): a
+pool of page-locked buffers on the device's primary context (the one cubecl-cuda retains),
+handed out as `&mut [u32]` the repack writes into directly (`repack_q4_0_into` assigns every
+word, so a reused slot needs no zeroing), wrapped as `Bytes` with `AllocationProperty::Pinned`
+through the public `AllocationController` trait, so `write_to_gpu` skips staging and DMAs from
+it; the slot comes back to the pool when CubeCL's drop queue drops the `Bytes` after its fence.
+`Gpu::upload_q4_0` uses it for every Q4_0 matrix (residents at load and on-demand misses);
+`LB_NO_PINNED=1` disables it, `LB_PINNED_POOL_MB` caps it (256 default; past the cap uploads
+silently take the old path, and `copy_bench` prints the pool's size so that cannot hide).
+Off the `cuda` feature nothing changes.
+
+**Re-measured, plain build, c2 GPU2, `LB_BENCH_WARM=40` so the pools are past their warm-up
+(a cold pool pays the page-lock the probe showed; the first 21-rep run without warm-up was
+*slower* with the pool, 4.1 ms, for exactly that reason), 20 timed reps, two pool runs and one
+`LB_NO_PINNED=1` run (`~/lb-measure/out/pinned-b7/`):**
+
+| | pool run A | pool run B | no pool |
+|---|---|---|---|
+| copy by itself: pinned 5.31 MB buffer filled before the clock, `create` + `sync` | **583 us** (465-693) = **9.1 GB/s** | **563 us** (469-647) = **9.4 GB/s** | n/a |
+| same, 64 MB | 6.16 ms = 10.9 GB/s | 6.20 ms = 10.8 GB/s | n/a |
+| fill 5.3 MB into a pool buffer, alone | 0.27 ms (Vec fill 0.41) | 0.27 | - |
+| `h2d_expert_upload` whole (3 repacks + 3 uploads + sync), ms | 1.83 (1.57-1.93) | 1.88 (1.67-2.20) | 2.14 (1.93-2.51) |
+| same, earlier run `pinned-b5` | 1.40 (1.22-1.97) | 1.61 (1.33-1.89) | 2.16 (1.95-2.69) |
+| engine's generic `create(Bytes)` path, untouched, GB/s | 2.8 | 3.3 | 2.9 |
+
+**Gate >= 6 GB/s at 5.3 MB: PASS on the copy itself** (9.1-9.4 GB/s at median, 7.7 GB/s at
+the slowest rep, against the card's 10.3 GB/s DMA). The one-call `h2d_pinned_fill_5mb` number
+(4.4-4.5 GB/s net) is lower only because it fills the *next* buffer inside the clock into a
+cache-cold slot and subtracts the hot 0.27 ms fill; the split (`create` returns in 2.6 us, the
+whole wait is `sync`) is the direct measurement. What an on-demand miss now pays end to end is
+1.4-1.9 ms per expert instead of 2.1-2.2 (the repack, 0.26 ms a matrix, is now the larger
+half), and the per-token arithmetic in `cubecl-copy-path-46x-loss` is on real bandwidth.
+
+**Parity and sha.** `gpu_matches_scalar` under cuda on GPU2 with the pool on: 8/8 (twice).
+`repack_q4_0_into` has a unit test against the previous accumulate-into-zeros form on dirty
+slices, odd/even counts and chunk boundaries. End to end on the same card, same config, pool on
+(x6 completions) vs `LB_NO_PINNED=1` (x3): greedy sha **`062392b8d2b0361a` in all nine**, the
+same as the all-resident reference. The config had to fit beside the live seat on GPU2
+(`--gpu-budget-mb 3200 --gpu-dense-mb 600 --miss-policy on-demand`, 602 residents, every other
+expert uploaded on demand through the pool each token), and there the pool is worth
+**5.48-5.51 tok/s against 3.82-3.85 (1.43x)**; the all-resident 16.3 tok/s configuration was
+not re-run (needs ~13.7 GB on a free card) and is unaffected in principle, since residents only
+upload at load. Scripts: `bench/cubecl-probe/c2_pinned_run.sh`, `c2_pool_sha_ab.sh`.
+
+**Not done / caveats.** 64 MB uploads only reuse a slot because `flush_after` fires per call;
+with the 256 MB default cap a run mixing 5 MB and 64 MB uploads hits the cap and falls back
+(seen in `pinned-b4`: 267 MB allocated, 64 MB section at no-pool speed). The engine never
+uploads 64 MB blobs, so the default stands; raise `LB_PINNED_POOL_MB` for benches. The pool
+holds ~130-360 MB of page-locked host memory in steady state (the drop queue's two batches);
+on a 46 GB host that is fine, on a small box it is a knob. The `h2d_expert_upload` gain varied
+between runs (1.15x and 1.5x); the e2e 1.43x is the number to quote, taken at c2's 2.7 % drift.
+
+**Scraper check (memory `moe-scraper-rule`), same day.** lemonade-burn already carries the
+NautiBurn writer (`lb-lfm2/src/moe.rs` `Scraper`, env `NAUTIBURN_SCRAPE_DIR` / `_MODEL_ID` /
+`_CLASS_ID`, default class `lb-lfm2`); `lb-server` flushes it once per request in
+`after_request`. Verified on c2 with the on-demand config above: two completions wrote
+`run-1793682926-0.json` and `run-1793682933-1.json` (schema 1, model `LFM2.5-24B-A2B-QAD-Q4_0`,
+2,014 activations = 53 positions x 38 MoE layers, top-4 `expert_ids`). Two gaps, named: the
+row's `phase` is always `"prefill"` and `token_ids` holds only the prompt although the
+activations cover prefill *and* decode (one row per request); and no lemonade-burn seat is
+running anywhere on the fleet, so nothing emits today, while the ingest side
+(`nautiburn-moe-consume.service`, `/mnt/fast/sidechannel.sqlite` at 0 bytes) is down
+regardless of the writer.
