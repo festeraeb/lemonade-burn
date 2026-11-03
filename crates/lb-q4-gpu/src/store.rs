@@ -1,6 +1,6 @@
-//! Resident Q4_0 matrices and expert FFNs on one wgpu device.
+//! Resident Q4_0 matrices and expert FFNs on one device (wgpu, or CUDA with the `cuda` feature).
 //!
-//! `Gpu` owns the compute client for the device chosen by `LB_WGPU_DEVICE`. A `GpuQ4Mat`
+//! `Gpu` owns the compute client for the device chosen by `LB_CUDA_DEVICE` or `LB_WGPU_DEVICE`. A `GpuQ4Mat`
 //! is a Q4_0 matrix uploaded once; `GpuExpert` is one SwiGLU expert (gate, up, down)
 //! whose `ffn` runs three matvec launches and one `silu(g) * u` launch with the
 //! intermediates staying on the device. Launches are asynchronous: `GpuExpert::launch`
@@ -36,12 +36,23 @@ pub struct Gpu {
     in_flight: Mutex<Vec<(usize, Handle)>>,
 }
 
+/// The device to open. `LB_CUDA_DEVICE=N` opens CUDA device N through the cubecl-cuda runtime,
+/// counting in the driver's order (nvidia-smi's, not wgpu's `discrete:N` order); it needs the
+/// `cuda` feature and is checked first so a CUDA run cannot silently fall through to wgpu.
+/// Otherwise `LB_WGPU_DEVICE` picks a wgpu adapter (see `lb_ternary_gpu::pick_device`).
+pub fn pick_cube_device() -> Result<cubecl::Device, String> {
+    if let Ok(spec) = std::env::var("LB_CUDA_DEVICE") {
+        let n: usize = spec.trim().parse().map_err(|_| format!("LB_CUDA_DEVICE {spec:?}: index must be a number"))?;
+        return cubecl::Device::cuda(n).map_err(|e| format!("CUDA device {n}: {e} (build lb-q4-gpu with --features cuda; libcuda + libnvrtc on the library path)"));
+    }
+    Ok(cubecl::Device::Wgpu(pick_device()?))
+}
+
 impl Gpu {
-    /// Open the device named by `LB_WGPU_DEVICE` (see `lb_ternary_gpu::pick_device`).
+    /// Open the device named by `LB_CUDA_DEVICE` or `LB_WGPU_DEVICE` (see `pick_cube_device`).
     pub fn open() -> Result<Self, String> {
-        let device = pick_device()?;
-        let dev = cubecl::Device::Wgpu(device);
-        let client = std::panic::catch_unwind(|| dev.client()).map_err(|_| "no wgpu adapter available".to_string())?;
+        let dev = pick_cube_device()?;
+        let client = std::panic::catch_unwind(|| dev.client()).map_err(|_| format!("{dev:?}: no client (adapter missing, or its runtime failed to initialise)"))?;
         let props = client.properties();
         let (pmin, pmax) = (props.hardware.plane_size_min, props.hardware.plane_size_max);
         let has_ops = props.features.plane.contains(cubecl::ir::features::Plane::Ops);

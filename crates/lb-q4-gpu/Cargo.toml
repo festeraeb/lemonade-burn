@@ -4,7 +4,15 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Q4_0 (GGUF) dequant + matvec on the GPU with CubeCL (wgpu: Vulkan/DX12/Metal), checked against lb-gguf's CPU kernels"
+description = "Q4_0 (GGUF) dequant + matvec on the GPU with CubeCL (wgpu: Vulkan/DX12/Metal, or CUDA with the `cuda` feature), checked against lb-gguf's CPU kernels"
+
+[features]
+default = []
+# The cubecl-cuda runtime beside wgpu. `LB_CUDA_DEVICE=N` opens CUDA device N (the driver's
+# order, which is nvidia-smi's); `LB_WGPU_DEVICE` still opens the wgpu path, so one binary can
+# A/B both runtimes on the same card. Needs libcuda + libnvrtc (CUDA 12.8 for Pascal) at run
+# time only; nothing is linked at build time (cudarc dynamic loading).
+cuda = ["cubecl/cuda"]
 
 
 [dependencies]

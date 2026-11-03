@@ -14,6 +14,8 @@ path = "src/main.rs"
 default = []
 # Resident LFM2 experts on the wgpu device named by LB_WGPU_DEVICE.
 gpu = ["lb-lfm2/gpu"]
+# Also build the cubecl-cuda runtime (LB_CUDA_DEVICE=N); see lb-q4-gpu.
+cuda = ["gpu", "lb-lfm2/cuda"]
 
 [dependencies]
 lb-model.workspace = true

@@ -17,7 +17,7 @@
 //! output per cube with a shared-memory tree.
 
 pub mod store;
-pub use store::{Gpu, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat};
+pub use store::{pick_cube_device, Gpu, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat};
 pub use cubecl::server as cubecl_server;
 
 use cubecl::prelude::*;
