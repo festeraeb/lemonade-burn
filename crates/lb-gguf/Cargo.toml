@@ -1,0 +1,12 @@
+[package]
+name = "lb-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "GGUF reader (mmap) with block dequantization and CPU matvec for F32/F16/Q8_0/Q4_0/Q6_K tensors"
+
+[dependencies]
+memmap2.workspace = true
+rayon.workspace = true
+half = "2"

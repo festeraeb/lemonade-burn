@@ -10,9 +10,21 @@ use std::path::Path;
 pub const EOT: u32 = 128009; // <|eot_id|>
 pub const EOS: u32 = 128001; // <|end_of_text|>
 
+/// How chat messages are rendered to text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatStyle {
+    /// BitNet 2B4T: `Role: content<|eot_id|>` ... `Assistant: `.
+    BitNet,
+    /// ChatML (LFM2): `<|im_start|>role\ncontent<|im_end|>\n` ... `<|im_start|>assistant\n`.
+    ChatMl,
+}
+
 pub struct TextCodec {
     pub tok: tokenizers::Tokenizer,
     pub bos: u32,
+    pub style: ChatStyle,
+    /// Token ids that end a generation.
+    pub stops: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -22,9 +34,15 @@ pub struct ChatMessage {
 }
 
 impl TextCodec {
+    /// BitNet codec: `dir/tokenizer.json`, BitNet chat style and stop ids.
     pub fn load(dir: &Path, bos: u32) -> Result<Self> {
-        let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
-        Ok(Self { tok, bos })
+        Self::load_with(&dir.join("tokenizer.json"), bos, ChatStyle::BitNet, vec![EOT, EOS])
+    }
+
+    /// Any HF `tokenizer.json` with an explicit chat style and stop ids.
+    pub fn load_with(tokenizer_json: &Path, bos: u32, style: ChatStyle, stops: Vec<u32>) -> Result<Self> {
+        let tok = tokenizers::Tokenizer::from_file(tokenizer_json).map_err(|e| anyhow!("tokenizer {}: {e}", tokenizer_json.display()))?;
+        Ok(Self { tok, bos, style, stops })
     }
 
     /// Plain-text prompt; BOS is added like `tokenizer(text)` does.
@@ -37,7 +55,15 @@ impl TextCodec {
         Ok(ids)
     }
 
-    pub fn render_chat(messages: &[ChatMessage]) -> String {
+    pub fn render_chat(&self, messages: &[ChatMessage]) -> String {
+        if self.style == ChatStyle::ChatMl {
+            let mut s = String::new();
+            for m in messages {
+                s.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content.trim()));
+            }
+            s.push_str("<|im_start|>assistant\n");
+            return s;
+        }
         let mut s = String::new();
         for m in messages {
             let mut role = m.role.clone();
@@ -53,7 +79,7 @@ impl TextCodec {
     }
 
     pub fn encode_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        let text = Self::render_chat(messages);
+        let text = self.render_chat(messages);
         let enc = self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("encode: {e}"))?;
         let mut ids = vec![self.bos];
         ids.extend_from_slice(enc.get_ids());
@@ -64,8 +90,8 @@ impl TextCodec {
         self.tok.decode(ids, true).map_err(|e| anyhow!("decode: {e}"))
     }
 
-    pub fn is_stop(id: u32) -> bool {
-        id == EOT || id == EOS
+    pub fn is_stop(&self, id: u32) -> bool {
+        self.stops.contains(&id)
     }
 }
 

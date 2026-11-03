@@ -1,0 +1,190 @@
+# lfm2-check raw output, 2026-10-31, t440 CPU path, oracle = llama-server --device none on the same QAD-Q4_0 GGUF
+# run A (13-token prompt, --generate 6), after the conv-tap fix:
+== 'The capital of France is Paris. The capital of Germany is'
+ pos     ours   oracle    truth  ok
+   0       11       11      597  yes
+   1       21       21     5205  yes
+   2      302      302      302  yes
+   3      278      278     3980  yes
+   4      355      355      355  yes
+   5     4741     4741     4741  yes
+   6       22       22       22  yes
+   7      440      440      440  yes
+   8     5205     5205     5205  yes
+   9      302      302      302  yes
+  10    10125     6398     6398  NO
+  11      355      355      355  yes
+  12     6552     6552        -  yes
+generated ids: [6552, 22, 440, 5205, 302, 10125]  (detokenized: ' Berlin. The capital of Italy')
+agreement ours==oracle: 12/13
+
+# run B (4 prompts, 145 positions, --generate 8):
+== "A search and rescue team on Lake Erie found the missing kayaker after three hours. The coordinator said the side-scan sonar image showed"
+ pos     ours   oracle    truth  ok   oracle-piece
+   0       11       11       41  yes  "#"
+   1       21       34     5009  NO   ":"
+   2      374      374      309  yes  " for"
+   3    22016    22016    22016  yes  " rescue"
+   4     6808     6808     2909  yes  " mission"
+   5      355      355      383  yes  " is"
+   6      267      267     8303  yes  " a"
+   7    56654    12659    56654  NO   " Michigan"
+   8      355     1332     1332  NO   " found"
+   9      395      395      278  yes  " that"
+  10     2272     2272     9643  yes  " following"
+  11     4698     4698    78108  yes  " individuals"
+  12      454      454     5101  yes  "ak"
+  13       22       22     1219  yes  "."
+  14      267      267     1703  yes  " a"
+  15     2877     2877     4433  yes  " days"
+  16       22       22       22  yes  "."
+  17      440     3103      440  NO   "  \n"
+  18    78108    78108    47316  yes  " kay"
+  19     1344     1344     1344  yes  " said"
+  20       20       20      278  yes  ","
+  21     5009    78108     2891  NO   " kay"
+  22      302      302     8982  yes  " of"
+  23      279      279      279  yes  "an"
+  24     1652     1652     1652  yes  " son"
+  25      287      287      287  yes  "ar"
+  26     1177     1177     4145  yes  " system"
+  27     5544     5544     5544  yes  " showed"
+  28      278      278        -  yes  " the"
+ours greedy: " the kayak was found at a depth"
+prompt 49 tokens: our forward 68.9s (108.4s in quantized matmuls)
+scrape written: /tmp/claude-1000/-Code-projects/e64c1aae-9bb0-4603-8eaa-37633f1b16fa/scratchpad/our-scrape/run-1793480496-1.json
+
+== "fn main() {\\n    let v: Vec<u32> = (1..=10).collect();\\n    let total: u32 = v.iter().sum();\\n    println!(\"total = {}\", total);\\n}"
+ pos     ours   oracle    truth  ok   oracle-piece
+   0       11       11    20459  yes  "#"
+   1       21       21     1619  yes  "-"
+   2     1296     1296     1296  yes  "()"
+   3      827      827     5455  yes  " {\n"
+   4       86       86       86  yes  "n"
+   5      360      360      360  yes  "   "
+   6     1528     1528     2443  yes  " //"
+   7     5095     5095      346  yes  " mut"
+   8      550      550       34  yes  " ="
+   9    53744    53744    53744  yes  " Vec"
+  10    67491    67491       36  yes  "<i"
+  11       78       78       93  yes  "f"
+  12     2424     2424     2424  yes  "32"
+  13       38       38       38  yes  ">"
+  14      550      550      550  yes  " ="
+  15    23979    23979      342  yes  " vec"
+  16       24       24       25  yes  "0"
+  17      781      781      781  yes  ".."
+  18      654      654       37  yes  "10"
+  19      654      654      654  yes  "10"
+  20      690      690      690  yes  ")."
+  21     9628    36867    36867  NO   "collect"
+  22    89307    89307    89307  yes  "();\\"
+  23       86       86       86  yes  "n"
+  24      360      360      360  yes  "   "
+  25     2443     2443     2443  yes  " let"
+  26      346      346     2925  yes  " v"
+  27       34       34       34  yes  ":"
+  28      331      331      331  yes  " u"
+  29     2424     2424     2424  yes  "32"
+  30      550      550      550  yes  " ="
+  31      346      346      346  yes  " v"
+  32    98170    98170    98170  yes  ".iter"
+  33     4990     4990     4990  yes  "()."
+  34     6144     6144     6144  yes  "sum"
+  35    89307    89307    89307  yes  "();\\"
+  36       86       86       86  yes  "n"
+  37      360      360      360  yes  "   "
+  38     4468     4468     4468  yes  " print"
+  39    13156    13156    13156  yes  "ln"
+  40    95490    95490    95490  yes  "!(\""
+  41    20632    20632    34876  yes  "Total"
+  42       34       34      550  yes  ":"
+  43    97784    97784    97784  yes  " {}\","
+  44     2925     2925     2925  yes  " total"
+  45    66045    66045    66045  yes  ");\\"
+  46       86       86       86  yes  "n"
+  47     1545     1545      101  yes  "}\\"
+  48     7609      229        -  NO   " "
+ours greedy: "')]<|tool_call_end|>"
+prompt 23 tokens: our forward 55.9s (88.0s in quantized matmuls)
+scrape written: /tmp/claude-1000/-Code-projects/e64c1aae-9bb0-4603-8eaa-37633f1b16fa/scratchpad/our-scrape/run-1793480688-2.json
+
+== "<|im_start|>user\\nWhat is the boiling point of water at sea level, in Celsius?<|im_end|>\\n<|im_start|>assistant\\n"
+ pos     ours   oracle    truth  ok   oracle-piece
+   0       11       11   124899  yes  "#"
+   1   124894   124894     5922  yes  "<|startoftext|>"
+   2   124894   124894    13198  yes  "<|startoftext|>"
+   3     9782     9782     2992  yes  " secondary"
+   4     9782     9782      355  yes  " secondary"
+   5      278      278      278  yes  " the"
+   6   124894   124894    35582  yes  "<|startoftext|>"
+   7     1628     1628     1628  yes  " point"
+   8      302      302      302  yes  " of"
+   9    35582    35582     1382  yes  " boiling"
+  10      296      296      462  yes  " in"
+  11      229      229     5046  yes  " "
+  12     1618     1618     1618  yes  " level"
+  13       39       39       20  yes  "?"
+  14      229      229      296  yes  " "
+  15    44530    44530    44530  yes  " Celsius"
+  16      309      309       39  yes  " and"
+  17     3103     3103   124900  yes  "  \n"
+  18   124901   124901    13198  yes  "<think>"
+  19   124901   124901   124899  yes  "<think>"
+  20     1400     1400    63514  yes  "'t"
+  21   124894   124894    13198  yes  "<|startoftext|>"
+  22   124901   124901        -  yes  "<think>"
+ours greedy: "<think>\nWe need to answer: \""
+prompt 44 tokens: our forward 69.1s (139.4s in quantized matmuls)
+scrape written: /tmp/claude-1000/-Code-projects/e64c1aae-9bb0-4603-8eaa-37633f1b16fa/scratchpad/our-scrape/run-1793480850-3.json
+
+== "Great Lakes shipwreck survey notes: the schooner lies in 45 m of water, bow to the north, with the mainmast collapsed across the deck. Visibility was 3 m and the"
+ pos     ours   oracle    truth  ok   oracle-piece
+   0       11       11    30850  yes  "#"
+   1       21       21    30271  yes  "-"
+   2    31545    31545     7721  yes  " Basin"
+   3    42981    42981       95  yes  "building"
+   4    10837    10837    10837  yes  "reck"
+   5       91       91     7652  yes  "s"
+   6      309     7652     8287  NO   " survey"
+   7        8        8       34  yes  "\n\n"
+   8     7652     7652      278  yes  " survey"
+   9    17719    17719     1146  yes  " vessel"
+  10     4306     4306     4306  yes  "oon"
+  11      269      269      269  yes  "er"
+  12      496      496    11971  yes  " \""
+  13      462      462      296  yes  " at"
+  14      229      229      229  yes  " "
+  15      885      397     2136  NO   "20"
+  16     5444     5444      295  yes  " feet"
+  17      302      302      302  yes  " of"
+  18     1382     1382     1382  yes  " water"
+  19      462      462       20  yes  " at"
+  20    11971      229     8562  NO   " "
+  21     4050     4050      310  yes  "head"
+  22      278      278      278  yes  " the"
+  23     5549     5549     5549  yes  " north"
+  24       20       20       20  yes  ","
+  25      293      309      415  NO   " and"
+  26      278      278      278  yes  " the"
+  27    38016    38016     1619  yes  " hull"
+  28    23390    23390       85  yes  " deck"
+  29      528      528      528  yes  "ast"
+  30      309      309    36552  yes  " and"
+  31     8629     8629     3147  yes  " onto"
+  32      278      278      278  yes  " the"
+  33     1225    23390    23390  NO   " deck"
+  34       22       22       22  yes  "."
+  35      440      440     8680  yes  " The"
+  36     1105     1105     3411  yes  "ible"
+  37      355      355      452  yes  " is"
+  38     1683     1683      229  yes  " good"
+  39      654      654       27  yes  "10"
+  40      907      907      295  yes  "–"
+  41       20       20      309  yes  ","
+  42    34591    34591      278  yes  " visibility"
+  43    53588    53588        -  yes  " seab"
+ours greedy: " seabed was mostly sand with some gravel"
+
+agreement ours==oracle: 133/145 (91.7%); ours==truth 59, oracle==truth 60 (of 141 with a next token)
+placement shadow: 0 expert calls would hit GPU residents, 9862 CPU (all executed on CPU in step 1)

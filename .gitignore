@@ -1,2 +1,5 @@
 target/
 *.npy
+
+# Agent worktrees created by Claude Code subagents - scratch, never committed.
+.claude/worktrees/
