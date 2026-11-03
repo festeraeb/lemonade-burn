@@ -663,3 +663,25 @@ activations cover prefill *and* decode (one row per request); and no lemonade-bu
 running anywhere on the fleet, so nothing emits today, while the ingest side
 (`nautiburn-moe-consume.service`, `/mnt/fast/sidechannel.sqlite` at 0 bytes) is down
 regardless of the writer.
+
+**All-resident reference re-run (same day, after the coordinator freed c2 GPU2; strand
+stopped, card at 5 MiB, qwq on GPU0 untouched).** Same binary, `--gpu-budget-mb 14500
+--gpu-dense-mb 900`, 2432 experts + 107 dense resident, 32 tokens, temperature 0, 3 reps +
+warm-up per server, `~/lb-measure/out/ref-full-pool.out`, `ref2-full-nopool.out`,
+`ref2-full-pool-rep2.out`:
+
+| server | decode tok/s (warm-up; reps) | load (incl. 12.9 GB upload) | greedy sha |
+|---|---|---|---|
+| pool on | 16.2; 15.9 / 19.5 / 15.5 | **8.3 s** | `062392b8d2b0361a` x4 |
+| `LB_NO_PINNED=1` | 16.4; 23.1 / 21.5 / 16.5 | 10.8 s | `062392b8d2b0361a` x4 |
+| pool on, again | 18.0; 16.5 / 17.4 / 18.7 | **8.3 s** | `062392b8d2b0361a` x4 |
+
+Sha unchanged in all 12 completions against the reference. Decode spreads (15.5-23.1) overlap
+and all are at or above the 16.3 of commit 603512f: **no decode change all-resident**, as
+expected, since residents upload once at load; the host was not at its usual quiet (load
+0.35-1.4 from these back-to-back servers), so no decode delta under ~1.5x is claimable from
+this run. What the pool does buy here is the **load: 8.3-8.9 s against 10.8-11.5 s** (two
+servers each), the upload of the 2432 residents. Lesson for the harness: two servers started
+back to back on one card OOM'd (`out of device memory allocating 2097152 bytes`, both pool
+on and off) because the previous 13 GB context was still tearing down; `c2_e2e.sh` callers
+must wait for the card to read empty first.
