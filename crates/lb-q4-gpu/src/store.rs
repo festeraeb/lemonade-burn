@@ -34,6 +34,10 @@ pub struct Gpu {
     /// Scratch handed out since the last sync. Reusing one before the GPU has run would
     /// corrupt it, so these only return to `free` after `read_all` has synchronised.
     in_flight: Mutex<Vec<(usize, Handle)>>,
+    /// Page-locked staging buffers the repack writes into directly (cuda runtime only; see
+    /// `pinned.rs` for the measurement behind it). `None` on wgpu or with `LB_NO_PINNED=1`.
+    #[cfg(feature = "cuda")]
+    pinned: Option<crate::pinned::PinnedPool>,
 }
 
 /// The device to open. `LB_CUDA_DEVICE=N` opens CUDA device N through the cubecl-cuda runtime,
@@ -67,6 +71,17 @@ impl Gpu {
             cube_dim = cube_dim.div_ceil(p).max(1) * p;
         }
         let cube_dim = cube_dim.clamp(1, 256).next_power_of_two().min(256);
+        #[cfg(feature = "cuda")]
+        let pinned = match (&dev, std::env::var("LB_NO_PINNED").is_err()) {
+            (cubecl::Device::Cuda(d), true) => match crate::pinned::PinnedPool::open(d.index) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("lb-q4-gpu: pinned staging pool unavailable, uploads stay pageable: {e}");
+                    None
+                }
+            },
+            _ => None,
+        };
         Ok(Self {
             client,
             name: format!("{dev:?}"),
@@ -75,6 +90,8 @@ impl Gpu {
             plane_size: (pmin, pmax),
             free: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(Vec::new()),
+            #[cfg(feature = "cuda")]
+            pinned,
         })
     }
 
@@ -98,6 +115,76 @@ impl Gpu {
     /// without touching the data, so a repacked `Vec<u32>` reaches the device uncopied.
     pub fn upload_u32(&self, v: Vec<u32>) -> Handle {
         self.client.create(Bytes::from_elems(v))
+    }
+
+    /// Whether uploads can be written straight into page-locked memory (`upload_u32_with`,
+    /// `upload_q4_0`); false on wgpu, with `LB_NO_PINNED=1`, or when the pool failed to open.
+    pub fn has_pinned(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.pinned.is_some()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
+    /// Bytes the pinned pool has page-locked so far (0 without one). A pool at its cap hands
+    /// out nothing and uploads silently take the pageable path, so a bench prints this.
+    pub fn pinned_allocated(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        {
+            self.pinned.as_ref().map(|p| p.allocated()).unwrap_or(0)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            0
+        }
+    }
+
+    /// A page-locked buffer for `n` words from the pool (cuda runtime), or `None`: lets a
+    /// caller time the fill and the upload apart (`upload_pinned`). `upload_u32_with` is the
+    /// one-call form.
+    #[cfg(feature = "cuda")]
+    pub fn take_pinned(&self, n: usize) -> Option<crate::pinned::PinnedBuf> {
+        self.pinned.as_ref().and_then(|p| p.take(n * 4))
+    }
+
+    /// Upload a buffer from `take_pinned`: the DMA runs straight from it.
+    #[cfg(feature = "cuda")]
+    pub fn upload_pinned(&self, buf: crate::pinned::PinnedBuf) -> Handle {
+        self.client.create(buf.into_bytes())
+    }
+
+    /// `n` words produced by `fill`, uploaded from page-locked memory when the pool has it
+    /// (no host copy between `fill` and the DMA), else from a fresh `Vec` as `upload_u32`.
+    /// `fill` must assign every word: the buffer it gets may hold a previous upload.
+    pub fn upload_u32_with(&self, n: usize, fill: impl FnOnce(&mut [u32])) -> Handle {
+        #[cfg(feature = "cuda")]
+        if let Some(mut buf) = self.pinned.as_ref().and_then(|p| p.take(n * 4)) {
+            fill(buf.as_mut_u32());
+            return self.client.create(buf.into_bytes());
+        }
+        let mut v = vec![0u32; n];
+        fill(&mut v);
+        self.upload_u32(v)
+    }
+
+    /// Repack `n_blocks` Q4_0 blocks and upload the device layout: `(qs, sc)` handles with
+    /// their word counts. The repack writes into page-locked memory when the pool has it, so
+    /// the only copy is the DMA; otherwise into `Vec`s, as before.
+    pub fn upload_q4_0(&self, bytes: &[u8], n_blocks: usize) -> ((Handle, usize), (Handle, usize)) {
+        let (n_qs, n_sc) = (n_blocks * 4, n_blocks.div_ceil(2).max(1));
+        #[cfg(feature = "cuda")]
+        if let Some(pool) = self.pinned.as_ref() {
+            if let (Some(mut qs), Some(mut sc)) = (pool.take(n_qs * 4), pool.take(n_sc * 4)) {
+                crate::repack_q4_0_into(bytes, n_blocks, qs.as_mut_u32(), sc.as_mut_u32());
+                return ((self.client.create(qs.into_bytes()), n_qs), (self.client.create(sc.into_bytes()), n_sc));
+            }
+        }
+        let (qs, sc) = crate::repack_q4_0(bytes, n_blocks);
+        ((self.upload_u32(qs), n_qs), (self.upload_u32(sc), n_sc))
     }
 
     /// Wait for everything submitted so far (a timing fence).
@@ -170,18 +257,9 @@ impl GpuQ4Mat {
             return Err(format!("Q4_0 needs cols % 32 == 0, got {}", w.cols));
         }
         let n_blocks = w.rows * (w.cols / 32);
-        let (qs, sc) = repack_q4_0(w.bytes, n_blocks);
+        let ((qs, n_qs), (sc, n_sc)) = gpu.upload_q4_0(w.bytes, n_blocks);
         let dims = matvec_dims(w.rows, w.cols);
-        Ok(Self {
-            rows: w.rows,
-            cols: w.cols,
-            row_bytes: w.row_bytes(),
-            n_qs: qs.len(),
-            n_sc: sc.len(),
-            qs: gpu.upload_u32(qs),
-            sc: gpu.upload_u32(sc),
-            dims: gpu.upload_u32(dims.to_vec()),
-        })
+        Ok(Self { rows: w.rows, cols: w.cols, row_bytes: w.row_bytes(), n_qs, n_sc, qs, sc, dims: gpu.upload_u32(dims.to_vec()) })
     }
 
     pub fn bytes_on_device(&self) -> usize {

@@ -3916,6 +3916,7 @@ name = "lb-q4-gpu"
 version = "0.1.0"
 dependencies = [
  "cubecl",
+ "cudarc",
  "half",
  "lb-gguf",
  "lb-ternary-gpu",

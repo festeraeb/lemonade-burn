@@ -15,6 +15,13 @@
 //!   h2d_write_prealloc_{5mb,64mb}        `client.write` into a handle allocated once (no device
 //!                                        allocation per call), fresh Vec
 //!   h2d_write_prealloc_pinned_{5mb,64mb} the same through the pinned staging pool
+//!   h2d_pinned_fill_{5mb,64mb}   `Gpu::upload_u32_with`: the words are written straight into a
+//!                                page-locked pool buffer and DMA'd from there (cuda runtime with
+//!                                the pool; falls back to a Vec elsewhere or with LB_NO_PINNED=1)
+//!   host_fill_pinned_{5mb,64mb}_ms  the same fill written into a pool buffer (cache-cold after
+//!                                a DMA), timed alone, so the pinned path's host cost is its own
+//!   h2d_pinned_upload_{5mb,64mb} only `create` of an already filled pool buffer + sync: the
+//!                                copy path by itself, which is what the >= 6 GB/s gate is about
 //!   h2d_from_slice_{5mb,64mb}    `client.create_from_slice` + sync: the older path (two host
 //!                                copies before the backend), kept for comparison with lb-gpu-bench
 //!   h2d_expert_upload_mb_s       `GpuExpert::upload` (repack + 3 uploads) minus the measured
@@ -35,15 +42,23 @@ fn stats(mut v: Vec<f64>) -> (f64, f64, f64) {
 
 fn main() -> Result<(), String> {
     let reps: usize = std::env::var("LB_BENCH_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    // untimed calls before the timed ones (default 1). Pools (CubeCL's pinned staging, the
+    // engine's `pinned.rs`) only reuse a slot after the drop queue has released it, which lags
+    // ~2 x 64 MiB of uploads behind; LB_BENCH_WARM=40 measures that steady state instead of
+    // the page-lock-per-call warm-up the default shows.
+    let warm: usize = std::env::var("LB_BENCH_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let host = std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim().to_string();
     let gpu = Gpu::open()?;
     let runtime = if std::env::var("LB_CUDA_DEVICE").is_ok() { "cuda" } else { "wgpu" };
-    eprintln!("device: {} runtime={runtime} host={host} reps={reps} plane={:?} use_plane={}", gpu.name, gpu.plane_size, gpu.use_plane);
-    let header = format!("\"host\":\"{host}\",\"runtime\":\"{runtime}\",\"device\":\"{}\"", gpu.name.replace('"', "'"));
+    eprintln!("device: {} runtime={runtime} host={host} reps={reps} warm={warm} plane={:?} use_plane={} pinned_pool={}", gpu.name, gpu.plane_size, gpu.use_plane, gpu.has_pinned());
+    let header = format!("\"host\":\"{host}\",\"runtime\":\"{runtime}\",\"device\":\"{}\",\"pinned_pool\":{},\"warm\":{warm}", gpu.name.replace('"', "'"), gpu.has_pinned());
 
     // timing helper: one warm-up (allocator, shader compile), then `reps` timed calls
     let time = |f: &mut dyn FnMut() -> Result<(), String>| -> Result<(f64, f64, f64), String> {
-        f()?;
+        for _ in 0..warm.max(1) {
+            f()?;
+        }
+        eprintln!("section-timed-start");
         let mut ts = Vec::with_capacity(reps);
         for _ in 0..reps {
             let t = Instant::now();
@@ -62,6 +77,7 @@ fn main() -> Result<(), String> {
 
     for (label, n) in sizes {
         // the engine's path: an owned Vec<u32> handed to the backend without another host copy
+        eprintln!("section: h2d_create_bytes_{label}");
         let (ms, lo, hi) = time(&mut || {
             let v: Vec<u32> = (0..n / 4).map(|i| i as u32).collect();
             let h = gpu.client.create(Bytes::from_elems(v));
@@ -81,6 +97,7 @@ fn main() -> Result<(), String> {
         // the same owned Vec, first moved into the runtime's pinned staging pool
         // (`Client::staging`: a host memcpy into pooled pinned memory, after which the
         // backend's `memcpy_htod_async` is a real DMA instead of the driver's own staging)
+        eprintln!("section: h2d_staged_pinned_{label}");
         let (ms, lo, hi) = time(&mut || {
             let v: Vec<u32> = (0..n / 4).map(|i| i as u32).collect();
             let mut b = Bytes::from_elems(v);
@@ -96,6 +113,7 @@ fn main() -> Result<(), String> {
         // `write` into a handle allocated once: the copy without a device allocation per call,
         // from a fresh Vec and from the pinned staging pool. Separates allocator cost from DMA.
         let dst = gpu.client.empty(n);
+        eprintln!("section: h2d_write_prealloc_{label}");
         let (ms, lo, hi) = time(&mut || {
             let v: Vec<u32> = (0..n / 4).map(|i| i as u32).collect();
             gpu.client.write(&dst, Bytes::from_elems(v));
@@ -103,6 +121,7 @@ fn main() -> Result<(), String> {
         })?;
         let net = (ms - fill_ms).max(1e-6);
         println!("{{{header},\"metric\":\"h2d_write_prealloc_{label}_mb_s\",\"value\":{:.0},\"ms\":{ms:.3},\"min_ms\":{lo:.3},\"max_ms\":{hi:.3},\"host_fill_ms\":{fill_ms:.3},\"net_ms\":{net:.3},\"bytes\":{n}}}", mb_s(n, net));
+        eprintln!("section: h2d_write_prealloc_pinned_{label}");
         let (ms, lo, hi) = time(&mut || {
             let v: Vec<u32> = (0..n / 4).map(|i| i as u32).collect();
             let mut b = Bytes::from_elems(v);
@@ -114,7 +133,69 @@ fn main() -> Result<(), String> {
         println!("{{{header},\"metric\":\"h2d_write_prealloc_pinned_{label}_mb_s\",\"value\":{:.0},\"ms\":{ms:.3},\"min_ms\":{lo:.3},\"max_ms\":{hi:.3},\"host_fill_ms\":{fill_ms:.3},\"net_ms\":{net:.3},\"bytes\":{n}}}", mb_s(n, net));
         drop(dst);
 
+        // the words written straight into page-locked memory, then DMA'd (the fix the probe
+        // pointed at); same fill as above so `fill_ms` subtracts the same way
+        eprintln!("section: h2d_pinned_fill_{label}");
+        let (ms, lo, hi) = time(&mut || {
+            let h = gpu.upload_u32_with(n / 4, |s| s.iter_mut().enumerate().for_each(|(i, x)| *x = i as u32));
+            gpu.sync()?;
+            drop(h);
+            Ok(())
+        })?;
+        let net = (ms - fill_ms).max(1e-6);
+        println!("{{{header},\"metric\":\"h2d_pinned_fill_{label}_mb_s\",\"value\":{:.0},\"gross_mb_s\":{:.0},\"ms\":{ms:.3},\"min_ms\":{lo:.3},\"max_ms\":{hi:.3},\"host_fill_ms\":{fill_ms:.3},\"net_ms\":{net:.3},\"bytes\":{n}}}", mb_s(n, net), mb_s(n, ms));
+
+        // the pinned path split in two: the fill alone (buffer taken, written, returned), then
+        // the upload alone (buffer filled before the clock starts)
+        #[cfg(feature = "cuda")]
+        if gpu.has_pinned() {
+            eprintln!("section: host_fill_pinned_{label}");
+            let (pf_ms, pf_lo, pf_hi) = time(&mut || {
+                let mut b = gpu.take_pinned(n / 4).ok_or("pinned pool at its cap")?;
+                b.as_mut_u32().iter_mut().enumerate().for_each(|(i, x)| *x = i as u32);
+                drop(b);
+                Ok(())
+            })?;
+            println!("{{{header},\"metric\":\"host_fill_pinned_{label}_ms\",\"value\":{pf_ms:.3},\"min_ms\":{pf_lo:.3},\"max_ms\":{pf_hi:.3},\"vec_fill_ms\":{fill_ms:.3},\"bytes\":{n}}}");
+            eprintln!("section: h2d_pinned_upload_{label}");
+            let mut staged: Option<lb_q4_gpu::pinned::PinnedBuf> = None;
+            // client-side split of each call: `create` returning, `sync` returning, handle drop
+            let mut split: Vec<(f64, f64, f64)> = Vec::new();
+            let (ms, lo, hi) = time(&mut || {
+                let b = match staged.take() {
+                    Some(b) => b,
+                    None => {
+                        let mut b = gpu.take_pinned(n / 4).ok_or("pinned pool at its cap")?;
+                        b.as_mut_u32().iter_mut().enumerate().for_each(|(i, x)| *x = i as u32);
+                        b
+                    }
+                };
+                let t0 = Instant::now();
+                let h = gpu.upload_pinned(b);
+                let t1 = Instant::now();
+                gpu.sync()?;
+                let t2 = Instant::now();
+                drop(h);
+                let t3 = Instant::now();
+                split.push(((t1 - t0).as_secs_f64() * 1e6, (t2 - t1).as_secs_f64() * 1e6, (t3 - t2).as_secs_f64() * 1e6));
+                // fill the next rep's buffer now, outside the next timed call
+                let mut nb = gpu.take_pinned(n / 4).ok_or("pinned pool at its cap")?;
+                nb.as_mut_u32().iter_mut().enumerate().for_each(|(i, x)| *x = i as u32);
+                staged = Some(nb);
+                Ok(())
+            })?;
+            // the clock covers the next buffer's fill too; take it out with the fill just measured
+            let net = (ms - pf_ms).max(1e-6);
+            let tail = split.split_off(split.len().saturating_sub(reps));
+            let (c_us, _, _) = stats(tail.iter().map(|t| t.0).collect());
+            let (s_us, s_lo, s_hi) = stats(tail.iter().map(|t| t.1).collect());
+            let (d_us, _, _) = stats(tail.iter().map(|t| t.2).collect());
+            println!("{{{header},\"metric\":\"h2d_pinned_upload_{label}_split_us\",\"create_us\":{c_us:.1},\"sync_us\":{s_us:.1},\"sync_min_us\":{s_lo:.1},\"sync_max_us\":{s_hi:.1},\"drop_us\":{d_us:.1},\"bytes\":{n}}}");
+            println!("{{{header},\"metric\":\"h2d_pinned_upload_{label}_mb_s\",\"value\":{:.0},\"ms_incl_next_fill\":{ms:.3},\"min_ms\":{lo:.3},\"max_ms\":{hi:.3},\"pinned_fill_ms\":{pf_ms:.3},\"net_ms\":{net:.3},\"bytes\":{n}}}", mb_s(n, net));
+        }
+
         let blob: Vec<u8> = (0..n).map(|i| i as u8).collect();
+        eprintln!("section: h2d_from_slice_{label}");
         let (ms, lo, hi) = time(&mut || {
             let h = gpu.client.create_from_slice(&blob);
             gpu.sync()?;
@@ -133,6 +214,7 @@ fn main() -> Result<(), String> {
             std::hint::black_box(lb_q4_gpu::repack_q4_0(&bytes, nb));
             Ok(())
         })?;
+        eprintln!("section: h2d_expert_upload");
         let (whole, lo, hi) = time(&mut || {
             let ex = GpuExpert::upload(&gpu, mat(), mat(), dmat())?;
             gpu.sync()?;
@@ -148,6 +230,7 @@ fn main() -> Result<(), String> {
     for m in [1usize, 4, 32] {
         let x: Vec<f32> = (0..m * n_embd).map(|i| (i % 97) as f32 * 0.01).collect();
         let xh = gpu.upload_f32(&x);
+        eprintln!("section: d2h_h2d_act_m{m}");
         let (ms, lo, hi) = time(&mut || {
             let v = gpu.read_all(vec![(xh.clone(), m * n_embd)])?;
             let h2 = gpu.upload_f32(&v[0]);
@@ -157,5 +240,6 @@ fn main() -> Result<(), String> {
         })?;
         println!("{{{header},\"metric\":\"d2h_h2d_act_m{m}_us\",\"value\":{:.1},\"min_us\":{:.1},\"max_us\":{:.1},\"bytes_each_way\":{}}}", ms * 1e3, lo * 1e3, hi * 1e3, m * n_embd * 4);
     }
+    println!("{{{header},\"metric\":\"pinned_pool_allocated_mb\",\"value\":{:.1}}}", gpu.pinned_allocated() as f64 / 1e6);
     Ok(())
 }

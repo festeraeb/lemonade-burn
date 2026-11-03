@@ -12,12 +12,15 @@ default = []
 # order, which is nvidia-smi's); `LB_WGPU_DEVICE` still opens the wgpu path, so one binary can
 # A/B both runtimes on the same card. Needs libcuda + libnvrtc (CUDA 12.8 for Pascal) at run
 # time only; nothing is linked at build time (cudarc dynamic loading).
-cuda = ["cubecl/cuda"]
+cuda = ["cubecl/cuda", "dep:cudarc"]
 
 
 [dependencies]
 lb-gguf.workspace = true
 lb-ternary-gpu = { path = "../lb-ternary-gpu" }
 cubecl.workspace = true
+# Only for the page-locked staging pool (`pinned.rs`), the same crate and feature set cubecl-cuda
+# itself uses; nothing is linked at build time.
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "fallback-dynamic-loading", "cuda-version-from-build-system", "fallback-latest"] }
 half = "2"
 rayon.workspace = true

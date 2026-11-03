@@ -18,6 +18,8 @@
 
 pub mod store;
 pub use store::{pick_cube_device, Gpu, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat};
+#[cfg(feature = "cuda")]
+pub mod pinned;
 pub use cubecl::server as cubecl_server;
 
 use cubecl::prelude::*;
@@ -332,27 +334,97 @@ const REPACK_CHUNK: usize = 1024;
 /// was 49 s of a 147 s load), and an on-demand upload of a non-resident expert has to pay
 /// it before the copy, where it was over half the cost of serving the miss.
 pub fn repack_q4_0(bytes: &[u8], n_blocks: usize) -> (Vec<u32>, Vec<u32>) {
-    use rayon::prelude::*;
     let mut qs = vec![0u32; n_blocks * 4];
     let mut sc = vec![0u32; n_blocks.div_ceil(2).max(1)];
+    repack_q4_0_into(bytes, n_blocks, &mut qs, &mut sc);
+    (qs, sc)
+}
+
+/// `repack_q4_0` into caller-owned words: `qs` is `n_blocks * 4` long, `sc` is
+/// `ceil(n_blocks / 2).max(1)`. **Every word is assigned**, none is accumulated into, so the
+/// slices need no zeroing first and can be page-locked memory the device DMAs from directly
+/// (`Gpu::upload_q4_0`): that is the whole point of the `_into` form (see `pinned.rs`).
+pub fn repack_q4_0_into(bytes: &[u8], n_blocks: usize, qs: &mut [u32], sc: &mut [u32]) {
+    use rayon::prelude::*;
+    assert_eq!(qs.len(), n_blocks * 4, "qs words");
+    assert_eq!(sc.len(), n_blocks.div_ceil(2).max(1), "sc words");
+    if n_blocks == 0 {
+        sc[0] = 0;
+        return;
+    }
+    let scale = |b: usize| u16::from_le_bytes([bytes[b * 18], bytes[b * 18 + 1]]) as u32;
     qs.par_chunks_mut(4 * REPACK_CHUNK)
         .zip(sc.par_chunks_mut(REPACK_CHUNK / 2))
         .enumerate()
         .for_each(|(ci, (qs, sc))| {
             let b0 = ci * REPACK_CHUNK;
-            for b in 0..(qs.len() / 4) {
+            let nb = qs.len() / 4;
+            // two f16 scales per word, the odd block in the high half; a missing last block is 0
+            for (j, w) in sc.iter_mut().enumerate() {
+                let lo = if 2 * j < nb { scale(b0 + 2 * j) } else { 0 };
+                let hi = if 2 * j + 1 < nb { scale(b0 + 2 * j + 1) } else { 0 };
+                *w = lo | (hi << 16);
+            }
+            for b in 0..nb {
                 let blk = &bytes[(b0 + b) * 18..(b0 + b) * 18 + 18];
-                sc[b / 2] |= (u16::from_le_bytes([blk[0], blk[1]]) as u32) << (16 * (b % 2));
                 // byte i of the block holds value i in its low nibble and value i + 16 in its
                 // high one; both land in word i % 4, at nibbles i / 4 and i / 4 + 4.
-                let w = &mut qs[b * 4..b * 4 + 4];
+                let mut w = [0u32; 4];
                 for i in 0..16usize {
                     let byte = blk[2 + i] as u32;
                     w[i % 4] |= ((byte & 15) << (4 * (i / 4))) | ((byte >> 4) << (4 * (i / 4) + 16));
                 }
+                qs[b * 4..b * 4 + 4].copy_from_slice(&w);
             }
         });
-    (qs, sc)
+}
+
+#[cfg(test)]
+mod repack_tests {
+    use super::*;
+
+    /// The accumulate-into-zeros form `repack_q4_0` had before `_into` existed, kept as the
+    /// reference the assigning form must match word for word.
+    fn reference(bytes: &[u8], n_blocks: usize) -> (Vec<u32>, Vec<u32>) {
+        let mut qs = vec![0u32; n_blocks * 4];
+        let mut sc = vec![0u32; n_blocks.div_ceil(2).max(1)];
+        for b in 0..n_blocks {
+            let blk = &bytes[b * 18..b * 18 + 18];
+            sc[b / 2] |= (u16::from_le_bytes([blk[0], blk[1]]) as u32) << (16 * (b % 2));
+            let w = &mut qs[b * 4..b * 4 + 4];
+            for i in 0..16usize {
+                let byte = blk[2 + i] as u32;
+                w[i % 4] |= ((byte & 15) << (4 * (i / 4))) | ((byte >> 4) << (4 * (i / 4) + 16));
+            }
+        }
+        (qs, sc)
+    }
+
+    #[test]
+    fn assigning_repack_matches_reference() {
+        // odd and even counts, under, at and past one REPACK_CHUNK and its sc half-chunk
+        for &n in &[1usize, 2, 3, 31, 1023, 1024, 1025, 2047, 2049, 4096 + 7] {
+            let mut x = 0x9E37_79B9u32;
+            let bytes: Vec<u8> = (0..n * 18)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x >> 24) as u8
+                })
+                .collect();
+            let (rq, rs) = reference(&bytes, n);
+            let (q, s) = repack_q4_0(&bytes, n);
+            assert_eq!(q, rq, "qs differ at n_blocks={n}");
+            assert_eq!(s, rs, "sc differ at n_blocks={n}");
+            // and into a slice that starts dirty, since pinned slots are reused
+            let mut dq = vec![0xFFFF_FFFFu32; n * 4];
+            let mut ds = vec![0xFFFF_FFFFu32; n.div_ceil(2).max(1)];
+            repack_q4_0_into(&bytes, n, &mut dq, &mut ds);
+            assert_eq!(dq, rq, "qs into dirty slice differ at n_blocks={n}");
+            assert_eq!(ds, rs, "sc into dirty slice differ at n_blocks={n}");
+        }
+    }
 }
 
 /// Cube count for `n` outputs given `per_cube` outputs per cube: wgpu caps each dispatch
