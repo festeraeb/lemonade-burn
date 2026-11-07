@@ -126,11 +126,11 @@ impl Tunables {
             Fixed { name: "pinned_pool_mb", value: env("LB_PINNED_POOL_MB"), ty: "int", source: "LB_PINNED_POOL_MB", description: "page-locked staging pool cap for host repacks (default 256)" },
             Fixed { name: "no_pinned", value: env_flag("LB_NO_PINNED"), ty: "bool", source: "LB_NO_PINNED", description: "no pinned staging pool: host repacks upload from pageable memory" },
             Fixed { name: "q4_cube", value: env("LB_Q4_CUBE"), ty: "int", source: "LB_Q4_CUBE", description: "units per cube for the Q4_0 matvec kernels (default: two planes)" },
-            Fixed { name: "q4_rows", value: env("LB_Q4_ROWS"), ty: "int", source: "LB_Q4_ROWS", description: "output rows per plane in the Q4_0 kernels: 1 (unset: the one-row kernels), 4 or 8 (the D2 rows kernels; need plane ops)" },
+            Fixed { name: "q4_rows", value: env("LB_Q4_ROWS"), ty: "int", source: "LB_Q4_ROWS", description: "output rows per plane in the Q4_0 kernels: 4 (unset), 8, or 1 for the one-row kernels; 4 and 8 need plane ops" },
             Fixed { name: "q4_xshared", value: env_flag("LB_Q4_XSHARED"), ty: "bool", source: "LB_Q4_XSHARED", description: "rows kernels stage the activation row in shared memory (one input row, up to q4_xshared_max_cols)" },
             Fixed { name: "q4_xshared_max_cols", value: env("LB_Q4_XSHARED_MAX_COLS"), ty: "int", source: "LB_Q4_XSHARED_MAX_COLS", description: "widest matrix whose activation row goes to shared memory (default 4096 columns = 16 KB)" },
             Fixed { name: "no_plane", value: env_flag("LB_NO_PLANE"), ty: "bool", source: "LB_NO_PLANE", description: "reduce with a shared-memory tree instead of plane_sum" },
-            Fixed { name: "expert_layers", value: env("LB_EXPERT_LAYERS"), ty: "bool", source: "LB_EXPERT_LAYERS (unset: follows LB_DEVICE_DECODE)", description: "upload a MoE layer whose experts are all planned resident as one stacked buffer per projection (per-expert views into it); the device-resident decode needs it" },
+            Fixed { name: "expert_layers", value: env("LB_EXPERT_LAYERS"), ty: "bool", source: "LB_EXPERT_LAYERS (unset: follows LB_DEVICE_DECODE, which is on unless 0)", description: "upload a MoE layer whose experts are all planned resident as one stacked buffer per projection (per-expert views into it); the device-resident decode needs it" },
             Fixed { name: "conv_block", value: env_flag("LB_CONV_BLOCK"), ty: "bool", source: "LB_CONV_BLOCK", description: "whole short-conv blocks resident on the device (off by default; measured slower)" },
             Fixed { name: "repack_scalar", value: env_flag("LB_REPACK_SCALAR"), ty: "bool", source: "LB_REPACK_SCALAR", description: "host repack with the scalar loop instead of SSSE3" },
             Fixed { name: "no_batch_miss_at_start", value: env_flag("LB_NO_BATCH_MISS"), ty: "bool", source: "LB_NO_BATCH_MISS", description: "the start value of the live knob batch_miss" },
@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(entry(&d, "gpu_budget_mb")["scope"], "restart");
         assert_eq!(entry(&d, "threads")["value"], 80);
         if std::env::var_os("LB_DEVICE_DECODE").is_none() {
-            assert_eq!(entry(&d, "device_decode")["value"], false, "off unless asked");
+            assert_eq!(entry(&d, "device_decode")["value"], true, "on unless LB_DEVICE_DECODE=0");
         }
         for live in ["miss_policy", "host_repack", "batch_miss", "device_decode", "dd_host_moe", "dd_router_seq", "scrape_dir", "scrape_model_id", "scrape_class_id", "default_max_tokens"] {
             assert_eq!(entry(&d, live)["scope"], "live", "{live}");

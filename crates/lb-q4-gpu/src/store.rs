@@ -57,8 +57,9 @@ pub struct Gpu {
     /// Small constant buffers (`dims`, kernel counts) keyed by their words. Every matrix of a
     /// shape shares one, so a miss uploads no tiny buffers (three per expert before).
     consts: Mutex<HashMap<Vec<u32>, Handle>>,
-    /// Output rows per plane for the Q4_0 kernels (D2): 1 = the one-row kernels (default),
-    /// 4 or 8 = `q4_0_*_rows_kernel`. `LB_Q4_ROWS`; live through `set_q4_rows` for A/Bs.
+    /// Output rows per plane for the Q4_0 kernels (D2): 4 (default since the 2026-11-07 P100
+    /// measurement) or 8 = `q4_0_*_rows_kernel`, 1 = the one-row kernels. `LB_Q4_ROWS`; live
+    /// through `set_q4_rows` for A/Bs.
     q4_rows: AtomicUsize,
     /// Stage the activation row in shared memory in the rows kernels (`LB_Q4_XSHARED=1`).
     q4_xshared: AtomicBool,
@@ -67,11 +68,13 @@ pub struct Gpu {
     pub xshared_max_cols: usize,
 }
 
-/// `LB_Q4_ROWS`: 1 (the one-row kernels, default), 4 or 8; anything else is 1.
+/// `LB_Q4_ROWS`: 4 (default), 8, or 1 for the one-row kernels; anything else is the default.
+/// Measured 2026-11-07 (docs/WORK_LOG.md): 1.29x end to end in the device decode on a P100,
+/// 1.16x / 1.31x on the GTX 1070's distinct-expert stream (wgpu / cuda).
 fn q4_rows_from_env() -> usize {
     match std::env::var("LB_Q4_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
-        Some(r @ (4 | 8)) => r,
-        _ => 1,
+        Some(r @ (1 | 4 | 8)) => r,
+        _ => 4,
     }
 }
 

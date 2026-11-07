@@ -400,14 +400,16 @@ impl ExpertStore {
 /// Whether a MoE layer whose experts are all planned resident is uploaded as one stacked
 /// [`lb_q4_gpu::GpuExpertLayer`] (three buffers, per-expert views into them) instead of 64
 /// separate experts. `LB_EXPERT_LAYERS=1`/`0` decides; unset, it follows `LB_DEVICE_DECODE`,
-/// whose expert kernels need it, so the default (neither set) keeps the per-expert upload.
+/// whose expert kernels need it; with neither set it is on (the device decode's default since
+/// 2026-11-07). On a P100 with all 2432 experts it also takes 13,775 MiB against the per-expert
+/// upload's 15,291 (docs/WORK_LOG.md).
 ///
 /// Read once: residency is fixed at load.
 pub fn expert_layers_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = |k: &str| std::env::var(k).ok().map(|v| !v.is_empty() && v != "0");
-        on("LB_EXPERT_LAYERS").or_else(|| on("LB_DEVICE_DECODE")).unwrap_or(false)
+        on("LB_EXPERT_LAYERS").or_else(|| on("LB_DEVICE_DECODE")).unwrap_or(true)
     })
 }
 

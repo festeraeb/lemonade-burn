@@ -19,7 +19,9 @@ pub struct Knobs {
     /// Upload a miss's three matrices as one batch (A/B switch for the per-matrix path).
     batch_miss: AtomicBool,
     /// Run a decode token device-resident (`device_decode.rs`): one upload, one read-back.
-    /// `LB_DEVICE_DECODE=1` at start; off by default.
+    /// **On by default** since the P100 measurement of 2026-11-07 (3.9x the old path, every
+    /// parity gate passed, docs/WORK_LOG.md); `LB_DEVICE_DECODE=0` starts with the old path.
+    /// A token whose weights are not all resident takes the old path either way.
     device_decode: AtomicBool,
     /// Inside a device-resident token, run a MoE layer whose experts are not all resident on
     /// the host path (one extra sync for that layer) instead of giving the whole token to the
@@ -32,7 +34,12 @@ pub struct Knobs {
 }
 
 fn env_on(k: &str) -> bool {
-    std::env::var(k).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+    env_or(k, false)
+}
+
+/// `k` set to anything but "" or "0" is on, set to those is off, unset is `default`.
+fn env_or(k: &str, default: bool) -> bool {
+    std::env::var(k).map(|v| !v.is_empty() && v != "0").unwrap_or(default)
 }
 
 impl Default for Knobs {
@@ -41,7 +48,7 @@ impl Default for Knobs {
             miss_policy: AtomicU8::new(MissPolicy::Cpu as u8),
             host_repack: AtomicBool::new(std::env::var_os("LB_HOST_REPACK").is_some()),
             batch_miss: AtomicBool::new(std::env::var_os("LB_NO_BATCH_MISS").is_none()),
-            device_decode: AtomicBool::new(env_on("LB_DEVICE_DECODE")),
+            device_decode: AtomicBool::new(env_or("LB_DEVICE_DECODE", true)),
             dd_host_moe: AtomicBool::new(env_on("LB_DD_HOST_MOE")),
             dd_router_seq: AtomicBool::new(env_on("LB_DD_ROUTER_SEQ")),
         }
@@ -132,11 +139,11 @@ mod tests {
     }
 
     #[test]
-    fn device_decode_is_off_unless_asked() {
-        // the test environment does not set LB_DEVICE_DECODE: the default must keep the old path
+    fn device_decode_is_on_unless_switched_off() {
         if std::env::var_os("LB_DEVICE_DECODE").is_none() {
-            assert!(!Knobs::default().device_decode());
+            assert!(Knobs::default().device_decode());
         }
         assert!(!env_on("LB_SURELY_UNSET_FOR_THIS_TEST"));
+        assert!(env_or("LB_SURELY_UNSET_FOR_THIS_TEST", true));
     }
 }

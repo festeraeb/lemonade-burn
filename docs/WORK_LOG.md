@@ -1045,3 +1045,93 @@ mostly 22 per-layer round trips becoming cheaper ones. **No tok/s claim comes fr
    every completion, `device_decode_fallbacks` 0 in (b)/(c), load printed, quieter round quoted.
 5. `examples/rows_bench.rs` 3 runs on the P100 (roofline 732 GB/s), to decide `LB_Q4_ROWS`'s
    default and whether the 512-row shapes need their own r.
+
+## D3 on the P100: device decode 79-82 tok/s, llama.cpp 82.0 in the same session; defaults flipped (2026-11-07, 18:10-18:24Z)
+
+**Card.** c4's Tesla P100 at **AF:00.0**, pinned by UUID (`CUDA_VISIBLE_DEVICES=GPU-fd9b03e5-aed9-cbca-a57b-efc90d61addd`,
+`LB_CUDA_DEVICE=0`). **c4's card set has changed since 11-04:** `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3`
+now resolves to the **RTX 2060 at D8:00.0** (PCI order today: 18:00 P100, 3B:00 T10, AF:00 P100, D8:00 2060), so
+`c4_e2e.sh` / `c4_llama.sh`'s default `CUDA_DEV=3` is stale and points at the wrong card. Every run below set
+`CUDA_DEV` to the UUID (`/mnt/models/lb-measure/d3_common.sh`). Binaries built on t440 from this branch,
+`bin/lemonade-burn-server-dd` (sha256 `895a2c15581eaa53`, `LB_*` set per arm), `-dd2` (the new defaults),
+`lfm2-check-dd`, `rows_bench-dd`; the old binaries are untouched. Le Chonk was stopped for the window; c4's
+CPU seats ran beside (load 1.1-2.5 for the e2e, 5-10 for rows_bench). Raw: `/mnt/models/lb-measure/out/d3-*`.
+
+**Step 2, memory.** Same placement (2432 experts from the 2 scrape files + 751 MB dense + head):
+`LB_EXPERT_LAYERS=1` (stacked) **13,775 MiB** at load / 13,825 after 186 decode tokens; per-expert **15,291 /
+15,809 MiB**. Stacking saves ~1.5 GB (the ~14,600 separate buffers' pool overhead), so it fits with room.
+
+**Step 3, parity on the card** (`lfm2-check --ab-device`, everything resident, no `LB_DD_HOST_MOE`):
+**86/86 top-1, max |logit diff| 2.34e-5, 0 of 3268 route activations differing**, alternating device/old every
+token 86/86 (2.09e-5), greedy 32 tokens identical (sha `062392b8d2b0361a` both arms), **every token on the
+device path, 0 fallbacks**.
+
+**Step 4, end to end** (`c4_e2e.sh` protocol: same GGUF, prompt, 32 greedy tokens, one warmup + 5 timed
+completions, two interleaved rounds, llama.cpp first in each round, lemonade-burn arms a-b-c-d then d-c-b-a;
+`--gpu --placement-from-scrapes scrapes --gpu-budget-mb 14500 --gpu-dense-mb 900 --miss-policy on-demand`,
+`LB_EXPERT_LAYERS=1` in every lemonade-burn arm so residency is identical):
+
+| engine, config | decode tok/s, round 1 | round 2 | prefill s | load (1 min) | greedy sha |
+|---|---|---|---|---|---|
+| **llama.cpp** (fleet build 20261027, `-ngl 99 -fa on -c 2048`, no scrape dir) | 82.09 / 82.07 / 82.13 / 82.13 / 82.14 | 82.00 / 82.05 / 81.99 / 82.02 / 82.08 | 0.202-0.204 | 1.16, 1.53 | `eccfc8c1a26ab916` x10 |
+| llama.cpp, same build, `NAUTIBURN_SCRAPE_DIR` set (its scraper on; one session, 2 timed) | 66.35 / 66.41 | - | 0.209 | 1.56 | `136ea2355506fcef` x3 |
+| (a) lemonade-burn old path, rows1 (`LB_DEVICE_DECODE=0 LB_Q4_ROWS=1`) | 20.06 / 17.63 / 23.93 / 21.00 / 18.96 | 19.13 / 22.61 / 21.69 / 21.43 / 18.89 | 0.54-0.63 | 1.13-1.35, 1.69-2.20 | `062392b8d2b0361a` x10 |
+| (b) **device decode**, rows1 | 61.27 / 61.31 / 61.46 / 61.34 / 61.41 | 61.37 / 61.32 / 61.37 / 61.36 / 61.43 | 0.60-0.64 | 1.50-1.62, 1.87-1.94 | `062392b8d2b0361a` x10 |
+| (c) **device decode, rows4** | 79.51 / 82.51 / 79.81 / 79.35 / 79.11 | 82.17 / 79.22 / 79.22 / 79.13 / 79.42 | 0.48-0.64 | 1.37-1.42, 1.71 | `062392b8d2b0361a` x10 |
+| (d) old path, rows4 (`LB_DEVICE_DECODE=0 LB_Q4_ROWS=4`) | 28.51 / 18.49 / 16.10 / 18.39 / 18.34 | 18.18 / 18.21 / 21.16 / 18.13 / 19.45 | 0.49-0.60 | 1.48-1.56, 1.79-1.89 | `062392b8d2b0361a` x10 |
+| (c) with lemonade-burn's scraper on (`NAUTIBURN_SCRAPE_DIR` set) | 81.09 / 78.61 / 77.19 / 80.69 / 78.74 | - | 0.54-0.63 | 7.23-7.77 | `062392b8d2b0361a` x5 |
+
+`/v1/placement`: arms b and c **186 device tokens of 186 decode passes, 0 fallbacks**; per device token
+**20.74 / 18.86 ms (rows1)** and **17.04 / 15.67 ms (rows4)**; arms a and d 0 device tokens, decode forward
+49.9 / 48.6 and 54.2 / 54.4 ms.
+
+Reading:
+* **Device decode alone is 3.0x** (b vs a: 61.3-61.5 against 17.6-23.9), and **rows4 on top of it is 1.29x**
+  (c vs b: 79.1-82.5 against 61.3-61.5; neither arm's range comes near the other's). Together **3.7-4.0x the old
+  path** (round medians 79.5 / 79.4 against 20.1 / 21.4). On the old path rows4 does nothing visible (d vs a,
+  both noisy): the old path is bound by its 145 round trips, not the kernel, which is exactly what the plan
+  predicted for each lever alone.
+* **Against llama.cpp on the same card and GGUF: 79.4-79.5 against 82.0, 0.97x** (scrape dirs unset on
+  both). The 11-04 bar of 66.2-66.7 was llama.cpp **with its built-in NautiBurn scraper on** (`baseline.sh`
+  exported `NAUTIBURN_SCRAPE_DIR`): reproduced here, same binary, 66.4 tok/s and the 11-04 sha
+  `136ea2355506fcef`. Without the scraper it is 82 tok/s and a different text, so the scraper changes
+  llama.cpp's arithmetic as well as its speed (presumably a different MoE path; not investigated). Ours
+  with the scraper on is 77.2-81.1 (load 7, something else started on c4) and the same sha: our scrape is
+  free, theirs costs 19%. Like for like, scrapers off: **0.97x llama.cpp**; scrapers on: **1.2x**.
+* Prefill is unchanged by any of this (0.48-0.64 s against llama.cpp's 0.20; not in the plan).
+* Different sha from llama.cpp (`062392b8...` vs `eccfc8c1...`): the two engines sum in different orders;
+  ours is the same in every arm and every completion, which is the gate.
+
+**Step 5, kernels on the P100** (`rows_bench`, 3 runs, load 5.1-10.5, roofline 732 GB/s; median [min-max]):
+
+| | rows1 | rows4 | rows8 | rows4 + x shared |
+|---|---|---|---|---|
+| distinct24_m1, ms/expert | 0.0618 [0.0613-0.0624], 85.9 GB/s | 0.0583 [0.0472-0.0583], 91.1, 1.06x | 0.0573, 92.6, 1.08x | 0.0581, 91.3, 1.06x |
+| in_proj 6144x2048 chain | 99.7 GB/s | 132.0, 1.32x | 131.8, 1.32x | 131.2, 1.32x |
+| out_proj 2048x2048 chain | 80.1 GB/s | 79.2, 0.99x | 77.2, 0.96x | 79.3, 0.99x |
+| kv 512x2048 chain | 32.9 GB/s | 35.2, 1.07x | 20.1, 0.61x | 22.0, 0.67x |
+| ffn_down 2048x11776 chain | 116.6 GB/s | **203.9, 1.75x** | 170.6, 1.46x | 171.0, 1.46x |
+| ffn_up 11776x2048 chain | 116.5 GB/s | **204.8, 1.76x** | 171.2, 1.47x | 171.1, 1.47x |
+
+On the busier box the per-expert number is bimodal (rows4's best run 0.0472 = 112 GB/s) and not conclusive by
+itself; the big matrices are, and the e2e above is the measurement that matters. The best kernel is at 28% of
+the P100's 732 GB/s, so there is still room in the kernel: at 15.7 ms a token for ~1.56 GB the device token
+streams ~100 GB/s overall, about what llama.cpp's 12.2 ms does (~128 GB/s).
+
+**Defaults changed (this commit)**, because both levers won on both cards with every gate passed:
+* `LB_DEVICE_DECODE` **on unless set to 0** (live knob `device_decode` as before). A token whose weights are
+  not all resident still takes the old path (0 fallbacks here; the fallback is bit-identical on the 1070).
+* `LB_EXPERT_LAYERS` follows it, so **stacked residency is the default** (13.8 GB instead of 15.3 on the 24B);
+  `LB_EXPERT_LAYERS=0` keeps the per-expert upload.
+* `LB_Q4_ROWS` **defaults to 4**; `LB_Q4_ROWS=1` is the one-row kernel.
+
+Checked on the card with the new binary (`-dd2`), no `LB_*` set: **79.54 / 79.95 / 84.58 / 83.07 / 80.54
+tok/s**, prefill 0.46-0.64, load 2.0-2.1, 13,775 MiB, 186 device tokens, 0 fallbacks, sha `062392b8d2b0361a`
+x6. With every opt-out (`LB_DEVICE_DECODE=0 LB_Q4_ROWS=1 LB_EXPERT_LAYERS=0`): **18.45 / 18.60 / 19.10 /
+18.74 / 24.25**, 15,291 MiB, 0 device tokens, same sha: the old engine, unchanged.
+
+**Still open.** The 512-row and 2048x2048 shapes get nothing from rows4 (too few row groups for 56 SMs: a
+per-shape r or split-K is next); the kernel sits at 28% of HBM2 so a further 1.5x is not ruled out; prefill
+is 2.5-3x llama.cpp's; `c4_e2e.sh` / `c4_llama.sh` should get the AF:00.0 UUID as their default `CUDA_DEV`
+(left unchanged here: not in the repo, and they were to be kept as they are); and why llama.cpp's scraper
+changes its output text is not ours to fix but should be told to whoever owns that build.

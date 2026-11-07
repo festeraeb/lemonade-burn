@@ -1,5 +1,6 @@
 //! Device-resident decode: one token, one upload, one read-back (Phase D1 of
-//! `docs/DEVICE_DECODE_PLAN.md`; `LB_DEVICE_DECODE=1` or the live `device_decode` knob).
+//! `docs/DEVICE_DECODE_PLAN.md`; on by default since 2026-11-07, `LB_DEVICE_DECODE=0` or the
+//! live `device_decode` knob switches it off).
 //!
 //! The old decode token left the card about 145 times: every quantized matvec read its result
 //! back, the norms, RoPE, attention and the residual adds ran as Burn ops on the host, and every
