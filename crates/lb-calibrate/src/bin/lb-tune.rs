@@ -50,6 +50,15 @@ struct Args {
     out: Option<PathBuf>,
     #[arg(long)]
     explain: bool,
+    /// Only layouts whose primary node is NODE.
+    #[arg(long)]
+    node: Option<String>,
+    /// Only layouts using this helper node ("none" = no helper).
+    #[arg(long)]
+    helper: Option<String>,
+    /// Print every variant of a node, not just its best.
+    #[arg(long)]
+    variants: bool,
     /// Layouts to print.
     #[arg(long, default_value_t = 3)]
     top: usize,
@@ -126,10 +135,19 @@ fn main() -> Result<()> {
         Some(d) => plan::SkewCurve::from_trace(&Trace::load_dir(d, md.n_layer, md.n_expert)?),
         None => plan::SkewCurve::by_name(&knobs.skew),
     };
-    let set = plan::plan_fleet(&fl, &md, &knobs, &benches, &curve);
+    let mut set = plan::plan_fleet(&fl, &md, &knobs, &benches, &curve);
+    if let Some(n) = &a.node {
+        set.plans.retain(|p| &p.layout.node == n);
+    }
+    if let Some(h) = &a.helper {
+        set.plans.retain(|p| match &p.layout.helper {
+            Some(x) => &x.node == h,
+            None => h == "none",
+        });
+    }
     let rows = quant::table(&fl, &md, &knobs);
     let remake = quant::remake_advice(&md, &rows, &knobs);
-    print!("{}", report::render(&md, &set, &rows, &remake, a.top, a.explain, &fl));
+    print!("{}", report::render(&md, &set, &rows, &remake, a.top, a.explain, &fl, a.variants));
     if let Some(p) = &a.out {
         let best = set.plans.first().context("no layout to write")?;
         std::fs::write(p, serde_json::to_string_pretty(best)?)?;

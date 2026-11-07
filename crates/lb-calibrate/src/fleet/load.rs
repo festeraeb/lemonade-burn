@@ -98,17 +98,19 @@ fn links_from_matrix(fleet: &mut Fleet, x: &Value, names: &[String]) {
             let paths = &icmp[*a][*b];
             let pick = ["25g", "lan-10.44"].iter().find_map(|p| paths.get(*p).and_then(|v| v.as_f64()).map(|ms| (*p, ms)));
             let Some((path, ms)) = pick else { continue };
-            // local interface speed: a's link_up on the same /24 as b's address on this path
-            let peer_ip = bv["paths"].as_array().and_then(|ps| ps.iter().find(|p| p["path"] == *path)).and_then(|p| p["ip"].as_str()).map(|s| s.to_string());
-            let prefix = peer_ip.as_deref().and_then(|ip| ip.rsplit_once('.').map(|(p, _)| p.to_string()));
-            let speed = prefix.as_deref().and_then(|pf| {
-                av["resources"]["links_up"].as_array().into_iter().flatten().find(|l| l["ipv4"].as_str().map_or(false, |ip| ip.starts_with(pf))).and_then(|l| l["speed_mbps"].as_str().and_then(|s| s.parse::<f64>().ok()))
-            });
+            // interface speed: the interface on the shared /24, read from either end (the slower one wins)
+            let ip_of = |v: &Value| v["paths"].as_array().and_then(|ps| ps.iter().find(|p| p["path"] == *path)).and_then(|p| p["ip"].as_str()).map(|s| s.to_string());
+            let speed_at = |v: &Value, peer_ip: Option<String>| -> Option<f64> {
+                let pf = peer_ip.as_deref().and_then(|ip| ip.rsplit_once('.').map(|(p, _)| p.to_string()))?;
+                v["resources"]["links_up"].as_array().into_iter().flatten().find(|l| l["ipv4"].as_str().map_or(false, |ip| ip.starts_with(&pf))).and_then(|l| l["speed_mbps"].as_str().and_then(|s| s.parse::<f64>().ok()))
+            };
+            let speeds: Vec<f64> = [speed_at(&av, ip_of(&bv)), speed_at(&bv, ip_of(&av))].into_iter().flatten().collect();
+            let speed = speeds.into_iter().fold(None, |m: Option<f64>, x| Some(m.map_or(x, |y| y.min(x))));
             let roce = path == "25g";
             let (gb_s, src_rate) = if roce {
                 (Some(ROCE_MEASURED_GB_S), "RDMA read measured 2.84 GB/s on t440<->c4, applied to this 25G RoCE link".to_string())
             } else {
-                (speed.map(|m| m / 8000.0), format!("nominal from interface speed {:?} Mbps", speed))
+                (speed.map(|m| m / 8000.0), speed.map(|m| format!("nominal from interface speed {m:.0} Mbps")).unwrap_or_else(|| "interface speed not reported by the matrix".to_string()))
             };
             let lat = if roce { ROCE_MEASURED_LAT_US } else { ms * 1000.0 };
             fleet.links.push(Link {

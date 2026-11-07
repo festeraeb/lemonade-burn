@@ -146,6 +146,9 @@ pub struct Expect {
     pub tok_s_low: Option<f64>,
     pub tok_s: Option<f64>,
     pub tok_s_high: Option<f64>,
+    /// First requests after a load: RAM and disk tiers still empty, every non-resident expert read from the model file.
+    #[serde(default)]
+    pub tok_s_cold: Option<f64>,
     pub ms_sim: f64,
     pub ms_helper: f64,
     pub ms_io_serial: f64,
@@ -612,10 +615,16 @@ pub fn evaluate(fleet: &Fleet, p: &Placement, node: &NodeDesc, model: &ModelDesc
     let lo = run_scenario(fleet, p, node, model, knobs, &ts, &uni, link);
     let ex = run_scenario(fleet, p, node, model, knobs, &ts, curve, link);
     let uses = (model.moe_layers() * model.top_k) as f64;
+    let mut pc = p.clone();
+    pc.file_experts += pc.ram_experts + pc.tier_experts.iter().map(|t| t.experts).sum::<u64>();
+    pc.ram_experts = 0;
+    pc.tier_experts.clear();
+    let cold = run_scenario(fleet, &pc, node, model, knobs, &ts, curve, link);
     let expect = Expect {
+        tok_s_cold: tok(cold.ms_sim + cold.ms_helper + cold.io_serial),
         tok_s_low: tok(lo.ms_sim + lo.ms_helper + lo.io_serial),
         tok_s: tok(ex.ms_sim + ex.ms_helper + ex.io_serial),
-        tok_s_high: tok(ex.ms_sim + ex.ms_helper + ex.io_overlap.max(0.0).min(ex.io_serial)).map(|h| h.max(tok(ex.ms_sim + ex.ms_helper + ex.io_serial).unwrap_or(0.0))),
+        tok_s_high: tok(ex.ms_sim + ex.ms_helper + ex.io_overlap),
         ms_sim: ex.ms_sim,
         ms_helper: ex.ms_helper,
         ms_io_serial: ex.io_serial,
@@ -629,7 +638,7 @@ pub fn evaluate(fleet: &Fleet, p: &Placement, node: &NodeDesc, model: &ModelDesc
         skew: format!("{} ({})", curve.name, curve.source),
         basis: {
             let mut v = ts.sources.clone();
-            v.push("expected = chosen skew curve, disk reads not overlapped with compute; low = uniform routing, no overlap; high = chosen skew, reads overlapped (max of devices)".into());
+            v.push("expected = chosen skew curve, warm tiers, disk reads not overlapped with compute; cold = same with RAM/disk tiers still empty (first requests after a load); low = uniform routing, no overlap; high = chosen skew, reads overlapped (max of devices)".into());
             v.push("decode, one stream; prefill and multi-stream pipelining not modelled (sim.rs)".into());
             v
         },
@@ -702,6 +711,14 @@ pub fn evaluate(fleet: &Fleet, p: &Placement, node: &NodeDesc, model: &ModelDesc
     }
     if p.file_experts > 0 && store.as_ref().and_then(|s| s.1.read_mb_s).is_none() {
         unknowns_used.push("model-store read speed unknown: tokens/s cannot be estimated".into());
+    }
+    if let Some(l) = link {
+        if l.gb_s.is_none() {
+            unknowns_used.push(format!("link {}-{} rate unknown: helper activation transfer time omitted (latency only)", l.a, l.b));
+        }
+    }
+    if p.helper_node.is_some() {
+        unknowns_used.push(format!("helper start-up (reading {:.1} GiB of experts from the helper's own storage) is not modelled", p.helper_experts as f64 * b / GIB));
     }
     for g in &p.gpus {
         if g.pcie_gen.is_none() || g.pcie_width.is_none() {
@@ -985,6 +1002,22 @@ pub(crate) mod tests {
         let r = plan_fleet(&f, &m, &Knobs::default(), &Benches::new(), &SkewCurve::profile());
         assert!(r.plans[0].layout.expect.tok_s.is_none());
         assert!(r.plans[0].layout.unknowns_used.iter().any(|u| u.contains("model-store")));
+    }
+
+    #[test]
+    fn plan_json_is_a_superset_of_the_staging_config_and_cold_is_slower() {
+        let mut m = small_moe();
+        m.n_expert = 512;
+        let mut f = one(vec![p100()], 40.0);
+        f.nodes[0].tiers = vec![Tier { kind: TierKind::Nfs, path: None, bytes: 1 << 40, read_mb_s: Some(300.0), holds_model: true }];
+        let r = plan_fleet(&f, &m, &Knobs::default(), &Benches::new(), &SkewCurve::profile());
+        let js = serde_json::to_string(&r.plans[0]).unwrap();
+        let st: StagingConfig = serde_json::from_str(&js).expect("old reader still parses the new plan");
+        assert_eq!(st.model, "small");
+        let back: FleetPlan = serde_json::from_str(&js).unwrap();
+        let e = &back.layout.expect;
+        assert!(e.tok_s_cold.unwrap() <= e.tok_s.unwrap());
+        assert!(e.tok_s_low.unwrap() <= e.tok_s.unwrap());
     }
 
     #[test]

@@ -235,4 +235,62 @@ mod tests {
         assert_eq!(type_info(GgmlType::Q4_0).unwrap().2, 18);
         assert!(type_info(GgmlType::Other(9999)).is_none());
     }
+
+    fn gstr(b: &mut Vec<u8>, s: &str) {
+        b.extend((s.len() as u64).to_le_bytes());
+        b.extend(s.as_bytes());
+    }
+
+    /// A tiny MoE GGUF: 3 layers (layer 0 dense), 4 experts, Q4_0 experts, F32 dense, F16 head.
+    #[test]
+    fn reads_shapes_from_a_synthetic_gguf() {
+        let mut b: Vec<u8> = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        let tensors: Vec<(&str, Vec<u64>, u32)> = vec![
+            ("token_embd.weight", vec![64, 10], 1),
+            ("blk.0.attn_q.weight", vec![64, 64], 0),
+            ("blk.1.attn_q.weight", vec![64, 64], 0),
+            ("blk.1.ffn_gate_exps.weight", vec![64, 32, 4], 2),
+            ("blk.2.attn_q.weight", vec![64, 64], 0),
+            ("blk.2.ffn_gate_exps.weight", vec![64, 32, 4], 2),
+        ];
+        b.extend((tensors.len() as u64).to_le_bytes());
+        let kvs: Vec<(&str, u32, u64)> = vec![("testmoe.block_count", 4, 3), ("testmoe.expert_count", 4, 4), ("testmoe.expert_used_count", 4, 2), ("testmoe.embedding_length", 4, 64), ("testmoe.attention.head_count", 4, 4), ("testmoe.attention.head_count_kv", 4, 2)];
+        b.extend(((kvs.len() + 1) as u64).to_le_bytes());
+        gstr(&mut b, "general.architecture");
+        b.extend(8u32.to_le_bytes());
+        gstr(&mut b, "testmoe");
+        for (k, t, v) in &kvs {
+            gstr(&mut b, k);
+            b.extend(t.to_le_bytes());
+            b.extend((*v as u32).to_le_bytes());
+        }
+        let mut off = 0u64;
+        let mut sizes = Vec::new();
+        for (n, d, t) in &tensors {
+            let el: u64 = d.iter().product();
+            let bytes = match t { 0 => el * 4, 1 => el * 2, _ => el / 32 * 18 };
+            gstr(&mut b, n);
+            b.extend((d.len() as u32).to_le_bytes());
+            for x in d { b.extend(x.to_le_bytes()); }
+            b.extend(t.to_le_bytes());
+            b.extend(off.to_le_bytes());
+            off += bytes.div_ceil(32) * 32;
+            sizes.push(bytes);
+        }
+        while b.len() % 32 != 0 { b.push(0); }
+        b.extend(vec![0u8; off as usize]);
+        let p = std::env::temp_dir().join(format!("lbtune-synth-{}.gguf", std::process::id()));
+        std::fs::write(&p, &b).unwrap();
+        let m = from_gguf(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!((m.n_layer, m.n_dense_lead, m.n_expert, m.top_k), (3, 1, 4, 2));
+        assert_eq!(m.expert_bytes, 64 * 32 / 32 * 18); // one expert of the gate matrix: 2048 values in Q4_0
+        assert_eq!(m.head_bytes, 64 * 10 * 2);
+        assert_eq!(m.dense_layer_bytes, 64 * 64 * 4); // one F32 attn_q per layer
+        assert_eq!(m.moe_layers(), 2);
+        assert_eq!(m.hidden, Some(64));
+        assert_eq!(m.kv_bytes_per_token, Some(3 * 2 * 16 * 2 * 2)); // 3 layers x kv_heads 2 x head_dim 16 x K,V x f16
+        assert_eq!(m.total_bytes, sizes.iter().sum::<u64>());
+    }
 }

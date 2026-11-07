@@ -1,0 +1,144 @@
+{
+ "nodes": [
+  {
+   "name": "cesarops4om",
+   "gpus": [
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 16,
+     "available": true
+    },
+    {
+     "name": "Tesla T10",
+     "vram_mib": 15360,
+     "pcie_gen": 3,
+     "pcie_width": 16,
+     "available": true
+    },
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 16,
+     "available": true
+    },
+    {
+     "name": "NVIDIA GeForce RTX 2060",
+     "vram_mib": 12288,
+     "pcie_gen": 3,
+     "pcie_width": 16,
+     "available": true
+    }
+   ],
+   "tiers": [
+    {
+     "kind": "optane",
+     "path": "/mnt/optane",
+     "bytes": 13958643712,
+     "read_mb_s": 900.0,
+     "holds_model": false
+    }
+   ]
+  },
+  {
+   "name": "t440",
+   "gpus": [
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 16,
+     "available": true
+    },
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 8,
+     "available": true
+    }
+   ],
+   "tiers": [
+    {
+     "kind": "ssd",
+     "path": "/mnt/ssd9",
+     "bytes": 373000000000,
+     "read_mb_s": 300.0,
+     "holds_model": true
+    }
+   ]
+  },
+  {
+   "name": "cesarops2",
+   "gpus": [
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 4,
+     "available": true
+    },
+    {
+     "name": "NVIDIA GeForce RTX 2060 SUPER",
+     "vram_mib": 8192,
+     "pcie_gen": 2,
+     "pcie_width": 4,
+     "available": true
+    },
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 16,
+     "available": true
+    }
+   ]
+  },
+  {
+   "name": "cesarops1",
+   "ram_gib": 108.0,
+   "cpu_threads": 32,
+   "gpus": [
+    {
+     "name": "NVIDIA GeForce GTX 1070",
+     "vram_mib": 8192,
+     "pcie_gen": null,
+     "pcie_width": null,
+     "available": true
+    },
+    {
+     "name": "Quadro P1000",
+     "vram_mib": 4096,
+     "pcie_gen": null,
+     "pcie_width": null,
+     "available": true
+    },
+    {
+     "name": "P106-100",
+     "vram_mib": 6144,
+     "pcie_gen": 1,
+     "pcie_width": 16,
+     "available": true
+    },
+    {
+     "name": "AMD 0x73df",
+     "vram_mib": 12272,
+     "pcie_gen": null,
+     "pcie_width": null,
+     "available": true
+    }
+   ]
+  }
+ ],
+ "links": [],
+ "notes": [
+  "overlay 2026-11-07, hand-written from memory notes; every number has a source below",
+  "c4 Optane: 13 GiB stick (df /mnt/optane 14 GB); 900 MB/s = ~3.5 GB/s RAID0 of 4 modules / 4 (memory note le-chonk-polystrata): ESTIMATE, the 13 GB stick itself is unmeasured",
+  "t440 ssd9 holds the Le Chonk files and is the model store for c4 misses: 300 MB/s, measured SAS SSD ceiling under expert reads (le-chonk-polystrata, 2026-11-06)",
+  "PCIe: c4 and t440 all Gen3 x16 (audit 2026-11-06) except t440 second P100 x8 (inventory 2026-11-02, which index is x8 is not recorded: GPU1 assumed); c2 P100 #0 Gen3 x4, 2060 SUPER in a Gen2 x4 PCH slot, P100 #2 x16; c1 P106 Gen1 for good (audit 2026-11-06)",
+  "c1 (cesarops1, not in the live matrix): 108 GB RAM from the manifest note; 32 threads = 2x E5-2680 v1 (8c/16t each) from the same note; GPUs from the manifest note (1070, P1000, P106, 6700 XT 12 GB). Its 1070/P1000/P106 PCIe widths unknown -> null",
+  "SEATS: this file does not know which cards currently serve seats; set available:false on cards that must stay put"
+ ]
+}

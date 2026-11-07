@@ -20,7 +20,7 @@ pub fn table() -> Vec<(&'static str, ArchInfo)> {
     let a = |arch, cc, dp4a, fp16, bw, src| ArchInfo { arch, compute_cap: cc, has_dp4a: dp4a, fp16_rate: fp16, mem_gb_s: bw, src };
     vec![
         // DP4A exists on cc 6.1/6.2, not 6.0; P100 fp16 full rate, 1070 1/64 (fleet-gpu-inventory.md, verified 2026-11-02).
-        ("p100", a("sm_60", Some("6.0"), false, "full", 732.0, "estimate: NVIDIA P100-PCIE-16GB spec 732 GB/s")),
+        ("tesla p100", a("sm_60", Some("6.0"), false, "full", 732.0, "estimate: NVIDIA P100-PCIE-16GB spec 732 GB/s")),
         ("gtx 1070", a("sm_61", Some("6.1"), true, "1/64", 256.0, "estimate: GTX 1070 spec 256 GB/s")),
         ("p106", a("sm_61", Some("6.1"), true, "1/64", 192.0, "estimate: P106-100 spec 192 GB/s")),
         ("p1000", a("sm_61", Some("6.1"), true, "1/64", 80.0, "estimate: Quadro P1000 spec 80 GB/s")),
@@ -90,6 +90,8 @@ mod tests {
         assert_eq!(lookup("NVIDIA GeForce GTX 1070").unwrap().has_dp4a, true);
         assert_eq!(lookup("NVIDIA GeForce RTX 2060 SUPER").unwrap().mem_gb_s, 448.0);
         assert_eq!(lookup("AMD 0x73df").unwrap().arch, "gfx1031");
+        assert_eq!(lookup("Quadro P1000").unwrap().arch, "sm_61", "P1000 is not a P100");
+        assert!(lookup("P106-100").unwrap().has_dp4a == true);
         assert!(lookup("mystery card").is_none());
     }
 

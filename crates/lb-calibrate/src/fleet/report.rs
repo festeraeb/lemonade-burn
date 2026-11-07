@@ -41,10 +41,11 @@ pub fn plan_summary(p: &FleetPlan, explain: bool) -> String {
     }
     let _ = writeln!(
         s,
-        "  expected {} tok/s  (low {} .. high {})   uses/token {:.0}: VRAM {:.0}%  helper {:.0}%  RAM {:.0}%  tier {:.0}%  file {:.0}%",
+        "  expected {} tok/s warm  (low {} .. high {}; cold start {})   uses/token {:.0}: VRAM {:.1}%  helper {:.1}%  RAM {:.1}%  tier {:.1}%  file {:.1}%",
         tok(e.tok_s),
         tok(e.tok_s_low),
         tok(e.tok_s_high),
+        tok(e.tok_s_cold),
         e.uses_per_token,
         e.share_vram * 100.0,
         e.share_helper * 100.0,
@@ -53,10 +54,10 @@ pub fn plan_summary(p: &FleetPlan, explain: bool) -> String {
         e.share_file * 100.0
     );
     let _ = writeln!(s, "  ms/token: sim {:.1}  helper {:.1}  disk reads {:.1} serial / {:.1} overlapped", e.ms_sim, e.ms_helper, e.ms_io_serial, e.ms_io_overlap);
-    for c in &l.cards {
-        if let Some(n) = &c.kernel_note {
-            let _ = writeln!(s, "  note: {n}");
-        }
+    let mut notes: Vec<&String> = l.cards.iter().filter_map(|c| c.kernel_note.as_ref()).collect();
+    notes.dedup();
+    for n in notes {
+        let _ = writeln!(s, "  note: {n}");
     }
     for u in &l.unknowns_used {
         let _ = writeln!(s, "  UNKNOWN: {u}");
@@ -75,7 +76,7 @@ pub fn plan_summary(p: &FleetPlan, explain: bool) -> String {
     s
 }
 
-pub fn render(m: &model::ModelDesc, set: &PlanSet, quants: &[QuantRow], remake: &[String], top: usize, explain: bool, fleet: &Fleet) -> String {
+pub fn render(m: &model::ModelDesc, set: &PlanSet, quants: &[QuantRow], remake: &[String], top: usize, explain: bool, fleet: &Fleet, variants: bool) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -97,7 +98,10 @@ pub fn render(m: &model::ModelDesc, set: &PlanSet, quants: &[QuantRow], remake: 
             let _ = writeln!(s, "  - {o}");
         }
     }
-    for (i, p) in set.plans.iter().take(top).enumerate() {
+    // best layout per node (the ranked list repeats near-identical variants of one node)
+    let mut seen = std::collections::HashSet::new();
+    let shown: Vec<&FleetPlan> = set.plans.iter().filter(|p| variants || seen.insert(p.layout.node.clone())).take(top).collect();
+    for (i, p) in shown.iter().enumerate() {
         let _ = writeln!(s, "\n#{} {}", i + 1, plan_summary(p, explain && i == 0));
     }
     if explain {

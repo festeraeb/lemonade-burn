@@ -1,0 +1,146 @@
+{
+ "nodes": [
+  {
+   "name": "cesarops4om",
+   "gpus": [
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 8,
+     "available": true
+    },
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 8,
+     "available": true
+    },
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 8,
+     "available": true
+    },
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 8,
+     "available": true
+    },
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 16,
+     "available": true
+    },
+    {
+     "name": "NVIDIA GeForce GTX 1070",
+     "vram_mib": 8192,
+     "pcie_gen": 3,
+     "pcie_width": 8,
+     "available": true
+    }
+   ],
+   "tiers": [
+    {
+     "kind": "optane",
+     "path": "/mnt/optane",
+     "bytes": 80000000000,
+     "read_mb_s": 3500.0,
+     "holds_model": false
+    }
+   ]
+  },
+  {
+   "name": "t440",
+   "gpus": [
+    {
+     "name": "Tesla P100-PCIE-16GB",
+     "vram_mib": 16384,
+     "pcie_gen": 3,
+     "pcie_width": 16,
+     "available": true
+    },
+    {
+     "name": "P106-100",
+     "vram_mib": 6144,
+     "pcie_gen": 1,
+     "pcie_width": 16,
+     "available": true
+    }
+   ],
+   "tiers": [
+    {
+     "kind": "ssd",
+     "path": "/mnt/ssd9",
+     "bytes": 373000000000,
+     "read_mb_s": 300.0,
+     "holds_model": true
+    }
+   ]
+  },
+  {
+   "name": "cesarops1",
+   "ram_gib": 108.0,
+   "cpu_threads": 32,
+   "gpus": [
+    {
+     "name": "NVIDIA GeForce RTX 2060",
+     "vram_mib": 12288,
+     "pcie_gen": null,
+     "pcie_width": null,
+     "available": true
+    },
+    {
+     "name": "NVIDIA GeForce RTX 2060 SUPER",
+     "vram_mib": 8192,
+     "pcie_gen": null,
+     "pcie_width": null,
+     "available": true
+    },
+    {
+     "name": "Tesla T10",
+     "vram_mib": 15360,
+     "pcie_gen": null,
+     "pcie_width": null,
+     "available": true
+    }
+   ]
+  },
+  {
+   "name": "cesarops2",
+   "gpus": [
+    {
+     "name": "AMD 0x73df",
+     "vram_mib": 12272,
+     "pcie_gen": null,
+     "pcie_width": null,
+     "available": true
+    }
+   ]
+  },
+  {
+   "name": "cesarops3",
+   "gpus": [
+    {
+     "name": "Quadro P1000",
+     "vram_mib": 4096,
+     "pcie_gen": null,
+     "pcie_width": null,
+     "available": true
+    }
+   ]
+  }
+ ],
+ "links": [],
+ "notes": [
+  "PLAN, not measured: the 2026-11-08 shed re-card from memory note shed-move-2026-11-08 (c4 5xP100+1070, t440 P100+P106, c1 Turing, c2 6700XT, c3 P1000)",
+  "c4: two x16->x8x8 bifurcation boards (4 P100 at x8), one P100 x16, the 1070 in an x8; Optane ~80 GB at ~3.5 GB/s RAID0 (memory note le-chonk-polystrata: 4x M10 ~3.5 GB/s) - the board is not installed yet",
+  "c1 SFP28 to t440 is planned; no link is described for it here (unknown, not guessed)"
+ ]
+}
