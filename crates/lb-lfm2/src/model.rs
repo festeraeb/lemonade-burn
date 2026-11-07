@@ -43,6 +43,9 @@ pub struct Lfm2 {
     /// Where a forward pass spent its time. Shared for the same reason as `stats`: the
     /// model runs on its own thread and the host has to be able to read this while it does.
     pub timings: Arc<Timings>,
+    /// Device copies for the device-resident decode, built on its first token.
+    #[cfg(feature = "gpu")]
+    pub(crate) dd: std::sync::Mutex<Option<crate::device_decode::Prep>>,
 }
 
 /// Cumulative wall time inside a forward pass, split at the one boundary that decides what
@@ -65,6 +68,11 @@ pub struct Timings {
     pub decode_forward_ns: AtomicU64,
     pub decode_matmul_ns: AtomicU64,
     pub decodes: AtomicU64,
+    /// Decode tokens that ran device-resident (`device_decode.rs`), their wall time, and the
+    /// single-token passes the knob asked for that went to the old path instead.
+    pub dd_tokens: AtomicU64,
+    pub dd_ns: AtomicU64,
+    pub dd_fallbacks: AtomicU64,
 }
 
 /// Mean ms per pass over the passes counted, split at the matmul boundary.
@@ -102,6 +110,13 @@ pub struct Cache {
     pub conv: Vec<Option<Tensor<2>>>,
     pub len: usize,
     pub cap: usize,
+    /// Positions the host tensors above are valid for. Equal to `len` except after
+    /// device-resident decode tokens, which advance only the device copy (`dev`); the next host
+    /// pass reads it back first (`device_decode::pull_if_stale`).
+    pub host_len: usize,
+    /// The device copy of this sequence's KV cache and conv state (device-resident decode).
+    #[cfg(feature = "gpu")]
+    pub dev: Option<crate::device_decode::DevCache>,
 }
 
 impl Lfm2 {
@@ -120,6 +135,8 @@ impl Lfm2 {
             stats: Arc::new(PlacementStats::default()),
             scraper: Arc::new(Scraper::from_env(&model_id)),
             timings: Arc::new(Timings::default()),
+            #[cfg(feature = "gpu")]
+            dd: std::sync::Mutex::new(None),
         })
     }
 
@@ -167,7 +184,16 @@ impl Lfm2 {
 
     pub fn new_cache(&self) -> Cache {
         let n = self.cfg().n_layer;
-        Cache { k: vec![None; n], v: vec![None; n], conv: vec![None; n], len: 0, cap: 0 }
+        Cache {
+            k: vec![None; n],
+            v: vec![None; n],
+            conv: vec![None; n],
+            len: 0,
+            cap: 0,
+            host_len: 0,
+            #[cfg(feature = "gpu")]
+            dev: None,
+        }
     }
 
     fn to_vec(t: Tensor<2>) -> Vec<f32> {
@@ -404,7 +430,7 @@ impl Lfm2 {
         self.linear(attn, o_w)
     }
 
-    fn ensure_cap(&self, cache: &mut Cache, need: usize) {
+    pub(crate) fn ensure_cap(&self, cache: &mut Cache, need: usize) {
         if need <= cache.cap {
             return;
         }
@@ -449,6 +475,24 @@ impl Lfm2 {
     }
 
     fn forward_inner(&self, tokens: &[u32], cache: &mut Cache, all_logits: bool) -> Tensor<2> {
+        // One decode token device-resident when asked and possible (see `device_decode.rs`);
+        // `None` means it declined and nothing changed, so the path below runs as before.
+        #[cfg(feature = "gpu")]
+        if tokens.len() == 1 && self.store.knobs.device_decode() {
+            if let Some(logits) = crate::device_decode::token(self, tokens[0], cache) {
+                return logits;
+            }
+        }
+        // a host pass after device tokens: bring the host's KV cache and conv state up first
+        #[cfg(feature = "gpu")]
+        crate::device_decode::pull_if_stale(self, cache);
+        let out = self.forward_host(tokens, cache, all_logits);
+        cache.host_len = cache.len;
+        out
+    }
+
+    /// The forward pass on Burn tensors with resident matmuls (the path before device decode).
+    fn forward_host(&self, tokens: &[u32], cache: &mut Cache, all_logits: bool) -> Tensor<2> {
         let cfg = self.cfg();
         let m = tokens.len();
         let pos0 = cache.len;

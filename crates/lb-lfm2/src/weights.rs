@@ -38,6 +38,11 @@ pub struct ExpertMats {
 }
 
 impl ExpertMats {
+    /// The whole stack as one matrix `[n * rows, cols]`: the experts are contiguous in the file.
+    pub fn all(&self) -> MatRef {
+        MatRef { ty: self.ty, rows: self.n * self.rows, cols: self.cols, start: self.start, len: self.n * self.per_expert }
+    }
+
     pub fn expert(&self, i: usize) -> MatRef {
         assert!(i < self.n);
         MatRef { ty: self.ty, rows: self.rows, cols: self.cols, start: self.start + i * self.per_expert, len: self.per_expert }

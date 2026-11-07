@@ -59,6 +59,11 @@ struct Args {
     /// them there (needs the `gpu` feature).
     #[arg(long, default_value_t = false)]
     gpu: bool,
+    /// LFM2 only, with `--gpu-budget-mb`: plan the experts as whole MoE layers in layer order
+    /// (`Placement::whole_layers`) instead of from scrapes: the residency a device-resident
+    /// decode can use on a card too small for every expert.
+    #[arg(long, default_value_t = false)]
+    whole_layers: bool,
     /// LFM2 only: what to do with an expert the router asked for that is not resident.
     /// `cpu` runs it on the CPU reference path; `on-demand` copies it to the device and
     /// runs it there, which measured 45.2 ms against about 4 ms a call on the 24B.
@@ -474,6 +479,12 @@ async fn placement_stats(State(st): State<Arc<AppState>>) -> Json<Value> {
             v[format!("{prefix}_matmul_ms")] = json!(r2(s.matmul_ms));
             v[format!("{prefix}_other_ms")] = json!(r2(s.other_ms));
         }
+        // device-resident decode: tokens that took it, their mean ms, and declined ones
+        let o = Ordering::Relaxed;
+        let n = tm.dd_tokens.load(o);
+        v["device_decode_tokens"] = json!(n);
+        v["device_decode_ms"] = json!(if n > 0 { r2(tm.dd_ns.load(o) as f64 / 1e6 / n as f64) } else { 0.0 });
+        v["device_decode_fallbacks"] = json!(tm.dd_fallbacks.load(o));
     }
     Json(v)
 }
@@ -525,7 +536,15 @@ fn main() -> Result<()> {
         let mut model = lb_lfm2::Lfm2::load(&args.model, &dev)?;
         let cfg = model.cfg().clone();
         model.store.knobs.set_miss_policy(lb_lfm2::moe::MissPolicy::parse(&args.miss_policy).map_err(|e| anyhow::anyhow!(e))?);
-        if let Some(dir) = &args.placement_from_scrapes {
+        if args.whole_layers {
+            let bytes: Vec<usize> = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).collect();
+            model.placement = lb_lfm2::moe::Placement::whole_layers(cfg.n_expert, &bytes, args.gpu_budget_mb * 1_000_000);
+            eprintln!("placement: {} experts in whole layers ({:.0} MB)", model.placement.n_resident(), model.placement.resident_bytes as f64 / 1e6);
+            if args.gpu {
+                let n = model.load_residents().map_err(|e| anyhow::anyhow!(e))?;
+                eprintln!("uploaded {n} experts ({:.0} MB) to the GPU", model.store.bytes as f64 / 1e6);
+            }
+        } else if let Some(dir) = &args.placement_from_scrapes {
             let scrapes = lb_lfm2::moe::read_scrape_dir(dir)?;
             let hist = lb_lfm2::moe::Histogram::from_scrapes("lfm2", cfg.n_layer, cfg.n_expert, &scrapes);
             let bytes: Vec<usize> = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).collect();

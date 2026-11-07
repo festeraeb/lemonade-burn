@@ -2,6 +2,8 @@
 //! See `docs/LFM2_CUBECL.md` for the architecture, kernels, placement and verification.
 pub mod config;
 pub mod dense;
+#[cfg(feature = "gpu")]
+pub mod device_decode;
 pub mod knobs;
 pub mod model;
 pub mod moe;

@@ -167,6 +167,33 @@ impl Placement {
         }
     }
 
+    /// Whole MoE layers, in layer order, until `budget_bytes` is spent: every expert of a
+    /// placed layer is resident and every expert of the others is not. This is the placement a
+    /// device-resident decode can use (its expert kernels need a layer's experts in one buffer,
+    /// `lb_q4_gpu::GpuExpertLayer`), and on a card too small for the model it is the honest
+    /// partial residency to test it with. Layers with no experts (`bytes_per_expert` 0) are
+    /// skipped; a layer that does not fit ends the plan, so the placed layers are a prefix.
+    pub fn whole_layers(n_expert: usize, bytes_per_expert: &[usize], budget_bytes: usize) -> Self {
+        let n_layer = bytes_per_expert.len();
+        let mut p = Self::all_cpu(n_layer, n_expert);
+        for (l, &b) in bytes_per_expert.iter().enumerate() {
+            if b == 0 {
+                continue;
+            }
+            if p.resident_bytes + b * n_expert > budget_bytes {
+                break;
+            }
+            p.homes[l] = vec![Home::Gpu; n_expert];
+            p.resident_bytes += b * n_expert;
+        }
+        p
+    }
+
+    /// Whether every expert of `layer` is planned resident (false for a layer without experts).
+    pub fn layer_whole(&self, layer: usize) -> bool {
+        self.homes.get(layer).is_some_and(|r| !r.is_empty() && r.iter().all(|h| *h == Home::Gpu))
+    }
+
     pub fn home(&self, layer: usize, expert: usize) -> Home {
         self.homes.get(layer).and_then(|r| r.get(expert)).copied().unwrap_or(Home::Cpu)
     }
@@ -266,6 +293,11 @@ pub struct ExpertStore {
     pub gpu: Option<lb_q4_gpu::Gpu>,
     #[cfg(feature = "gpu")]
     pub resident: HashMap<(usize, usize), lb_q4_gpu::GpuExpert>,
+    /// Layers whose experts are all resident as one stacked buffer per projection (see
+    /// [`expert_layers_enabled`]). Their entries in `resident` are views into these buffers,
+    /// so the per-expert path and the device-resident decode read the same device memory.
+    #[cfg(feature = "gpu")]
+    pub layers: HashMap<usize, lb_q4_gpu::GpuExpertLayer>,
     pub bytes: usize,
     /// The live settings (how to serve a miss, which upload path), shared with the host.
     pub knobs: std::sync::Arc<crate::knobs::Knobs>,
@@ -334,6 +366,16 @@ impl ExpertStore {
         let mut n = 0;
         for (l, layer) in w.layers.iter().enumerate() {
             let Ffn::Moe { gate, up, down, .. } = &layer.ffn else { continue };
+            if expert_layers_enabled() && placement.layer_whole(l) && !self.layers.contains_key(&l) && (0..gate.n).all(|e| !self.resident.contains_key(&(l, e))) {
+                let stack = lb_q4_gpu::GpuExpertLayer::upload_stacked(gpu, w.mat(&gate.all()), w.mat(&up.all()), w.mat(&down.all()), gate.n)?;
+                for e in 0..gate.n {
+                    self.resident.insert((l, e), stack.expert(gpu, e)?);
+                }
+                self.bytes += stack.bytes_on_device();
+                self.layers.insert(l, stack);
+                n += gate.n;
+                continue;
+            }
             for e in 0..gate.n {
                 if placement.home(l, e) != Home::Gpu || self.resident.contains_key(&(l, e)) {
                     continue;
@@ -353,6 +395,20 @@ impl ExpertStore {
     pub fn load(&mut self, _w: &Weights, _placement: &Placement) -> Result<usize, String> {
         Err("built without the `gpu` feature: experts cannot be made resident".to_string())
     }
+}
+
+/// Whether a MoE layer whose experts are all planned resident is uploaded as one stacked
+/// [`lb_q4_gpu::GpuExpertLayer`] (three buffers, per-expert views into them) instead of 64
+/// separate experts. `LB_EXPERT_LAYERS=1`/`0` decides; unset, it follows `LB_DEVICE_DECODE`,
+/// whose expert kernels need it, so the default (neither set) keeps the per-expert upload.
+///
+/// Read once: residency is fixed at load.
+pub fn expert_layers_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = |k: &str| std::env::var(k).ok().map(|v| !v.is_empty() && v != "0");
+        on("LB_EXPERT_LAYERS").or_else(|| on("LB_DEVICE_DECODE")).unwrap_or(false)
+    })
 }
 
 /// Executes an expert FFN for a batch of tokens. One SwiGLU expert:
@@ -718,6 +774,20 @@ mod tests {
         let dense = Placement::plan(&hist, &[100, 0, 100], 1000);
         assert_eq!(dense.home(1, 0), Home::Cpu);
         assert_eq!(dense.resident_bytes, 800);
+    }
+
+    #[test]
+    fn whole_layer_placement_is_a_prefix_of_whole_layers() {
+        // layer 0 dense (0 bytes), then four MoE layers of 3 experts x 100 bytes
+        let bytes = [0usize, 100, 100, 100, 100];
+        let p = Placement::whole_layers(3, &bytes, 700);
+        assert_eq!(p.resident_bytes, 600, "two whole layers fit in 700; a third would need 900");
+        assert!(!p.layer_whole(0), "a dense layer is never whole");
+        assert!(p.layer_whole(1) && p.layer_whole(2));
+        assert!(!p.layer_whole(3) && !p.layer_whole(4));
+        assert_eq!(p.home(3, 0), Home::Cpu, "no partial layer: the leftover budget stays unspent");
+        assert_eq!(Placement::whole_layers(3, &bytes, 10_000).n_resident(), 12);
+        assert_eq!(Placement::whole_layers(3, &bytes, 299).n_resident(), 0);
     }
 
     #[test]

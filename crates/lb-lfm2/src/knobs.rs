@@ -18,6 +18,21 @@ pub struct Knobs {
     host_repack: AtomicBool,
     /// Upload a miss's three matrices as one batch (A/B switch for the per-matrix path).
     batch_miss: AtomicBool,
+    /// Run a decode token device-resident (`device_decode.rs`): one upload, one read-back.
+    /// `LB_DEVICE_DECODE=1` at start; off by default.
+    device_decode: AtomicBool,
+    /// Inside a device-resident token, run a MoE layer whose experts are not all resident on
+    /// the host path (one extra sync for that layer) instead of giving the whole token to the
+    /// old path. `LB_DD_HOST_MOE=1` at start; off by default (the plan's rule: a token takes
+    /// the device path only when everything it needs is resident).
+    dd_host_moe: AtomicBool,
+    /// Router logits as one sequential dot per expert (the host's summation order) instead
+    /// of a plane reduce: slower, for parity checks. `LB_DD_ROUTER_SEQ=1`; off by default.
+    dd_router_seq: AtomicBool,
+}
+
+fn env_on(k: &str) -> bool {
+    std::env::var(k).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
 }
 
 impl Default for Knobs {
@@ -26,6 +41,9 @@ impl Default for Knobs {
             miss_policy: AtomicU8::new(MissPolicy::Cpu as u8),
             host_repack: AtomicBool::new(std::env::var_os("LB_HOST_REPACK").is_some()),
             batch_miss: AtomicBool::new(std::env::var_os("LB_NO_BATCH_MISS").is_none()),
+            device_decode: AtomicBool::new(env_on("LB_DEVICE_DECODE")),
+            dd_host_moe: AtomicBool::new(env_on("LB_DD_HOST_MOE")),
+            dd_router_seq: AtomicBool::new(env_on("LB_DD_ROUTER_SEQ")),
         }
     }
 }
@@ -57,6 +75,30 @@ impl Knobs {
     pub fn set_batch_miss(&self, on: bool) {
         self.batch_miss.store(on, Ordering::Relaxed);
     }
+
+    pub fn device_decode(&self) -> bool {
+        self.device_decode.load(Ordering::Relaxed)
+    }
+
+    pub fn set_device_decode(&self, on: bool) {
+        self.device_decode.store(on, Ordering::Relaxed);
+    }
+
+    pub fn dd_host_moe(&self) -> bool {
+        self.dd_host_moe.load(Ordering::Relaxed)
+    }
+
+    pub fn set_dd_host_moe(&self, on: bool) {
+        self.dd_host_moe.store(on, Ordering::Relaxed);
+    }
+
+    pub fn dd_router_seq(&self) -> bool {
+        self.dd_router_seq.load(Ordering::Relaxed)
+    }
+
+    pub fn set_dd_router_seq(&self, on: bool) {
+        self.dd_router_seq.store(on, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -77,5 +119,24 @@ mod tests {
         let h = k.host_repack();
         k.set_host_repack(!h);
         assert_eq!(k.host_repack(), !h);
+        for (get, set) in [
+            (Knobs::device_decode as fn(&Knobs) -> bool, Knobs::set_device_decode as fn(&Knobs, bool)),
+            (Knobs::dd_host_moe, Knobs::set_dd_host_moe),
+            (Knobs::dd_router_seq, Knobs::set_dd_router_seq),
+        ] {
+            let b = get(&k);
+            set(&k, !b);
+            assert_eq!(get(&k), !b);
+            set(&k, b);
+        }
+    }
+
+    #[test]
+    fn device_decode_is_off_unless_asked() {
+        // the test environment does not set LB_DEVICE_DECODE: the default must keep the old path
+        if std::env::var_os("LB_DEVICE_DECODE").is_none() {
+            assert!(!Knobs::default().device_decode());
+        }
+        assert!(!env_on("LB_SURELY_UNSET_FOR_THIS_TEST"));
     }
 }

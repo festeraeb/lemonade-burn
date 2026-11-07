@@ -82,6 +82,9 @@ enum Change {
     MissPolicy(MissPolicy),
     HostRepack(bool),
     BatchMiss(bool),
+    DeviceDecode(bool),
+    DdHostMoe(bool),
+    DdRouterSeq(bool),
     ScrapeDir(Option<PathBuf>),
     ScrapeModelId(String),
     ScrapeClassId(String),
@@ -124,6 +127,7 @@ impl Tunables {
             Fixed { name: "no_pinned", value: env_flag("LB_NO_PINNED"), ty: "bool", source: "LB_NO_PINNED", description: "no pinned staging pool: host repacks upload from pageable memory" },
             Fixed { name: "q4_cube", value: env("LB_Q4_CUBE"), ty: "int", source: "LB_Q4_CUBE", description: "units per cube for the Q4_0 matvec kernels (default: two planes)" },
             Fixed { name: "no_plane", value: env_flag("LB_NO_PLANE"), ty: "bool", source: "LB_NO_PLANE", description: "reduce with a shared-memory tree instead of plane_sum" },
+            Fixed { name: "expert_layers", value: env("LB_EXPERT_LAYERS"), ty: "bool", source: "LB_EXPERT_LAYERS (unset: follows LB_DEVICE_DECODE)", description: "upload a MoE layer whose experts are all planned resident as one stacked buffer per projection (per-expert views into it); the device-resident decode needs it" },
             Fixed { name: "conv_block", value: env_flag("LB_CONV_BLOCK"), ty: "bool", source: "LB_CONV_BLOCK", description: "whole short-conv blocks resident on the device (off by default; measured slower)" },
             Fixed { name: "repack_scalar", value: env_flag("LB_REPACK_SCALAR"), ty: "bool", source: "LB_REPACK_SCALAR", description: "host repack with the scalar loop instead of SSSE3" },
             Fixed { name: "no_batch_miss_at_start", value: env_flag("LB_NO_BATCH_MISS"), ty: "bool", source: "LB_NO_BATCH_MISS", description: "the start value of the live knob batch_miss" },
@@ -143,6 +147,12 @@ impl Tunables {
                 "description": "repack a miss's Q4_0 blocks on the host (pinned pool) instead of on the device from the page-locked mapping; no effect without the cuda runtime and a registered mapping"}));
             v.push(json!({"name": "batch_miss", "value": k.batch_miss(), "type": "bool", "scope": "live", "source": "LB_NO_BATCH_MISS (inverted)",
                 "description": "upload a miss's three matrices in three device calls (one create, one allocation, one repack) instead of twelve; cuda + registered mapping only"}));
+            v.push(json!({"name": "device_decode", "value": k.device_decode(), "type": "bool", "scope": "live", "source": "LB_DEVICE_DECODE",
+                "description": "run a decode token device-resident (one upload, one read-back) when every dense matrix, the head and every MoE layer (as a stacked layer) is resident; otherwise the token takes the old path"}));
+            v.push(json!({"name": "dd_host_moe", "value": k.dd_host_moe(), "type": "bool", "scope": "live", "source": "LB_DD_HOST_MOE",
+                "description": "inside a device-resident token, run a MoE layer that is not resident on the host path (one sync for that layer) instead of giving the whole token to the old path"}));
+            v.push(json!({"name": "dd_router_seq", "value": k.dd_router_seq(), "type": "bool", "scope": "live", "source": "LB_DD_ROUTER_SEQ",
+                "description": "device router logits as one sequential dot per expert (the host's summation order) instead of a plane reduce; slower, for parity checks"}));
         }
         if let Some(s) = &self.live.scraper {
             v.push(json!({"name": "scrape_dir", "value": s.dir().map(|p| p.to_string_lossy().into_owned()), "type": "path|null", "scope": "live", "source": "NAUTIBURN_SCRAPE_DIR",
@@ -184,6 +194,18 @@ impl Tunables {
             "batch_miss" => {
                 knobs.ok_or_else(not_lfm2)?;
                 as_bool(value).map(Change::BatchMiss)
+            }
+            "device_decode" => {
+                knobs.ok_or_else(not_lfm2)?;
+                as_bool(value).map(Change::DeviceDecode)
+            }
+            "dd_host_moe" => {
+                knobs.ok_or_else(not_lfm2)?;
+                as_bool(value).map(Change::DdHostMoe)
+            }
+            "dd_router_seq" => {
+                knobs.ok_or_else(not_lfm2)?;
+                as_bool(value).map(Change::DdRouterSeq)
             }
             "scrape_dir" => {
                 scraper.ok_or_else(not_lfm2)?;
@@ -235,6 +257,18 @@ impl Tunables {
                 }
                 Change::BatchMiss(b) => {
                     self.live.knobs.as_ref().expect("validated").set_batch_miss(b);
+                    json!(b)
+                }
+                Change::DeviceDecode(b) => {
+                    self.live.knobs.as_ref().expect("validated").set_device_decode(b);
+                    json!(b)
+                }
+                Change::DdHostMoe(b) => {
+                    self.live.knobs.as_ref().expect("validated").set_dd_host_moe(b);
+                    json!(b)
+                }
+                Change::DdRouterSeq(b) => {
+                    self.live.knobs.as_ref().expect("validated").set_dd_router_seq(b);
                     json!(b)
                 }
                 Change::ScrapeDir(d) => {
@@ -296,7 +330,10 @@ mod tests {
         assert_eq!(entry(&d, "gpu_budget_mb")["value"], 14500);
         assert_eq!(entry(&d, "gpu_budget_mb")["scope"], "restart");
         assert_eq!(entry(&d, "threads")["value"], 80);
-        for live in ["miss_policy", "host_repack", "batch_miss", "scrape_dir", "scrape_model_id", "scrape_class_id", "default_max_tokens"] {
+        if std::env::var_os("LB_DEVICE_DECODE").is_none() {
+            assert_eq!(entry(&d, "device_decode")["value"], false, "off unless asked");
+        }
+        for live in ["miss_policy", "host_repack", "batch_miss", "device_decode", "dd_host_moe", "dd_router_seq", "scrape_dir", "scrape_model_id", "scrape_class_id", "default_max_tokens"] {
             assert_eq!(entry(&d, live)["scope"], "live", "{live}");
         }
         for fixed in ["model", "gpu", "gpu_dense_mb", "placement_from_scrapes", "ctx", "cuda_device", "wgpu_device", "no_register", "pinned_pool_mb", "q4_cube", "conv_block"] {
@@ -308,7 +345,7 @@ mod tests {
     fn live_knobs_change_and_show_the_new_value() {
         let (t, knobs, scraper) = lfm2_tunables();
         let req: Map<String, Value> = serde_json::from_value(json!({
-            "miss_policy": "on-demand", "host_repack": true, "batch_miss": false,
+            "miss_policy": "on-demand", "host_repack": true, "batch_miss": false, "device_decode": true, "dd_host_moe": true,
             "scrape_dir": "/tmp/scr", "scrape_class_id": "live-test", "default_max_tokens": 64
         }))
         .unwrap();
@@ -318,6 +355,7 @@ mod tests {
         assert_eq!(knobs.miss_policy(), MissPolicy::OnDemand);
         assert!(knobs.host_repack());
         assert!(!knobs.batch_miss());
+        assert!(knobs.device_decode() && knobs.dd_host_moe());
         assert_eq!(scraper.dir(), Some(PathBuf::from("/tmp/scr")));
         assert_eq!(scraper.class_id(), "live-test");
         let d = t.describe();
@@ -349,6 +387,7 @@ mod tests {
         for (req, status) in [
             (json!({"miss_policy": "sometimes"}), 400),
             (json!({"host_repack": "yes"}), 400),
+            (json!({"device_decode": 1}), 400),
             (json!({"default_max_tokens": 0}), 400),
             (json!({"default_max_tokens": 4096}), 400),
             (json!({"scrape_dir": 7}), 400),

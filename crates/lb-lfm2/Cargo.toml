@@ -24,3 +24,6 @@ serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ureq = { version = "2", features = ["json"] }
+# lfm2-check --tokenizer (already in the workspace for lb-model; no new crate)
+tokenizers.workspace = true
+sha2.workspace = true
