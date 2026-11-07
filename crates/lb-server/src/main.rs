@@ -2,7 +2,9 @@
 //!
 //! Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (blocking and
 //! SSE), `POST /v1/completions` (blocking and SSE), `GET /api/v1/topology` (single-node
-//! description, so the lemonade bridge's topology proxy has something to return).
+//! description, so the lemonade bridge's topology proxy has something to return),
+//! `GET /v1/placement` (where expert calls went), `GET`/`POST /v1/tunables` (every knob the
+//! engine reads; the live ones change without a restart, see `tunables.rs`).
 //!
 //! The model runs on one dedicated worker thread (it uses the rayon pool internally);
 //! requests are served in arrival order. A client disconnect stops its generation.
@@ -29,12 +31,16 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 pub const RUNTIME_NAME: &str = "lemonade-burn";
+
+pub mod tunables;
+use tunables::{LiveTargets, Tunables};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "lemonade-burn-server")]
@@ -100,7 +106,8 @@ enum Gen {
 struct AppState {
     model_id: String,
     ctx: usize,
-    default_max_tokens: usize,
+    /// Live (`/v1/tunables`): `max_tokens` for a request that gives none.
+    default_max_tokens: Arc<AtomicUsize>,
     codec: Arc<TextCodec>,
     jobs: std_mpsc::Sender<Job>,
     started: u64,
@@ -295,7 +302,7 @@ impl AppState {
         if prompt.len() >= self.ctx {
             return Err(err(StatusCode::BAD_REQUEST, format!("prompt has {} tokens; context is {}", prompt.len(), self.ctx)));
         }
-        let max_tokens = req.max_tokens.unwrap_or(self.default_max_tokens).min(self.ctx - prompt.len());
+        let max_tokens = req.max_tokens.unwrap_or_else(|| self.default_max_tokens.load(Ordering::Relaxed)).min(self.ctx - prompt.len());
         let stop = match &req.stop {
             Some(Value::String(s)) => vec![s.clone()],
             Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
@@ -471,6 +478,30 @@ async fn placement_stats(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(v)
 }
 
+async fn get_tunables(State(t): State<Arc<Tunables>>) -> Json<Value> {
+    Json(t.describe())
+}
+
+/// Change live knobs: `{"name": value, ...}`. All or nothing; a restart-only knob answers
+/// 409 with the flag to use, a bad value or unknown name 400, and in either case nothing moved.
+async fn post_tunables(State(t): State<Arc<Tunables>>, Json(req): Json<Value>) -> Response {
+    let Some(map) = req.as_object() else {
+        return err(StatusCode::BAD_REQUEST, "body must be an object of {\"name\": value}");
+    };
+    if map.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "nothing to change (GET /v1/tunables lists the knobs)");
+    }
+    match t.apply(map) {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => (StatusCode::from_u16(r.status()).unwrap_or(StatusCode::BAD_REQUEST), Json(json!({"error": {"message": r.message(), "type": "tunable_error"}}))).into_response(),
+    }
+}
+
+/// The `/v1/tunables` routes, with their own state so they can be served (and tested) apart.
+fn tunables_router(t: Arc<Tunables>) -> Router {
+    Router::new().route("/v1/tunables", get(get_tunables).post(post_tunables)).with_state(t)
+}
+
 async fn topology(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "schema": "lemonade-burn.topology.v1",
@@ -488,11 +519,12 @@ fn main() -> Result<()> {
     let dev = Device::flex();
     let is_gguf = args.model.extension().map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false);
     let (jtx, jrx) = std_mpsc::channel::<Job>();
-    type Loaded = (Arc<TextCodec>, usize, String, &'static str, Option<Arc<lb_lfm2::moe::PlacementStats>>, Option<Arc<lb_lfm2::model::Timings>>);
-    let (codec, ctx, model_id, kernel, placement, timings): Loaded = if is_gguf {
+    let default_max_tokens = Arc::new(AtomicUsize::new(args.default_max_tokens));
+    type Loaded = (Arc<TextCodec>, usize, String, &'static str, Option<Arc<lb_lfm2::moe::PlacementStats>>, Option<Arc<lb_lfm2::model::Timings>>, LiveTargets);
+    let (codec, ctx, model_id, kernel, placement, timings, live): Loaded = if is_gguf {
         let mut model = lb_lfm2::Lfm2::load(&args.model, &dev)?;
         let cfg = model.cfg().clone();
-        model.store.miss = lb_lfm2::moe::MissPolicy::parse(&args.miss_policy).map_err(|e| anyhow::anyhow!(e))?;
+        model.store.knobs.set_miss_policy(lb_lfm2::moe::MissPolicy::parse(&args.miss_policy).map_err(|e| anyhow::anyhow!(e))?);
         if let Some(dir) = &args.placement_from_scrapes {
             let scrapes = lb_lfm2::moe::read_scrape_dir(dir)?;
             let hist = lb_lfm2::moe::Histogram::from_scrapes("lfm2", cfg.n_layer, cfg.n_expert, &scrapes);
@@ -525,19 +557,32 @@ fn main() -> Result<()> {
         let kernel = model.kernel_name();
         let stats = model.stats.clone();
         let tm = model.timings.clone();
+        let live = LiveTargets { knobs: Some(model.knobs()), scraper: Some(model.scraper.clone()), default_max_tokens: default_max_tokens.clone(), ctx };
         let wc = codec.clone();
         std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
-        (codec, ctx, model_id, kernel, Some(stats), Some(tm))
+        (codec, ctx, model_id, kernel, Some(stats), Some(tm), live)
     } else {
         let model = BitNet::load(&args.model, &dev)?;
         let codec = Arc::new(TextCodec::load(&args.model, model.cfg.bos_token_id)?);
         let ctx = args.ctx.min(model.cfg.max_position_embeddings);
         let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "bitnet".into()));
         let kernel = model.kernel_name();
+        let live = LiveTargets { knobs: None, scraper: None, default_max_tokens: default_max_tokens.clone(), ctx };
         let wc = codec.clone();
         std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
-        (codec, ctx, model_id, kernel, None, None)
+        (codec, ctx, model_id, kernel, None, None, live)
     };
+    let fixed = Tunables::fixed_from_start(
+        &args.model.to_string_lossy(),
+        args.gpu,
+        args.gpu_budget_mb,
+        args.gpu_dense_mb,
+        args.placement_from_scrapes.as_deref().map(|p| p.to_str().unwrap_or("")),
+        ctx,
+        rayon::current_num_threads(),
+        &model_id,
+    );
+    let tunables = Arc::new(Tunables::new(live, fixed));
     eprintln!(
         "lemonade-burn-server: loaded {} in {:.1}s (kernel {}, {} threads, ctx {ctx})",
         model_id,
@@ -548,7 +593,7 @@ fn main() -> Result<()> {
     let state = Arc::new(AppState {
         model_id,
         ctx,
-        default_max_tokens: args.default_max_tokens,
+        default_max_tokens,
         codec,
         jobs: jtx,
         started: now(),
@@ -565,7 +610,8 @@ fn main() -> Result<()> {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(completions))
         .route("/api/v1/topology", get(topology))
-        .with_state(state);
+        .with_state(state)
+        .merge(tunables_router(tunables));
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     rt.block_on(async move {
         let addr = format!("{}:{}", args.host, args.port);
@@ -584,4 +630,66 @@ fn main() -> Result<()> {
             .await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod http_tests {
+    //! The routes end to end through the router (no model, no listener).
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn router() -> (Router, Arc<lb_lfm2::Knobs>) {
+        let knobs = Arc::new(lb_lfm2::Knobs::default());
+        let scraper = Arc::new(lb_lfm2::moe::Scraper::new(None, "m".into(), "c".into()));
+        let live = LiveTargets { knobs: Some(knobs.clone()), scraper: Some(scraper), default_max_tokens: Arc::new(AtomicUsize::new(512)), ctx: 2048 };
+        let fixed = Tunables::fixed_from_start("/m/x.gguf", true, 14500, 900, None, 2048, 80, "x");
+        (tunables_router(Arc::new(Tunables::new(live, fixed))), knobs)
+    }
+
+    async fn call(app: &Router, method: &str, body: Option<Value>) -> (u16, Value) {
+        let req = match body {
+            Some(b) => Request::builder().method(method).uri("/v1/tunables").header("content-type", "application/json").body(Body::from(b.to_string())).unwrap(),
+            None => Request::builder().method(method).uri("/v1/tunables").body(Body::empty()).unwrap(),
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn get_lists_and_post_changes_live_knobs() {
+        let (app, knobs) = router();
+        let (status, v) = call(&app, "GET", None).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = v["tunables"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"miss_policy") && names.contains(&"gpu_budget_mb") && names.contains(&"batch_miss"), "{names:?}");
+
+        let (status, v) = call(&app, "POST", Some(json!({"miss_policy": "on-demand", "batch_miss": false}))).await;
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["applied"]["miss_policy"], "on-demand");
+        assert_eq!(knobs.miss_policy(), lb_lfm2::moe::MissPolicy::OnDemand);
+        assert!(!knobs.batch_miss());
+        let (_, v) = call(&app, "GET", None).await;
+        let e = v["tunables"].as_array().unwrap().iter().find(|e| e["name"] == "miss_policy").unwrap();
+        assert_eq!(e["value"], "on-demand");
+    }
+
+    #[tokio::test]
+    async fn post_refuses_restart_only_with_409_and_the_flag() {
+        let (app, knobs) = router();
+        let (status, v) = call(&app, "POST", Some(json!({"gpu_budget_mb": 3200, "miss_policy": "on-demand"}))).await;
+        assert_eq!(status, 409, "{v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("--gpu-budget-mb"), "{v}");
+        assert_eq!(knobs.miss_policy(), lb_lfm2::moe::MissPolicy::Cpu, "nothing in a refused post is applied");
+        let (status, _) = call(&app, "POST", Some(json!({"no_such_knob": 1}))).await;
+        assert_eq!(status, 400);
+        let (status, _) = call(&app, "POST", Some(json!({}))).await;
+        assert_eq!(status, 400);
+        let (status, _) = call(&app, "POST", Some(json!([1, 2]))).await;
+        assert_eq!(status, 400);
+    }
 }

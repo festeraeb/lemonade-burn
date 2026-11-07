@@ -783,3 +783,95 @@ per call whatever the size (the 196 KB `sc` upload costs what the 1.57 MB `qs` o
 `create` per expert (gate/up/down are separate tensors, so that needs a gather on the host or
 three-handle kernels) or a batched write in CubeCL would take a miss toward the 0.47 ms of
 pure bus time; and layer-ahead prefetch (stage 5) now has a 0.28 ms miss to hide instead of 1.1.
+
+## c4 is the measurement host now; the llama.cpp gap on the same model and card (Fable, 2026-11-04)
+
+**Host change.** c2's P100s went to forge seats, so lemonade-burn measures on **cesarops4om GPU 3**
+(Tesla P100-PCIE-16GB, bus AF:00.0, Gen3 x16; `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3
+LB_CUDA_DEVICE=0`). Everything local under `/mnt/models/lb-measure/` (`models/`, `bin/`, `lib/`
+= CUDA 12.8 nvrtc from c2, `scrapes/`, `c4_e2e.sh`, `c4_llama.sh`). c4 is a shared box: the `kat`
+seat on GPU 0, `injector-qwen35` on GPU 2 and the CPU-only `flint` seat (40 threads, bursts) run
+beside these numbers, which is why load is printed with every one. Load 2-3 idle, 7-12 while
+flint answers the forge; the lemonade-burn server itself runs 80 rayon threads here.
+
+**Step 1: where we stand against llama.cpp, like for like.** Same GGUF
+(`LFM2.5-24B-A2B-QAD-Q4_0`, 13.58 GB), same card, same prompt, 32 greedy tokens through each
+server's `/v1/completions`, two interleaved rounds, 5 timed completions a round after one warmup.
+llama.cpp is the fleet's own build (`20261027-nautiburn-flint-cuda12.8-sm60_61_75_86-cpuall`,
+`-ngl 99 -fa on -c 2048`, 13.36 GB on the card). lemonade-burn is HEAD `eec4500` (cuda feature).
+
+| engine, config | decode tok/s, round 1 | round 2 | prefill s | load (1 min) | greedy sha |
+|---|---|---|---|---|---|
+| **llama.cpp**, all layers on the card | 66.16 / 66.21 / 66.17 / 66.21 / 66.18 | 66.73 / 66.73 / 66.70 / 66.73 / 66.72 | 0.209 | 2.4-2.5, 8.0 | `136ea2355506fcef` x10 |
+| **lemonade-burn**, all 2432 experts + 751 MB dense resident (`--gpu-budget-mb 14500 --gpu-dense-mb 900`) | 18.37 / 22.50 / **27.68** / 22.67 / 24.27 | 18.21 / 17.93 / 18.69 / 18.75 / 18.79 | 0.55-0.65 | 2.2-2.8, 6.5-6.8 | `062392b8d2b0361a` x10 |
+| lemonade-burn, 602 residents, misses copied in (`3200/600 --miss-policy on-demand`) | 7.93 / 7.74 / 7.65 | 7.91 / 7.66 / 8.04 | 1.14-1.18 | 2.9-9.2, 10-11 | `062392b8d2b0361a` x6 |
+
+So on this model **llama.cpp decodes 66.2-66.7 tok/s against lemonade-burn's 18-19 (3.5x), or
+18-28 in a round where the box was quieter** (round 1's 27.7 is a single completion; round 2 at
+load 6.5-6.8 held 17.9-18.8 with a 1.05x spread, which is the number to quote). The two engines'
+greedy texts share the first 60+ characters and diverge later (different f32 summation order in
+the kernels: sha differs, both self-consistent across every rep). Per decode token lemonade-burn
+reports 48.4-54.4 ms forward of which 41.8-46.5 ms is "matmul" time (`/v1/placement`): with
+every expert resident that is the 411 dispatches + 145 syncs of the audit above, not the misses.
+The on-demand config costs 131 ms a token, of which `on_demand_s` says 4.16 s / 12620 misses =
+**0.33 ms a miss** on this card (0.28 on c2's slot).
+
+Caveat for the KAT/Gemma numbers in the task brief (31.7 and 24.6 tok/s): those are different,
+larger-active models (A3B / A4B); this table is the only like-for-like pair we have.
+
+**Miss floor on c4 before any change** (`miss_bench`, HEAD build, GPU 3, 3 runs, load 1.95-2.0):
+
+| per expert, ms (median of 30 after 40 warm) | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| device path, whole (3 `create`s + 6 `empty`s + 3 repack launches + sync) | 0.927 / 0.960 (rep2) | 0.946 / 0.959 | 0.947 / 0.925 |
+| device DMA alone (3 raw `create`s + sync) | 0.843 | 0.704 | 0.812 |
+| host path, whole | 1.843 / 2.003 | 1.947 / 2.112 | 1.981 / 1.988 |
+| host repack alone | 0.471 | 0.443 | 0.555 |
+| host DMA alone (6 pool `create`s) | 0.896 | 0.885 | 0.916 |
+
+c4's slot moves 5.3 MB in 0.70-0.84 ms (6.3-7.5 GB/s) against c2's 0.59 (9.0 GB/s), same Gen3
+x16: a slower root complex on this box. The whole minus the DMA leaves **~0.12-0.24 ms** for the
+nine remaining calls, which is the most the create-count lever can return here. Run-to-run
+spread of the device whole: 0.925-0.960 (3.8%).
+
+**Gate for the create-count change, written before the run:** (a) the parity check in
+`miss_bench` passes (batched words == per-matrix words, batched expert output == per-matrix
+output, bit for bit); (b) `device_batched_whole` is below `device_whole` by at least 0.08 ms
+(twice the spread) in each of three runs, both arms interleaved inside the same run; (c) greedy
+sha `062392b8d2b0361a` in every e2e completion, both arms, on-demand and all-resident configs;
+(d) e2e `on_demand_s` per miss no worse than the per-matrix arm. Anything short of all four is
+reported as not passing.
+
+### Step 2, the create-count lever: built, parity passes, the miss gets 2-7% faster, which is under the gate
+
+**What was built** (`lb-q4-gpu` `store.rs`, cuda feature): `Gpu::upload_expert_batched` serves a
+miss's three matrices with **three** device calls instead of twelve: one `client.create_tensors`
+DMAs the three raw slices out of the page-locked mapping into one allocation (three
+`memcpy_htod_async` on the stream, one submission), one `client.empty_tensors` reserves the packed
+`qs`/`sc` words of all three, and one `q4_0_repack_kernel` launch covers the lot when the
+allocator placed the raw slices back to back (it does: 1,769,472-byte slices, 256-aligned; three
+launches otherwise). Each `GpuQ4Mat` then owns an offset view (`Handle::offset_start/offset_end`)
+of the shared buffers. `GpuExpert::upload` takes it when the bytes are registered, the block
+counts are equal and even, and neither `LB_HOST_REPACK` nor `LB_NO_BATCH_MISS` is set; residents
+at load go through the same call. `miss_bench` grew `device_batched_*` sections and a parity
+check (batched words == per-matrix words for gate/up/down, and the same expert run on the same
+input gives bit-identical output).
+
+**Measured, c4 GPU 3, `miss_bench` new build, three runs, both arms interleaved in each run
+(medians of 30 after 40 warm, ms per expert; load 2.8-5.3):**
+
+| run | batched, whole | per-matrix, whole | diff | batched rep2 | per-matrix rep2 | diff | DMA alone | parity |
+|---|---|---|---|---|---|---|---|---|
+| 1 | **0.909** | 0.928 | -0.019 | **0.890** | 0.961 | -0.071 | 0.724 | ok |
+| 2 | **0.914** | 0.937 | -0.023 | **0.809** | 0.835 | -0.026 | 0.718 | ok |
+| 3 | **0.915** | 0.948 | -0.033 | **0.774** | 0.798 | -0.024 | 0.706 | ok |
+
+Batched is lower in **6 of 6** interleaved pairs, by 0.019-0.071 ms (2-7%). The gate asked for
+0.08 ms in every run; **it does not pass (b)**. (a) passes. Reading: nine of the twelve calls
+were cheap; the cost that is not bus time (whole minus DMA alone: 0.17-0.24 ms) stays, so it
+is not the call count. Candidates for that remainder, unmeasured: the allocation (the memory
+pool's reserve for a fresh 5.3 MB + 4.2 MB on every miss, released after the sync), the three
+separate `memcpy_htod_async` (each a driver round trip even inside one submission), and the
+drop of the raw buffer. A true single copy would need the three slices contiguous in the file,
+which gate/up/down are not. The path stays in as the default because it is never slower and
+the parity is proven, with `LB_NO_BATCH_MISS=1` / the live `batch_miss` knob as the switch back.

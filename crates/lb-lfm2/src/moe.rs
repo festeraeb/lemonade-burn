@@ -231,12 +231,13 @@ impl PlacementStats {
 /// a 45 ms CPU call for a roughly 4 ms one. `Cpu` stays the default because it is the only
 /// policy that needs no free VRAM and no device at all.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum MissPolicy {
     /// Run the miss on the CPU reference path.
     #[default]
-    Cpu,
+    Cpu = 0,
     /// Upload the expert to the device, run it there, release it after the readback.
-    OnDemand,
+    OnDemand = 1,
 }
 
 impl MissPolicy {
@@ -246,6 +247,14 @@ impl MissPolicy {
             "cpu" => Ok(Self::Cpu),
             "on-demand" | "ondemand" => Ok(Self::OnDemand),
             other => Err(format!("unknown miss policy {other:?} (expected cpu or on-demand)")),
+        }
+    }
+
+    /// The `--miss-policy` spelling of this value.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::OnDemand => "on-demand",
         }
     }
 }
@@ -258,11 +267,16 @@ pub struct ExpertStore {
     #[cfg(feature = "gpu")]
     pub resident: HashMap<(usize, usize), lb_q4_gpu::GpuExpert>,
     pub bytes: usize,
-    /// How to serve an expert that is not resident.
-    pub miss: MissPolicy,
+    /// The live settings (how to serve a miss, which upload path), shared with the host.
+    pub knobs: std::sync::Arc<crate::knobs::Knobs>,
 }
 
 impl ExpertStore {
+    /// How to serve an expert that is not resident (live: `knobs`).
+    pub fn miss(&self) -> MissPolicy {
+        self.knobs.miss_policy()
+    }
+
     pub fn is_resident(&self, layer: usize, expert: usize) -> bool {
         #[cfg(feature = "gpu")]
         {
@@ -324,7 +338,9 @@ impl ExpertStore {
                 if placement.home(l, e) != Home::Gpu || self.resident.contains_key(&(l, e)) {
                     continue;
                 }
-                let ex = lb_q4_gpu::GpuExpert::upload(gpu, w.mat(&gate.expert(e)), w.mat(&up.expert(e)), w.mat(&down.expert(e)))?;
+                // residents take the per-matrix path: the batched one costs device memory the
+                // all-resident config does not have (see `GpuExpert::upload_per_matrix`)
+                let ex = lb_q4_gpu::GpuExpert::upload_per_matrix(gpu, w.mat(&gate.expert(e)), w.mat(&up.expert(e)), w.mat(&down.expert(e)))?;
                 self.bytes += ex.bytes_on_device();
                 self.resident.insert((l, e), ex);
                 n += 1;
@@ -401,7 +417,7 @@ pub fn moe_ffn(
     // and released after the readback, so this needs an expert's worth of free VRAM per
     // concurrent miss and nothing else.
     #[cfg(feature = "gpu")]
-    let od_part: Vec<(usize, Vec<(usize, f32)>)> = if store.miss == MissPolicy::OnDemand && store.gpu.is_some() { std::mem::take(&mut cpu_part) } else { Vec::new() };
+    let od_part: Vec<(usize, Vec<(usize, f32)>)> = if store.miss() == MissPolicy::OnDemand && store.gpu.is_some() { std::mem::take(&mut cpu_part) } else { Vec::new() };
     stats.cpu_calls.fetch_add(cpu_part.len() as u64, Ordering::Relaxed);
 
     // Resident experts: launch everything first (asynchronous), read back after the CPU work.
@@ -552,29 +568,62 @@ pub struct Scrape {
 /// Collects routes during a forward pass and writes a scrape file per request when
 /// `NAUTIBURN_SCRAPE_DIR` is set (`NAUTIBURN_MODEL_ID`, `NAUTIBURN_CLASS_ID` optional).
 pub struct Scraper {
-    dir: Option<PathBuf>,
-    model_id: String,
-    class_id: String,
+    /// Where files go; `None` disables recording. Live: the server can point it elsewhere or
+    /// switch it off between requests.
+    dir: Mutex<Option<PathBuf>>,
+    model_id: Mutex<String>,
+    class_id: Mutex<String>,
     seq: AtomicU64,
     pending: Mutex<Vec<Activation>>,
 }
 
 impl Scraper {
     pub fn from_env(default_model_id: &str) -> Self {
-        Self {
-            dir: std::env::var_os("NAUTIBURN_SCRAPE_DIR").map(PathBuf::from),
-            model_id: std::env::var("NAUTIBURN_MODEL_ID").unwrap_or_else(|_| default_model_id.to_string()),
-            class_id: std::env::var("NAUTIBURN_CLASS_ID").unwrap_or_else(|_| "lb-lfm2".to_string()),
-            seq: AtomicU64::new(0),
-            pending: Mutex::new(Vec::new()),
-        }
+        Self::new(
+            std::env::var_os("NAUTIBURN_SCRAPE_DIR").map(PathBuf::from),
+            std::env::var("NAUTIBURN_MODEL_ID").unwrap_or_else(|_| default_model_id.to_string()),
+            std::env::var("NAUTIBURN_CLASS_ID").unwrap_or_else(|_| "lb-lfm2".to_string()),
+        )
+    }
+
+    pub fn new(dir: Option<PathBuf>, model_id: String, class_id: String) -> Self {
+        Self { dir: Mutex::new(dir), model_id: Mutex::new(model_id), class_id: Mutex::new(class_id), seq: AtomicU64::new(0), pending: Mutex::new(Vec::new()) }
     }
 
     pub fn enabled(&self) -> bool {
-        self.dir.is_some()
+        self.dir.lock().unwrap().is_some()
+    }
+
+    pub fn dir(&self) -> Option<PathBuf> {
+        self.dir.lock().unwrap().clone()
+    }
+
+    /// Point the scraper at `dir` (`None` switches recording off). Takes effect at the next
+    /// flush; activations already pending go to the new place.
+    pub fn set_dir(&self, dir: Option<PathBuf>) {
+        *self.dir.lock().unwrap() = dir;
+    }
+
+    pub fn model_id(&self) -> String {
+        self.model_id.lock().unwrap().clone()
+    }
+
+    pub fn set_model_id(&self, id: String) {
+        *self.model_id.lock().unwrap() = id;
+    }
+
+    pub fn class_id(&self) -> String {
+        self.class_id.lock().unwrap().clone()
+    }
+
+    pub fn set_class_id(&self, id: String) {
+        *self.class_id.lock().unwrap() = id;
     }
 
     pub fn record(&self, layer: usize, pos0: usize, routes: &[Route]) {
+        if !self.enabled() {
+            return;
+        }
         let mut p = self.pending.lock().unwrap();
         for (i, r) in routes.iter().enumerate() {
             p.push(Activation {
@@ -593,7 +642,7 @@ impl Scraper {
     /// Write the pending activations as one scrape file; returns its path when enabled.
     pub fn flush(&self, phase: &str, token_ids: &[u32]) -> std::io::Result<Option<PathBuf>> {
         let acts = self.take();
-        let Some(dir) = &self.dir else { return Ok(None) };
+        let Some(dir) = self.dir() else { return Ok(None) };
         if acts.is_empty() {
             return Ok(None);
         }
@@ -601,9 +650,9 @@ impl Scraper {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let s = Scrape {
             schema_version: 1,
-            model_id: self.model_id.clone(),
+            model_id: self.model_id(),
             request_id: format!("lb-lfm2-{epoch}-{seq}"),
-            class_id: self.class_id.clone(),
+            class_id: self.class_id(),
             source: "scrape".into(),
             phase: phase.into(),
             n_tokens: token_ids.len() as u32,
@@ -611,7 +660,7 @@ impl Scraper {
             token_ids: token_ids.to_vec(),
             activations: acts,
         };
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("run-{epoch}-{seq}.json"));
         let tmp = dir.join(format!(".run-{epoch}-{seq}.json.tmp"));
         let mut f = std::fs::File::create(&tmp)?;
@@ -673,7 +722,12 @@ mod tests {
 
     #[test]
     fn scrape_round_trips_through_histogram() {
-        let s = Scraper { dir: None, model_id: "m".into(), class_id: "c".into(), seq: AtomicU64::new(0), pending: Mutex::new(Vec::new()) };
+        let s = Scraper::new(None, "m".into(), "c".into());
+        // recording is off with no directory: nothing pends, nothing costs
+        s.record(3, 10, &[Route { experts: vec![1, 2], weights: vec![0.5, 0.5] }]);
+        assert!(s.take().is_empty());
+        s.set_dir(Some(std::path::PathBuf::from("/nonexistent-for-this-test")));
+        assert!(s.enabled());
         s.record(3, 10, &[Route { experts: vec![1, 2], weights: vec![0.5, 0.5] }]);
         let acts = s.take();
         assert_eq!(acts[0].token_pos, 10);

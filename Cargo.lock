@@ -3932,6 +3932,7 @@ dependencies = [
  "burn",
  "clap",
  "futures-util",
+ "http-body-util",
  "lb-lfm2",
  "lb-model",
  "lb-ternary",
@@ -3939,6 +3940,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

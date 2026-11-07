@@ -63,9 +63,20 @@ fn main() -> Result<(), String> {
     };
     let expert = |i: usize| (QuantMat::new(GgmlType::Q4_0, rows, cols, slice(3 * i)), QuantMat::new(GgmlType::Q4_0, rows, cols, slice(3 * i + 1)), QuantMat::new(GgmlType::Q4_0, cols, rows, slice(3 * i + 2)));
 
-    for (path, host_repack) in [("device", false), ("host", true), ("device_rep2", false), ("host_rep2", true)] {
+    // `device_batched`: the three matrices in three device calls (`Gpu::upload_expert_batched`);
+    // `device`: one `create`, two `empty`s and a repack launch per matrix (`LB_NO_BATCH_MISS`).
+    // Interleaved and repeated so a drift during the run shows as a disagreement between reps.
+    for (path, host_repack, batch) in [
+        ("device_batched", false, true),
+        ("device", false, false),
+        ("host", true, false),
+        ("device_batched_rep2", false, true),
+        ("device_rep2", false, false),
+        ("host_rep2", true, false),
+    ] {
         if host_repack || registered {
             gpu.set_host_repack(host_repack);
+            gpu.set_batch_miss(batch);
             eprintln!("section: {path}");
             time(&format!("{path}_whole"), &mut |i| {
                 let (a, b, c) = expert(i);
@@ -77,7 +88,31 @@ fn main() -> Result<(), String> {
         }
     }
     gpu.set_host_repack(false);
+    gpu.set_batch_miss(true);
     if registered {
+        // parity: the batched path must hold the same words as the per-matrix path, and run
+        // the same expert to the same bits (an output sha is the e2e form of this)
+        let (a, b, c) = expert(0);
+        let batched = GpuExpert::upload(&gpu, a, b, c)?;
+        gpu.set_batch_miss(false);
+        let (a, b, c) = expert(0);
+        let single = GpuExpert::upload(&gpu, a, b, c)?;
+        gpu.set_batch_miss(true);
+        for (name, p, q) in [("gate", &batched.gate, &single.gate), ("up", &batched.up, &single.up), ("down", &batched.down, &single.down)] {
+            let (pq, ps) = p.words(&gpu)?;
+            let (qq, qs) = q.words(&gpu)?;
+            if pq != qq || ps != qs {
+                return Err(format!("parity: batched {name} words differ from the per-matrix upload"));
+            }
+        }
+        let x: Vec<f32> = (0..cols).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
+        let yb = batched.ffn(&gpu, &x, 1)?;
+        let ys = single.ffn(&gpu, &x, 1)?;
+        if yb != ys {
+            return Err("parity: batched expert output differs from the per-matrix upload".into());
+        }
+        println!("{{{header},\"metric\":\"parity\",\"batched_matches_single\":true,\"out_len\":{}}}", yb.len());
+        drop((batched, single));
         // DMA alone: raw bytes from the mapping, no kernel
         time("device_dma_only", &mut |i| {
             let hs: Vec<_> = (0..3).map(|k| gpu.client.create(lb_q4_gpu::registered::RegisteredSlice::bytes(gpu.registration_of(slice(3 * i + k)).expect("registered"), slice(3 * i + k)))).collect();

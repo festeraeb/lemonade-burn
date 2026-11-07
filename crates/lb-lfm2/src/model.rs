@@ -38,7 +38,8 @@ pub struct Lfm2 {
     /// Shared so a host (the server) can read the counters while the model runs on its
     /// own thread: this is the only view of where a token's time actually went.
     pub stats: Arc<PlacementStats>,
-    pub scraper: Scraper,
+    /// Shared with the host so scrape output can be redirected or switched off live.
+    pub scraper: Arc<Scraper>,
     /// Where a forward pass spent its time. Shared for the same reason as `stats`: the
     /// model runs on its own thread and the host has to be able to read this while it does.
     pub timings: Arc<Timings>,
@@ -117,7 +118,7 @@ impl Lfm2 {
             store: ExpertStore::default(),
             dense: DenseStore::default(),
             stats: Arc::new(PlacementStats::default()),
-            scraper: Scraper::from_env(&model_id),
+            scraper: Arc::new(Scraper::from_env(&model_id)),
             timings: Arc::new(Timings::default()),
         })
     }
@@ -142,6 +143,26 @@ impl Lfm2 {
 
     pub fn cfg(&self) -> &Config {
         &self.w.cfg
+    }
+
+    /// The live settings, shared with whoever hosts the model (see `knobs.rs`).
+    pub fn knobs(&self) -> Arc<crate::knobs::Knobs> {
+        self.store.knobs.clone()
+    }
+
+    /// Push the live knobs the device reads into it; called at the top of every forward pass
+    /// so a change posted between two tokens applies to the next one.
+    fn apply_knobs(&self) {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = self.store.gpu.as_ref() {
+            let k = &self.store.knobs;
+            if gpu.host_repack() != k.host_repack() {
+                gpu.set_host_repack(k.host_repack());
+            }
+            if gpu.batch_miss() != k.batch_miss() {
+                gpu.set_batch_miss(k.batch_miss());
+            }
+        }
     }
 
     pub fn new_cache(&self) -> Cache {
@@ -411,6 +432,7 @@ impl Lfm2 {
     /// Run `tokens` at positions `cache.len ..`. Returns logits `[m, vocab]` when
     /// `all_logits`, else `[1, vocab]` for the last position.
     pub fn forward(&self, tokens: &[u32], cache: &mut Cache, all_logits: bool) -> Tensor<2> {
+        self.apply_knobs();
         let mm0 = self.timings.matmul_ns.load(Ordering::Relaxed);
         let t_fwd = Instant::now();
         let out = self.forward_inner(tokens, cache, all_logits);

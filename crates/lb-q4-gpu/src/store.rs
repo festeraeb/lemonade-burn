@@ -50,6 +50,10 @@ pub struct Gpu {
     /// Repack on the host even when the bytes are registered (`LB_HOST_REPACK=1`, or
     /// `set_host_repack`): the A/B switch for the device repack.
     host_repack: AtomicBool,
+    /// Serve a miss's three matrices with three device calls instead of twelve
+    /// (`upload_expert_batched`); `LB_NO_BATCH_MISS=1` or `set_batch_miss(false)` is the A/B
+    /// switch back to one `create`, two `empty`s and a repack launch per matrix.
+    batch_miss: AtomicBool,
     /// Small constant buffers (`dims`, kernel counts) keyed by their words. Every matrix of a
     /// shape shares one, so a miss uploads no tiny buffers (three per expert before).
     consts: Mutex<HashMap<Vec<u32>, Handle>>,
@@ -115,8 +119,114 @@ impl Gpu {
             #[cfg(feature = "cuda")]
             registered: Mutex::new(Vec::new()),
             host_repack: AtomicBool::new(std::env::var_os("LB_HOST_REPACK").is_some()),
+            batch_miss: AtomicBool::new(std::env::var_os("LB_NO_BATCH_MISS").is_none()),
             consts: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Whether a miss's three matrices go up as one batch (see `batch_miss`).
+    pub fn batch_miss(&self) -> bool {
+        self.batch_miss.load(Ordering::Relaxed)
+    }
+
+    /// Switch the batched miss path on or off (A/B switch; live).
+    pub fn set_batch_miss(&self, on: bool) {
+        self.batch_miss.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether registered bytes are repacked on the host (see `host_repack`).
+    pub fn host_repack(&self) -> bool {
+        self.host_repack.load(Ordering::Relaxed)
+    }
+
+    /// Three Q4_0 matrices of one expert in **three** device calls: one `create_tensors` DMAs
+    /// the three raw slices out of the page-locked mapping into one allocation, one
+    /// `empty_tensors` reserves the packed words of all three, and one repack launch covers the
+    /// lot (three launches if the allocator did not place the raw slices back to back). Each
+    /// matrix then owns an offset view of the shared `qs`/`sc` buffers, which the kernels read
+    /// exactly as they read a buffer of their own.
+    ///
+    /// Why: a miss paid twelve calls (`create`, two `empty`s and a launch per matrix), and the
+    /// three `create`s alone measured 0.59 ms for 5.3 MB on c2 where the bus time is 0.47 ms
+    /// (`docs/WORK_LOG.md`, 2026-11-03). `None` when the fast path does not apply (not all
+    /// registered, odd or unequal block counts, host repack or batching switched off): the
+    /// caller takes the per-matrix path.
+    #[cfg(feature = "cuda")]
+    fn upload_expert_batched(&self, mats: [&QuantMat<'_>; 3]) -> Option<[GpuQ4Mat; 3]> {
+        use cubecl::server::MemoryLayoutDescriptor;
+        if !self.batch_miss() || self.host_repack() {
+            return None;
+        }
+        let nb = mats[0].rows * (mats[0].cols / 32);
+        if nb == 0 || nb % 2 != 0 {
+            return None;
+        }
+        for m in mats {
+            if m.ty != lb_gguf::GgmlType::Q4_0 || m.cols % 32 != 0 || m.rows * (m.cols / 32) != nb {
+                return None;
+            }
+        }
+        let raw_len = nb * 18;
+        let mut descs = Vec::with_capacity(3);
+        for m in mats {
+            let raw = self.registered_slice(&m.bytes[..raw_len])?;
+            descs.push((MemoryLayoutDescriptor::contiguous([raw_len].into(), 1), raw));
+        }
+        let (n_qs, n_sc) = (nb * 4, nb / 2);
+        // one submission, one allocation, three DMAs
+        let raws = self.client.create_tensors(descs);
+        // one submission, one allocation, for the six packed outputs
+        let outs = self.client.empty_tensors(vec![
+            MemoryLayoutDescriptor::contiguous([3 * n_qs * 4].into(), 1),
+            MemoryLayoutDescriptor::contiguous([3 * n_sc * 4].into(), 1),
+        ]);
+        let (qs_all, sc_all) = (outs[0].memory.clone(), outs[1].memory.clone());
+        let n = self.const_u32(&[(3 * n_sc) as u32]);
+        let off = |h: &Handle| h.offset_start.unwrap_or(0);
+        let back_to_back = (1..3).all(|i| off(&raws[i].memory) == off(&raws[0].memory) + (i * raw_len) as u64);
+        if back_to_back {
+            // one view over the three raw slices: start at the first, end where the last ends
+            let mut span = raws[0].memory.clone();
+            span.offset_end = raws[2].memory.offset_end;
+            unsafe {
+                q4_0_repack_kernel::launch(
+                    &self.client,
+                    cube_count(3 * n_sc, REPACK_CUBE),
+                    CubeDim::new_1d(REPACK_CUBE as u32),
+                    BufferArg::from_raw_parts(span, 3 * raw_len / 4),
+                    BufferArg::from_raw_parts(qs_all.clone(), 3 * n_qs),
+                    BufferArg::from_raw_parts(sc_all.clone(), 3 * n_sc),
+                    BufferArg::from_raw_parts(n, 1),
+                );
+            }
+        } else {
+            let n1 = self.const_u32(&[n_sc as u32]);
+            for i in 0..3 {
+                let qs_i = qs_all.clone().offset_start((i * n_qs * 4) as u64).offset_end(((2 - i) * n_qs * 4) as u64);
+                let sc_i = sc_all.clone().offset_start((i * n_sc * 4) as u64).offset_end(((2 - i) * n_sc * 4) as u64);
+                unsafe {
+                    q4_0_repack_kernel::launch(
+                        &self.client,
+                        cube_count(n_sc, REPACK_CUBE),
+                        CubeDim::new_1d(REPACK_CUBE as u32),
+                        BufferArg::from_raw_parts(raws[i].memory.clone(), raw_len / 4),
+                        BufferArg::from_raw_parts(qs_i, n_qs),
+                        BufferArg::from_raw_parts(sc_i, n_sc),
+                        BufferArg::from_raw_parts(n1.clone(), 1),
+                    );
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(3);
+        for (i, m) in mats.iter().enumerate() {
+            let qs = qs_all.clone().offset_start((i * n_qs * 4) as u64).offset_end(((2 - i) * n_qs * 4) as u64);
+            let sc = sc_all.clone().offset_start((i * n_sc * 4) as u64).offset_end(((2 - i) * n_sc * 4) as u64);
+            let dims = matvec_dims(m.rows, m.cols);
+            out.push(GpuQ4Mat { rows: m.rows, cols: m.cols, row_bytes: m.row_bytes(), n_qs, n_sc, qs, sc, dims: self.const_u32(&dims) });
+        }
+        // `raws` drops here: the raw allocation is released once the stream is past the repack
+        let (d, u, g) = (out.pop()?, out.pop()?, out.pop()?);
+        Some([g, u, d])
     }
 
     /// A device buffer holding exactly `words`, shared by every caller asking for the same
@@ -413,6 +523,12 @@ impl GpuQ4Mat {
         (self.n_qs + self.n_sc) * 4
     }
 
+    /// The packed words as the device holds them, `(qs, sc)`; synchronises. For parity checks
+    /// between upload paths (the batched expert path hands out offset views of shared buffers).
+    pub fn words(&self, gpu: &Gpu) -> Result<(Vec<u32>, Vec<u32>), String> {
+        Ok((gpu.read_u32(&self.qs, self.n_qs)?, gpu.read_u32(&self.sc, self.n_sc)?))
+    }
+
     /// Launch `out = x @ W^T` for `m` rows of `x` already on the device; returns the output handle.
     pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
         let n_out = m * self.rows;
@@ -642,7 +758,24 @@ pub struct GpuExpert {
 }
 
 impl GpuExpert {
+    /// Upload the three matrices: as one batch when the bytes are page-locked and the
+    /// shapes allow it (`Gpu::upload_expert_batched`, cuda), else one matrix at a time.
     pub fn upload(gpu: &Gpu, gate: QuantMat<'_>, up: QuantMat<'_>, down: QuantMat<'_>) -> Result<Self, String> {
+        #[cfg(feature = "cuda")]
+        if let Some([gate, up, down]) = gpu.upload_expert_batched([&gate, &up, &down]) {
+            return Ok(Self { gate, up, down });
+        }
+        Self::upload_per_matrix(gpu, gate, up, down)
+    }
+
+    /// One matrix at a time, whatever the runtime: the path for experts that stay resident.
+    ///
+    /// Measured 2026-11-04 on c4 GPU 3 (`docs/WORK_LOG.md`): loading all 2432 experts of the
+    /// 24B through the batched path put 16,267 MiB on the card against 15,291 MiB this way
+    /// (+0.4 MiB an expert from how the memory pool rounds the larger shared allocations),
+    /// and the first token then ran out of device memory. The batched path is a win per miss
+    /// (transient), not per resident.
+    pub fn upload_per_matrix(gpu: &Gpu, gate: QuantMat<'_>, up: QuantMat<'_>, down: QuantMat<'_>) -> Result<Self, String> {
         Ok(Self { gate: GpuQ4Mat::upload(gpu, gate)?, up: GpuQ4Mat::upload(gpu, up)?, down: GpuQ4Mat::upload(gpu, down)? })
     }
 
