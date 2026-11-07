@@ -875,3 +875,173 @@ separate `memcpy_htod_async` (each a driver round trip even inside one submissio
 drop of the raw buffer. A true single copy would need the three slices contiguous in the file,
 which gate/up/down are not. The path stays in as the default because it is never slower and
 the parity is proven, with `LB_NO_BATCH_MISS=1` / the live `batch_miss` knob as the switch back.
+
+## Device-resident decode (D1) and rows-per-plane kernels (D2): built, parity passes on the 1070, speed unproven until D3 (2026-11-07)
+
+Branch `fable/device-decode-2026-11-07` (off `fable/tunables-2026-11-04`), commits `5fedfe2` (D1
+kernels), `53b4780` (the token loop), `4b76e80` (D2). Spec: `docs/DEVICE_DECODE_PLAN.md`. Test card:
+**cesarops1's GTX 1070** (8 GB, nvidia-smi 0, `LB_WGPU_DEVICE=discrete:0` / `LB_CUDA_DEVICE=0`
+with c4's CUDA 12.8 nvrtc in `/mnt/models/lb-dd/lib`), model on c1's local disk
+(`/mnt/models/lfm25/`). No P100 was touched. Everything below is off by default.
+
+### What was built
+
+* **Kernels** (`lb-q4-gpu/src/decode.rs`): `add_rms_norm` (residual add fused into the next
+  pre-norm), `qk_norm_rope` (per-head rms + NEOX RoPE + KV append), `attn_decode` (online
+  softmax, one cube per query head, GQA), `router_topk` (`route_sigmoid`'s rule: rank by
+  `p + bias`, lower id on ties, `/ max(sum, 2^-14)`), `weighted_sum` (ascending expert id, the
+  order `moe_ffn` adds in). `GpuExpertLayer` gained `upload_stacked` (the GGUF stack as one
+  `QuantMat` per projection), `expert(e)` offset views and `launch_device` on device-written
+  routes at a slot base.
+* **The token loop** (`lb-lfm2/src/device_decode.rs`), `LB_DEVICE_DECODE=1` or the live knob
+  `device_decode`: embedding upload, then per layer norm / conv or attention / norm / dense FFN
+  or router + stacked experts + weighted sum, final norm, head, and **one read** for the
+  logits plus every MoE layer's routes and weights; the scraper is fed from those routes in
+  layer order. About **388 launches and 1 sync** a token when everything is resident (30 conv
+  x 3 + 10 attention x 6 + 80 norms + 2 dense FFN x 2 + 38 MoE x 4 + final norm + head; the
+  plan guessed ~430).
+* **State**: `Cache` keeps a device copy (KV per attention layer, conv state per conv layer) and
+  `host_len`; a device token uploads the host's state when its copy is behind, a host pass reads
+  the device's back first when the host is behind. The two paths can alternate token by token.
+* **Residency**: `LB_EXPERT_LAYERS` (unset: follows `LB_DEVICE_DECODE`) uploads a MoE layer whose
+  experts are all placed as one stacked buffer per projection; the old path's per-expert entries
+  are views into it, so **both arms read the same device memory**. `Placement::whole_layers` /
+  `--whole-layers` places whole layers in order within a budget.
+* **Fallback**: a token takes the old path, unchanged, when a dense matrix or the head is not
+  resident, `LB_CONV_BLOCK` is on, or a MoE layer is not stacked-resident (reason logged once,
+  `device_decode_fallbacks` in `/v1/placement`). `LB_DD_HOST_MOE=1` instead runs such a layer on
+  the host path *inside* the device token (one extra sync for that layer): the only way a card
+  smaller than the model runs the device path. `LB_DD_ROUTER_SEQ=1` computes router logits in
+  the host's summation order.
+* **D2**: `q4_0_matvec_rows_kernel` / `q4_0_gate_up_silu_rows_kernel`, r = 4 or 8 rows per plane,
+  every load of a block issued before the FMAs, one `plane_sum` per 4 rows, optional x in shared
+  memory; one comptime `routed` flag so dense, per-expert and stacked-layer paths all switch.
+  `LB_Q4_ROWS` (default **1 = the old kernels**), `LB_Q4_XSHARED`, `LB_Q4_XSHARED_MAX_COLS`.
+
+### Where the code disagreed with the plan (the code won)
+
+1. **The model never used `GpuExpertLayer`.** Residents were one `GpuExpert` per (layer, expert)
+   in a `HashMap`; the layer type existed only in tests, host-concatenating per-expert repacks.
+   Device routes cannot pick a per-expert buffer, so the stacked layer had to become a residency
+   mode (`LB_EXPERT_LAYERS`) with per-expert views for the old path.
+2. **`GpuConv` is not the conv path to reuse**: it exists only under `LB_CONV_BLOCK` (off,
+   measured 0.90x) and owns its own copies of the projections. The device token uses the loose
+   resident `in_proj`/`out_proj` + `conv_decode` + its own state, and declines when
+   `LB_CONV_BLOCK` is on (two device conv states would disagree).
+3. **RoPE from the host's f64 table**, uploaded once per cache size, not cos/sin in-kernel: the
+   rotation is then the host's to the bit. No per-token host table, which was the point.
+4. Position values go in one per-token buffer (`TokenParams`) written once a token: a
+   `const_u32` per position would have left a buffer behind for every position ever decoded.
+
+### Measured: correctness (GTX 1070)
+
+Kernel tests (`decode_kernels_match_host.rs`, 7): **7/7 wgpu, 7/7 cuda**; worst |gpu-host|
+4.8e-7 (q after norm+RoPE), attention 1-257 positions at 32:8 / 4:2 / 8:8 heads within 1e-5
+relative; router selection exact on 20 random routers, an exact tie across the top-k cut, a
+bias-forced expert and the 2^-14 floor, both logit variants. Stacked layer + views + device
+routes **bit-identical** to the per-expert path. D2 (`rows_kernels_match_one_row.rs`, 3): every
+arm **bit-identical** to the one-row kernel on both runtimes; the decode, expert_layer and
+gpu_matches_scalar suites pass at `LB_Q4_ROWS` 1, 4 and 8 on both.
+
+Real model, `lfm2-check --ab-device` (old arm = knob off, device arm = on, same process, same
+residency): dense 751 MB + head, MoE layers 2-17 stacked on the card (16 of 38, 5436 MB), the
+other 22 on the host inside the device token (`LB_DD_HOST_MOE=1`). Teacher-forced token by token
+over the three prompts (13 + 29 + 44 = 86 positions), then 32 greedy tokens of c4_e2e's prompt:
+
+| runtime | top-1 old==device | max \|logit diff\| | route activations differing | alternating arm | greedy 32 | sha both arms |
+|---|---|---|---|---|---|---|
+| wgpu | **86/86** | 3.60e-5 | **0 of 3268** | 86/86 (2.48e-5) | identical | `062392b8d2b0361a` |
+| cuda | **86/86** | 3.95e-5 | **0 of 3268** | 86/86 (3.00e-5) | identical | `062392b8d2b0361a` |
+| cuda, `LB_DD_ROUTER_SEQ=1` | 86/86 | 2.24e-5 | 0 | 86/86 (3.56e-5) | identical | `062392b8d2b0361a` |
+
+`062392b8d2b0361a` is the old path's greedy sha on c4's P100 as well. The route comparison is the
+scrape file's content (layer, position, experts) compared in process. **Fallback case**
+(partial residency, `LB_DD_HOST_MOE` off): 13/13 tokens declined, logits **bit-identical**
+(max diff 0), routes identical. **lb-server**, `device_decode` posted live between
+completions: sha `062392b8d2b0361a` x4, 62 device tokens, 0 fallbacks; and all 30 completions
+of the e2e table below give the same sha.
+
+### Measured: D2 kernel A/B (GTX 1070, roofline 256 GB/s)
+
+`examples/rows_bench.rs`, arms interleaved in one process on one upload after a 2 s warm-up,
+median of 30 reps per arm, **3 runs** (separate processes), median [min-max] of the 3. "chain" =
+16 launches of the matrix, one readback, per launch (a single launch + readback is mostly
+round-trip latency: on wgpu every dense shape sat at 0.16-0.46 ms whatever the kernel). Load
+0.23-0.51 (wgpu runs), 0.67-0.89 (cuda runs).
+
+| | rows1 (old) | rows4 | rows8 | rows4 + x shared |
+|---|---|---|---|---|
+| **wgpu distinct24_m1**, ms/expert | 0.1032 [0.1004-0.1033], 51.4 GB/s | **0.0887** [0.0885-0.0907], 59.9 GB/s, **1.16x** | 0.1148, 46.2, 0.90x | 0.1050, 50.6, 0.98x |
+| **cuda distinct24_m1**, ms/expert | 0.0670 [0.0670-0.0670], 79.2 GB/s | **0.0511** [0.0511-0.0516], 103.9 GB/s, **1.31x** | 0.0850, 62.4, 0.79x | 0.0525, 101.2, 1.28x |
+| cuda in_proj 6144x2048 chain | 83.7 GB/s | 118.0, 1.41x | 117.7, 1.41x | 116.4, 1.39x |
+| cuda out_proj 2048x2048 chain | 50.6 [rows1 range 0.0331-0.0467 ms: bimodal] | 68.4, 1.35x | 68.0, 1.35x | 67.5, 1.34x |
+| cuda kv 512x2048 chain | 35.9 GB/s | 33.6, **0.93x** | 34.1, 0.95x | 33.5, 0.93x |
+| cuda ffn_down 2048x11776 chain | 91.5 GB/s | **158.4, 1.73x** | 122.0, 1.33x | 157.8, 1.72x |
+| cuda ffn_up 11776x2048 chain | 91.3 GB/s | 138.0, 1.51x | 137.8, 1.51x | 136.8, 1.50x |
+| wgpu in_proj chain | 60.8 GB/s | 77.5, 1.27x | 76.8, 1.26x | 67.8, 1.12x |
+| wgpu ffn_down chain | 80.2 GB/s | 86.4, 1.08x | 103.8, 1.29x | 87.0, 1.08x |
+| wgpu ffn_up chain | 74.7 GB/s | 102.5, 1.37x | 102.2, 1.37x | 87.2, 1.17x |
+| wgpu kv 512 chain | 15.9 GB/s | 15.2, 0.96x | 11.2, 0.70x | 11.6, 0.73x |
+
+Reading: **rows4 is the pick** (rows8 loses on the expert FFN, where gate + up hold 16 partial
+vectors a lane; x in shared memory adds nothing). On the quantity the plan named, distinct24_m1,
+rows4 is **1.16x (wgpu) and 1.31x (cuda)**: run-to-run spread is under 2% on this quiet box, so
+the gain is real here, but it is **under 1.5x and it is one card**; the best kernel reaches 158
+GB/s = **62% of the 1070's roofline** (ffn_down chain), the expert FFN 104 GB/s = 41%. The
+512-row K/V matrices get slower (too few row groups to fill the card): a per-shape r is the
+obvious follow-up. On cuda a *single* launch + readback of the big shapes is bimodal (ffn_up
+rows1 0.366 ms vs 0.148 per launch in a chain; ffn_down rows4 0.100): the host sync's wake-up
+quantises, so those single-launch ratios (3.3-3.7x) are not quoted. Default stays `LB_Q4_ROWS=1`
+until rows4 wins on a P100 too.
+
+### Measured: end to end on the 1070 (not a speed claim)
+
+lb-server, whole-layer residency as above (22 of 38 MoE layers on c1's Xeon E5-2680, 32 threads,
+in every config), one server per config, 1 warm-up + 3 completions of 32 tokens, rounds
+interleaved:
+
+| config | wgpu tok/s | cuda tok/s | load (1 min) |
+|---|---|---|---|
+| old path (`LB_DEVICE_DECODE=0`) | 8.87 / 8.95 / 8.94 | 10.94 / 10.72 / 11.10 | 2.7-10.4 |
+| device decode, rows1 | 10.92-11.94 (2 rounds) | 13.19-13.40 | 10-15 |
+| device decode, rows4 | 11.52-12.17 | 12.97-13.83 | 9-18 |
+
+`/v1/placement`: 124 device tokens a config, 0 fallbacks, 80-91 ms a device token. The load is
+the host MoE layers' own rayon threads. This config is CPU-bound by construction, so it says
+nothing about the P100: rows4 vs rows1 does not show at all, and device vs old (1.2-1.3x) is
+mostly 22 per-layer round trips becoming cheaper ones. **No tok/s claim comes from this table.**
+
+### What did not pass or was not done
+
+* **No all-resident run.** The 1070 cannot hold the model, so the path the plan is about (zero
+  host layers, one sync a token) has never run end to end on the real model; it is the same code
+  minus the host-layer branch, and every kernel in it is tested, but its speed is unmeasured.
+* **Stacked residency memory on a 16 GB card is unknown.** The per-expert all-resident config
+  used 15,291 MiB of the P100's 16,280; the batched-miss path once cost +0.4 MiB an expert from
+  pool rounding and ran out. Stacked layers are 3 x ~113 MB allocations a layer instead of 192
+  small ones: it may cost more or less. D3 must look before it measures.
+* D2 under 1.5x on distinct24 on this card; nothing claimed for the P100.
+* The plan's in-kernel cos/sin was not built (table instead, see above).
+* lfm2-check `--ab-device` compares against our old path, not the llama.cpp oracle (the old
+  path's 75/86 against the oracle is unchanged by construction when top-1 is equal everywhere).
+
+### What Phase D3 must run on a P100 (c4 GPU 3, after asking on Buzz #human-questions)
+
+1. Build the cuda lb-server from this branch (`CUDARC_CUDA_VERSION=12080`), into
+   `/mnt/models/lb-measure/bin/`.
+2. **Memory first**: `LB_EXPERT_LAYERS=1` with `--placement-from-scrapes <scrapes>
+   --gpu-budget-mb 14500 --gpu-dense-mb 900`: every layer must come up stacked
+   (`uploaded 2432 experts`, `/v1/placement`), and `nvidia-smi` used vs the per-expert
+   15,291 MiB. If it does not fit, that is the first finding.
+3. **Parity on the card**: `lfm2-check --ab-device --tokenizer .../tokenizer.json --gpu
+   --placement-from-scrapes ... --gpu-budget-mb 14500 --gpu-dense-mb 900` with
+   `LB_EXPERT_LAYERS=1` and *without* `LB_DD_HOST_MOE` (so a token that is not fully resident
+   falls back and shows as `fallbacks`): 86/86, routes 0 differing, greedy identical, and
+   `device tokens == positions`.
+4. **Speed**: `c4_e2e.sh` / `c4_llama.sh`, 2 interleaved rounds x 5 completions, arms
+   (a) `LB_DEVICE_DECODE=0 LB_Q4_ROWS=1` (the 18-19 tok/s baseline), (b) `LB_DEVICE_DECODE=1
+   LB_Q4_ROWS=1`, (c) `LB_DEVICE_DECODE=1 LB_Q4_ROWS=4`, (d) `LB_DEVICE_DECODE=0 LB_Q4_ROWS=4`,
+   `LB_EXPERT_LAYERS=1` in all four so residency is identical; gate: sha `062392b8d2b0361a` in
+   every completion, `device_decode_fallbacks` 0 in (b)/(c), load printed, quieter round quoted.
+5. `examples/rows_bench.rs` 3 runs on the P100 (roofline 732 GB/s), to decide `LB_Q4_ROWS`'s
+   default and whether the 512-row shapes need their own r.
