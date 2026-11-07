@@ -126,6 +126,9 @@ impl Tunables {
             Fixed { name: "pinned_pool_mb", value: env("LB_PINNED_POOL_MB"), ty: "int", source: "LB_PINNED_POOL_MB", description: "page-locked staging pool cap for host repacks (default 256)" },
             Fixed { name: "no_pinned", value: env_flag("LB_NO_PINNED"), ty: "bool", source: "LB_NO_PINNED", description: "no pinned staging pool: host repacks upload from pageable memory" },
             Fixed { name: "q4_cube", value: env("LB_Q4_CUBE"), ty: "int", source: "LB_Q4_CUBE", description: "units per cube for the Q4_0 matvec kernels (default: two planes)" },
+            Fixed { name: "q4_rows", value: env("LB_Q4_ROWS"), ty: "int", source: "LB_Q4_ROWS", description: "output rows per plane in the Q4_0 kernels: 1 (unset: the one-row kernels), 4 or 8 (the D2 rows kernels; need plane ops)" },
+            Fixed { name: "q4_xshared", value: env_flag("LB_Q4_XSHARED"), ty: "bool", source: "LB_Q4_XSHARED", description: "rows kernels stage the activation row in shared memory (one input row, up to q4_xshared_max_cols)" },
+            Fixed { name: "q4_xshared_max_cols", value: env("LB_Q4_XSHARED_MAX_COLS"), ty: "int", source: "LB_Q4_XSHARED_MAX_COLS", description: "widest matrix whose activation row goes to shared memory (default 4096 columns = 16 KB)" },
             Fixed { name: "no_plane", value: env_flag("LB_NO_PLANE"), ty: "bool", source: "LB_NO_PLANE", description: "reduce with a shared-memory tree instead of plane_sum" },
             Fixed { name: "expert_layers", value: env("LB_EXPERT_LAYERS"), ty: "bool", source: "LB_EXPERT_LAYERS (unset: follows LB_DEVICE_DECODE)", description: "upload a MoE layer whose experts are all planned resident as one stacked buffer per projection (per-expert views into it); the device-resident decode needs it" },
             Fixed { name: "conv_block", value: env_flag("LB_CONV_BLOCK"), ty: "bool", source: "LB_CONV_BLOCK", description: "whole short-conv blocks resident on the device (off by default; measured slower)" },
@@ -336,7 +339,7 @@ mod tests {
         for live in ["miss_policy", "host_repack", "batch_miss", "device_decode", "dd_host_moe", "dd_router_seq", "scrape_dir", "scrape_model_id", "scrape_class_id", "default_max_tokens"] {
             assert_eq!(entry(&d, live)["scope"], "live", "{live}");
         }
-        for fixed in ["model", "gpu", "gpu_dense_mb", "placement_from_scrapes", "ctx", "cuda_device", "wgpu_device", "no_register", "pinned_pool_mb", "q4_cube", "conv_block"] {
+        for fixed in ["model", "gpu", "gpu_dense_mb", "placement_from_scrapes", "ctx", "cuda_device", "wgpu_device", "no_register", "pinned_pool_mb", "q4_cube", "q4_rows", "q4_xshared", "q4_xshared_max_cols", "expert_layers", "conv_block"] {
             assert_eq!(entry(&d, fixed)["scope"], "restart", "{fixed}");
         }
     }

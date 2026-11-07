@@ -7,14 +7,14 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{conv_decode_kernel, cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_matvec_kernel, q4_0_repack_kernel, q4_0_routed_gate_up_silu_kernel, q4_0_routed_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, REPACK_CUBE, THREADS};
+use crate::{conv_decode_kernel, cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_gate_up_silu_rows_kernel, q4_0_matvec_kernel, q4_0_matvec_rows_kernel, q4_0_repack_kernel, q4_0_routed_gate_up_silu_kernel, q4_0_routed_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, REPACK_CUBE, THREADS};
 use cubecl::bytes::Bytes;
 use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 use lb_ternary_gpu::pick_device;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Most free buffers to keep per size. Decode reuses a handful of sizes, so this only caps
@@ -57,6 +57,22 @@ pub struct Gpu {
     /// Small constant buffers (`dims`, kernel counts) keyed by their words. Every matrix of a
     /// shape shares one, so a miss uploads no tiny buffers (three per expert before).
     consts: Mutex<HashMap<Vec<u32>, Handle>>,
+    /// Output rows per plane for the Q4_0 kernels (D2): 1 = the one-row kernels (default),
+    /// 4 or 8 = `q4_0_*_rows_kernel`. `LB_Q4_ROWS`; live through `set_q4_rows` for A/Bs.
+    q4_rows: AtomicUsize,
+    /// Stage the activation row in shared memory in the rows kernels (`LB_Q4_XSHARED=1`).
+    q4_xshared: AtomicBool,
+    /// ... only for matrices up to this many columns (`LB_Q4_XSHARED_MAX_COLS`, default 4096:
+    /// 16 KB of shared memory; the 11776-wide dense down would take 46 KB of the 48).
+    pub xshared_max_cols: usize,
+}
+
+/// `LB_Q4_ROWS`: 1 (the one-row kernels, default), 4 or 8; anything else is 1.
+fn q4_rows_from_env() -> usize {
+    match std::env::var("LB_Q4_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(r @ (4 | 8)) => r,
+        _ => 1,
+    }
 }
 
 /// The device to open. `LB_CUDA_DEVICE=N` opens CUDA device N through the cubecl-cuda runtime,
@@ -121,7 +137,41 @@ impl Gpu {
             host_repack: AtomicBool::new(std::env::var_os("LB_HOST_REPACK").is_some()),
             batch_miss: AtomicBool::new(std::env::var_os("LB_NO_BATCH_MISS").is_none()),
             consts: Mutex::new(HashMap::new()),
+            q4_rows: AtomicUsize::new(q4_rows_from_env()),
+            q4_xshared: AtomicBool::new(std::env::var("LB_Q4_XSHARED").map(|v| v == "1").unwrap_or(false)),
+            xshared_max_cols: std::env::var("LB_Q4_XSHARED_MAX_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
         })
+    }
+
+    /// Rows per plane the Q4_0 kernels use (1 = the one-row kernels).
+    pub fn q4_rows(&self) -> usize {
+        self.q4_rows.load(Ordering::Relaxed)
+    }
+
+    /// Switch the Q4_0 kernels' rows per plane: 4 or 8 take the rows kernels, anything else the
+    /// one-row ones. Live (an A/B in one process); a kernel already queued is unaffected.
+    pub fn set_q4_rows(&self, r: usize) {
+        self.q4_rows.store(if r == 4 || r == 8 { r } else { 1 }, Ordering::Relaxed);
+    }
+
+    pub fn q4_xshared(&self) -> bool {
+        self.q4_xshared.load(Ordering::Relaxed)
+    }
+
+    pub fn set_q4_xshared(&self, on: bool) {
+        self.q4_xshared.store(on, Ordering::Relaxed);
+    }
+
+    /// Rows per plane for a matrix of `rows` rows, or `None` for the one-row kernel (knob at 1,
+    /// no plane ops, or rows not a multiple).
+    fn rows_for(&self, rows: usize) -> Option<usize> {
+        let r = self.q4_rows();
+        (self.use_plane && (r == 4 || r == 8) && rows % r == 0).then_some(r)
+    }
+
+    /// Whether the rows kernel stages `x` in shared memory: one input row, narrow enough.
+    fn xshared_for(&self, n_x_rows: usize, cols: usize) -> bool {
+        self.q4_xshared() && n_x_rows == 1 && cols <= self.xshared_max_cols
     }
 
     /// Whether a miss's three matrices go up as one batch (see `batch_miss`).
@@ -538,6 +588,28 @@ impl GpuQ4Mat {
     pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
+        if let Some(r) = gpu.rows_for(self.rows) {
+            let xsh = gpu.xshared_for(m, self.cols);
+            unsafe {
+                q4_0_matvec_rows_kernel::launch(
+                    &gpu.client,
+                    cube_count(n_out / r, gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(self.qs.clone(), self.n_qs / 4),
+                    BufferArg::from_raw_parts(self.sc.clone(), self.n_sc),
+                    BufferArg::from_raw_parts(x.clone(), m * self.cols / 4),
+                    // not routed: `routes` is never read, any real buffer will do
+                    BufferArg::from_raw_parts(self.dims.clone(), 2),
+                    BufferArg::from_raw_parts(self.dims.clone(), 2),
+                    BufferArg::from_raw_parts(out.clone(), n_out),
+                    r,
+                    xsh,
+                    if xsh { self.cols / 4 } else { 1 },
+                    false,
+                );
+            }
+            return out;
+        }
         unsafe {
             // `from_raw_parts` counts ELEMENTS of the kernel's slice type, not u32 words:
             // `qs`/`qv` are `&[V4U]` and `x` is `&[V4F]`, so the word counts divide by 4. Both
@@ -573,6 +645,10 @@ impl GpuQ4Mat {
         assert!(gate.rows == up.rows && gate.cols == up.cols, "gate/up shape mismatch");
         let n_h = m * gate.rows;
         let h = gpu.scratch(n_h * 4);
+        if gpu.rows_for(gate.rows).is_some() {
+            gpu.gate_up_rows(gate, up, x, m, &h);
+            return h;
+        }
         unsafe {
             debug_assert_eq!(gate.n_qs % 4, 0);
             debug_assert_eq!((m * gate.cols) % 4, 0);
@@ -595,6 +671,32 @@ impl GpuQ4Mat {
 }
 
 impl Gpu {
+    /// The rows variant of the fused gate/up/silu into `h` (`m * gate.rows`), two resident matrices.
+    fn gate_up_rows(&self, gate: &GpuQ4Mat, up: &GpuQ4Mat, x: &Handle, m: usize, h: &Handle) {
+        let r = self.rows_for(gate.rows).expect("caller checked");
+        let n_h = m * gate.rows;
+        let xsh = self.xshared_for(m, gate.cols);
+        unsafe {
+            q4_0_gate_up_silu_rows_kernel::launch(
+                &self.client,
+                cube_count(n_h / r, self.per_cube()),
+                CubeDim::new_1d(self.cube_dim as u32),
+                BufferArg::from_raw_parts(gate.qs.clone(), gate.n_qs / 4),
+                BufferArg::from_raw_parts(gate.sc.clone(), gate.n_sc),
+                BufferArg::from_raw_parts(up.qs.clone(), up.n_qs / 4),
+                BufferArg::from_raw_parts(up.sc.clone(), up.n_sc),
+                BufferArg::from_raw_parts(x.clone(), m * gate.cols / 4),
+                BufferArg::from_raw_parts(gate.dims.clone(), 2),
+                BufferArg::from_raw_parts(gate.dims.clone(), 2),
+                BufferArg::from_raw_parts(h.clone(), n_h),
+                r,
+                xsh,
+                if xsh { gate.cols / 4 } else { 1 },
+                false,
+            );
+        }
+    }
+
     /// The short-conv middle for one token on device buffers: `bcx` is `in_proj`'s output
     /// (`[b | c | x]`, `3e`), `taps` `[l, e]`, `state` `[l - 1, e]` (advanced in place). Returns
     /// `y` (scratch, `e`), the input of `out_proj`. See `conv_decode_kernel`.
@@ -854,6 +956,11 @@ impl GpuExpert {
         assert!(self.gate.rows == self.up.rows && self.gate.cols == self.up.cols, "gate/up shape mismatch");
         let n_h = m * n_ff;
         let h = gpu.scratch(n_h * 4);
+        if gpu.rows_for(n_ff).is_some() {
+            gpu.gate_up_rows(&self.gate, &self.up, x, m, &h);
+            let out = self.down.launch(gpu, &h, m);
+            return (out, m * self.down.rows);
+        }
         unsafe {
             // `from_raw_parts` counts ELEMENTS of the kernel's slice type, not u32 words:
             // `qs`/`qv` are `&[V4U]` and `x` is `&[V4F]`, so the word counts divide by 4. Both
@@ -1054,6 +1161,49 @@ impl GpuExpertLayer {
     fn launch_with(&self, gpu: &Gpu, x: &Handle, n_tokens: usize, rh: &Handle, n_route_words: usize, slots: usize, gu_dims: &Handle, dn_dims: &Handle) -> (Handle, usize) {
         let n_h = slots * self.n_ff;
         let h = gpu.scratch(n_h * 4);
+        if let (Some(r), Some(_)) = (gpu.rows_for(self.n_ff), gpu.rows_for(self.n_embd)) {
+            // every slot of a decode token reads token 0, so x can sit in shared memory
+            let xsh = gpu.xshared_for(n_tokens, self.n_embd);
+            unsafe {
+                q4_0_gate_up_silu_rows_kernel::launch(
+                    &gpu.client,
+                    cube_count(n_h / r, gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(self.gate.0.clone(), self.gate.1 / 4),
+                    BufferArg::from_raw_parts(self.gate.2.clone(), self.gate.3),
+                    BufferArg::from_raw_parts(self.up.0.clone(), self.up.1 / 4),
+                    BufferArg::from_raw_parts(self.up.2.clone(), self.up.3),
+                    BufferArg::from_raw_parts(x.clone(), n_tokens * self.n_embd / 4),
+                    BufferArg::from_raw_parts(rh.clone(), n_route_words),
+                    BufferArg::from_raw_parts(gu_dims.clone(), 3),
+                    BufferArg::from_raw_parts(h.clone(), n_h),
+                    r,
+                    xsh,
+                    if xsh { self.n_embd / 4 } else { 1 },
+                    true,
+                );
+            }
+            let n_out = slots * self.n_embd;
+            let out = gpu.scratch(n_out * 4);
+            unsafe {
+                q4_0_matvec_rows_kernel::launch(
+                    &gpu.client,
+                    cube_count(n_out / r, gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(self.down.0.clone(), self.down.1 / 4),
+                    BufferArg::from_raw_parts(self.down.2.clone(), self.down.3),
+                    BufferArg::from_raw_parts(h.clone(), n_h / 4),
+                    BufferArg::from_raw_parts(rh.clone(), n_route_words),
+                    BufferArg::from_raw_parts(dn_dims.clone(), 3),
+                    BufferArg::from_raw_parts(out.clone(), n_out),
+                    r,
+                    false,
+                    1,
+                    true,
+                );
+            }
+            return (out, n_out);
+        }
         unsafe {
             debug_assert_eq!(self.gate.1 % 4, 0);
             debug_assert_eq!((n_tokens * self.n_embd) % 4, 0);

@@ -749,3 +749,223 @@ fn q4_0_routed_matvec_kernel(
         o += step;
     }
 }
+
+// ---- D2: R rows per plane (docs/DEVICE_DECODE_PLAN.md) ----
+//
+// The kernels above give each plane one output row: two 16-byte loads a lane (`qs` and its
+// scale word) and then the FMAs, so few bytes are in flight per SM and the P100 streams at ~7%
+// of HBM2. Here a plane takes `r` consecutive rows (4 or 8, `LB_Q4_ROWS`): per block it issues
+// the `r` quant loads, the `r` scale loads and the 8 activation loads **before** any FMA, keeps
+// `r` partials, and reduces them together at the end (`plane_sum` on a 4-wide vector, one per 4
+// rows) instead of once a row. With `xshared` the activation row (m = 1) is staged in shared
+// memory once per cube, since every row reads all of it.
+//
+// Per row the arithmetic is `q4_row_partial`'s exactly (same blocks per lane, same order), so
+// the outputs are the same numbers; only the reduction is batched.
+
+/// `r` row partials of one plane's lane: rows `0..r` start at global blocks `gb0 + i * bpr`, the
+/// activation row at vector `x4_0` (in `xs` when `xshared`). Written into `acc[0..r]`.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn q4_rows_acc(
+    qs: &[V4U],
+    sc: &[u32],
+    x: &[V4F],
+    xs: &Shared<[V4F]>,
+    gb0: usize,
+    bpr: usize,
+    x4_0: usize,
+    lane: usize,
+    width: usize,
+    acc: &mut Array<f32>,
+    #[comptime] r: usize,
+    #[comptime] xshared: bool,
+) {
+    let mut accv = Array::<V4F>::new(r);
+    #[unroll]
+    for i in 0..r {
+        accv[i] = V4F::new(0.0f32);
+    }
+    let mut b = lane;
+    while b < bpr {
+        // every load of this block first: r quant vectors, r scales, 8 activation vectors
+        let mut q = Array::<V4U>::new(r);
+        let mut d = Array::<u32>::new(r);
+        #[unroll]
+        for i in 0..r {
+            let gb = gb0 + i * bpr + b;
+            q[i] = qs[gb];
+            d[i] = (sc[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32;
+        }
+        let mut xv = Array::<V4F>::new(8usize);
+        let xb = x4_0 + b * 8usize;
+        #[unroll]
+        for j in 0..8usize {
+            if xshared {
+                xv[j] = xs[xb + j];
+            } else {
+                xv[j] = x[xb + j];
+            }
+        }
+        #[unroll]
+        for i in 0..r {
+            let mut s = V4F::new(0.0f32);
+            #[unroll]
+            for j in 0..8u32 {
+                let nib = (q[i] >> V4U::new(4u32 * j)) & V4U::new(15u32);
+                let f = V4F::cast_from(nib) - V4F::new(8.0f32);
+                s += f * xv[j as usize];
+            }
+            accv[i] += V4F::new(f16_to_f32(d[i])) * s;
+        }
+        b += width;
+    }
+    #[unroll]
+    for i in 0..r {
+        let a = accv[i];
+        acc[i] = a.extract(0usize) + a.extract(1usize) + a.extract(2usize) + a.extract(3usize);
+    }
+}
+
+/// Reduce `acc[c*4 .. c*4+4]` across the plane in one `plane_sum`; the 4 totals, valid in every lane.
+#[cube]
+fn plane_sum4(acc: &Array<f32>, c: usize) -> V4F {
+    let mut v = V4F::new(0.0f32);
+    v.insert(0usize, acc[4usize * c]);
+    v.insert(1usize, acc[4usize * c + 1usize]);
+    v.insert(2usize, acc[4usize * c + 2usize]);
+    v.insert(3usize, acc[4usize * c + 3usize]);
+    plane_sum(v)
+}
+
+/// Stage `n4` activation vectors in shared memory (whole cube; ends on a barrier).
+#[cube]
+fn stage_x(x: &[V4F], xs: &mut Shared<[V4F]>, n4: usize) {
+    let mut i = UNIT_POS as usize;
+    while i < n4 {
+        xs[i] = x[i];
+        i += CUBE_DIM_X as usize;
+    }
+    sync_cube();
+}
+
+/// Q4_0 matvec, `r` rows per plane (needs plane ops; `rows % r == 0`, `r % 4 == 0`).
+/// Plain: `dims` = [rows, cols], output `o = t * rows + row`. `routed`: `dims` = [rows, cols,
+/// base], output `o = slot * rows + row`, expert `routes[2 (base + slot)]`, input row `slot`
+/// (the routed `down` of an expert layer). `xshared` only with one input row.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn q4_0_matvec_rows_kernel(
+    qs: &[V4U],
+    sc: &[u32],
+    x: &[V4F],
+    routes: &[u32],
+    dims: &[u32],
+    out: &mut [f32],
+    #[comptime] r: usize,
+    #[comptime] xshared: bool,
+    #[comptime] xlen: usize,
+    #[comptime] routed: bool,
+) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let mut xs = Shared::<[V4F]>::new_slice(xlen);
+    if xshared {
+        stage_x(x, &mut xs, cols / 4usize);
+    }
+    let width = PLANE_DIM as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let groups = out.len() / r;
+    let mut g = CUBE_POS as usize * ppc + plane_id;
+    let mut acc = Array::<f32>::new(r);
+    while g < groups {
+        let o0 = g * r;
+        let t = o0 / rows;
+        let r0 = o0 % rows;
+        let mut gb0 = r0 * bpr;
+        if routed {
+            let e = routes[2usize * (dims[2] as usize + t)] as usize;
+            gb0 += e * rows * bpr;
+        }
+        q4_rows_acc(qs, sc, x, &xs, gb0, bpr, t * cols / 4usize, lane, width, &mut acc, r, xshared);
+        #[unroll]
+        for c in 0..r / 4 {
+            let v = plane_sum4(&acc, c);
+            if lane == 0usize {
+                #[unroll]
+                for k in 0..4usize {
+                    out[o0 + 4 * c + k] = v.extract(k);
+                }
+            }
+        }
+        g += step;
+    }
+}
+
+/// `h = silu(x . gate) * (x . up)`, `r` rows per plane (gate's `r` rows, then up's).
+/// Plain: `dims` = [rows, cols], `o = t * rows + row`. `routed`: `dims` = [rows, cols, base],
+/// `o = slot * rows + row`, expert and token from `routes[2 (base + slot) ..]`.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn q4_0_gate_up_silu_rows_kernel(
+    gq: &[V4U],
+    gs: &[u32],
+    uq: &[V4U],
+    us: &[u32],
+    x: &[V4F],
+    routes: &[u32],
+    dims: &[u32],
+    h: &mut [f32],
+    #[comptime] r: usize,
+    #[comptime] xshared: bool,
+    #[comptime] xlen: usize,
+    #[comptime] routed: bool,
+) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let mut xs = Shared::<[V4F]>::new_slice(xlen);
+    if xshared {
+        stage_x(x, &mut xs, cols / 4usize);
+    }
+    let width = PLANE_DIM as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let groups = h.len() / r;
+    let mut g = CUBE_POS as usize * ppc + plane_id;
+    let mut ag = Array::<f32>::new(r);
+    let mut au = Array::<f32>::new(r);
+    while g < groups {
+        let o0 = g * r;
+        let t = o0 / rows;
+        let r0 = o0 % rows;
+        let mut gb0 = r0 * bpr;
+        let mut tok = t;
+        if routed {
+            let base = dims[2] as usize;
+            gb0 += routes[2usize * (base + t)] as usize * rows * bpr;
+            tok = routes[2usize * (base + t) + 1usize] as usize;
+        }
+        q4_rows_acc(gq, gs, x, &xs, gb0, bpr, tok * cols / 4usize, lane, width, &mut ag, r, xshared);
+        q4_rows_acc(uq, us, x, &xs, gb0, bpr, tok * cols / 4usize, lane, width, &mut au, r, xshared);
+        #[unroll]
+        for c in 0..r / 4 {
+            let vg = plane_sum4(&ag, c);
+            let vu = plane_sum4(&au, c);
+            if lane == 0usize {
+                #[unroll]
+                for k in 0..4usize {
+                    let gv = vg.extract(k);
+                    h[o0 + 4 * c + k] = gv / (1.0f32 + Exp::exp(-gv)) * vu.extract(k);
+                }
+            }
+        }
+        g += step;
+    }
+}
