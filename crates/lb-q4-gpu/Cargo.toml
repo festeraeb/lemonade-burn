@@ -28,3 +28,7 @@ rayon.workspace = true
 [[example]]
 name = "register_bench"
 required-features = ["cuda"]
+
+[[example]]
+name = "miss_bench"
+required-features = ["cuda"]

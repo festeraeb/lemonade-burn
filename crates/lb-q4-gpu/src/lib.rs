@@ -16,7 +16,9 @@
 //! same kernel is right for wave32 and wave64. Devices without subgroup ops fall back to one
 //! output per cube with a shared-memory tree.
 
+pub mod decode;
 pub mod store;
+pub use decode::TokenParams;
 pub use store::{pick_cube_device, Gpu, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat};
 #[cfg(feature = "cuda")]
 pub mod pinned;
@@ -648,7 +650,9 @@ pub fn q6_k_matvec_gpu(w: QuantMat<'_>, x: &[f32], m: usize) -> Result<Vec<f32>,
 ///
 /// `routes` holds two u32 per slot: `[expert_id, token_index]`. A slot is one (expert, token)
 /// pair the router chose, so `h` is `[slots, rows]` and output `o` maps to slot `o / rows`,
-/// row `o % rows`. Expert `e`'s rows start at block `e * rows * bpr`.
+/// row `o % rows`. Expert `e`'s rows start at block `e * rows * bpr`. `dims` = `[rows, cols,
+/// base]`: the launch's slots start at slot `base` of `routes`, so a device-resident decode can
+/// keep every layer's routes in one buffer and read them all back with the logits.
 ///
 /// Concatenation is only sound because `q4_row_partial` reads the f16 scale at `sc[gb / 2]` from
 /// the GLOBAL block index: each expert's block count must therefore be even, or an expert
@@ -669,6 +673,8 @@ fn q4_0_routed_gate_up_silu_kernel(
     let cols = dims[1] as usize;
     let bpr = cols / 32usize;
     let bpe = rows * bpr;
+    // first slot of this launch in `routes` (a per-token buffer holds every layer's slots)
+    let rbase = dims[2] as usize;
     let mut sm = Shared::<[f32]>::new_slice(256usize);
     let mut width = CUBE_DIM_X as usize;
     let mut plane_id = 0usize;
@@ -684,8 +690,8 @@ fn q4_0_routed_gate_up_silu_kernel(
     while o < h.len() {
         let slot = o / rows;
         let r = o % rows;
-        let e = routes[2usize * slot] as usize;
-        let tok = routes[2usize * slot + 1usize] as usize;
+        let e = routes[2usize * (rbase + slot)] as usize;
+        let tok = routes[2usize * (rbase + slot) + 1usize] as usize;
         let gb0 = e * bpe + r * bpr;
         let x4 = tok * cols / 4usize;
         let pg = q4_row_partial(gq, gs, x, gb0, x4, bpr, lane, width);
@@ -717,6 +723,8 @@ fn q4_0_routed_matvec_kernel(
     let cols = dims[1] as usize;
     let bpr = cols / 32usize;
     let bpe = rows * bpr;
+    // first slot of this launch in `routes` (a per-token buffer holds every layer's slots)
+    let rbase = dims[2] as usize;
     let mut sm = Shared::<[f32]>::new_slice(256usize);
     let mut width = CUBE_DIM_X as usize;
     let mut plane_id = 0usize;
@@ -732,7 +740,7 @@ fn q4_0_routed_matvec_kernel(
     while o < out.len() {
         let slot = o / rows;
         let r = o % rows;
-        let e = routes[2usize * slot] as usize;
+        let e = routes[2usize * (rbase + slot)] as usize;
         let p = q4_row_partial(qs, sc, h, e * bpe + r * bpr, slot * cols / 4usize, bpr, lane, width);
         let v = lane_sum(&mut sm, p, use_plane);
         if lane == 0usize {
