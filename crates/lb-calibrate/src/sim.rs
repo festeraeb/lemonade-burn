@@ -57,6 +57,16 @@ pub struct SimConfig {
     pub n_dense_lead: usize,
     pub n_attn_every: usize,
     pub attn_first: usize,
+    /// Bytes of one expert (sets the on-demand copy time). Default: the LFM2.5 Q4_0 expert.
+    #[serde(default = "default_expert_bytes")]
+    pub expert_bytes: usize,
+    /// Explicit layer -> card map (contiguous layer splits). `None` keeps the round-robin deal.
+    #[serde(default)]
+    pub layer_card: Option<Vec<usize>>,
+}
+
+fn default_expert_bytes() -> usize {
+    EXPERT_BYTES
 }
 
 impl SimConfig {
@@ -78,6 +88,8 @@ impl SimConfig {
             n_dense_lead: 2,
             n_attn_every: 4,
             attn_first: 2,
+            expert_bytes: EXPERT_BYTES,
+            layer_card: None,
         }
     }
 
@@ -86,6 +98,9 @@ impl SimConfig {
     }
 
     pub fn card_of(&self, layer: usize) -> usize {
+        if let Some(m) = &self.layer_card {
+            return m[layer.min(m.len() - 1)];
+        }
         if layer < self.n_dense_lead {
             0
         } else {
@@ -154,7 +169,7 @@ pub fn simulate(cfg: &SimConfig, trace: &Trace, staged: &[Vec<u16>]) -> SimResul
     let n_layer = trace.n_layer;
     let n_cards = cfg.cards.len();
     let mut res = SimResult { static_cards: (0..n_cards).map(|c| cfg.is_static(c, n_layer)).collect(), ..Default::default() };
-    let b_mb = EXPERT_BYTES as f64 / 1e6;
+    let b_mb = cfg.expert_bytes as f64 / 1e6;
     // spare slots per layer for dynamic admission (static cards only)
     let mut pools: Vec<LayerPool> = (0..n_layer)
         .map(|l| {

@@ -12,3 +12,4 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+lb-gguf.workspace = true

@@ -3,6 +3,7 @@
 //! the card topology from the drivers (`topology`), routing traces from NautiBurn scrapes
 //! (`trace`), a discrete-event model of the layer pipeline (`sim`), and the tuner that
 //! picks the staging config for this hardware and writes it for the engine (`tune`).
+pub mod fleet;
 pub mod sim;
 pub mod timings;
 pub mod topology;

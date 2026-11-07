@@ -3848,6 +3848,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "lb-gguf",
  "lb-lfm2",
  "serde",
  "serde_json",
