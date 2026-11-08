@@ -33,8 +33,8 @@ def complete(p):
         rate, pre = t.get("predicted_per_second"), t.get("prompt_s")
     return {"tokens": toks, "decode_tok_s": rate, "prefill_s": pre, "text_sha": hashlib.sha256(txt.encode()).hexdigest()[:16], "t0": t0, "t1": time.time()}
 
-common = {"label": label, "arm": arm, "round": int(E["ROUND"]), "expert_mib": int(E["MIB"]), "ring_mib": int(E["RING"]) if arm.startswith("b") else 0,
-          "slots": int(E["SLOTS"]) if arm.startswith("b") else 0, "min_margin": float(E["MARGIN"]) if arm.startswith("b") else None, "vram_used_mib": int(E["VRAM"] or 0)}
+common = {"label": label, "arm": arm, "round": int(E["ROUND"]), "expert_mib": int(E["MIB"]), "ring_mib": int(E["RING"]) if arm not in ("a", "c") else 0,
+          "slots": int(E["SLOTS"]) if arm not in ("a", "c") else 0, "min_margin": float(E["MARGIN"]) if arm not in ("a", "c") else None, "vram_used_mib": int(E["VRAM"] or 0)}
 w = complete(prompts[0])
 before = None if is_llama else get("/v1/placement")
 rows = []

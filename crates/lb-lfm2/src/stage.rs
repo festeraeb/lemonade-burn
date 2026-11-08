@@ -26,7 +26,8 @@
 //!
 //! Off by default (Avalon's PREGATE lesson, `docs/LESSONS_FROM_AVALON.md` 2.5: a prefetch that
 //! competes for bandwidth when the hit rate is already high makes things slower). Settings are
-//! read once at start: `LB_STAGE=1`, `LB_STAGE_SLOTS` (guesses per layer, default 8),
+//! read once at start: `LB_STAGE=1`, `LB_STAGE_SLOTS` (guesses per layer, default 8; 0 = none,
+//! the ring only caches demand misses with `LB_STAGE_KEEP_MISSES=1`),
 //! `LB_STAGE_RING_MIB` (ring size, default 256), `LB_STAGE_MIN_MARGIN` (skip guesses below this
 //! margin, default 0 = off), `LB_STAGE_KEEP_MISSES=1` (demand misses also stay in the ring).
 
@@ -65,7 +66,9 @@ impl StageCfg {
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<f64>().ok());
         Self {
             on: on("LB_STAGE"),
-            slots: num("LB_STAGE_SLOTS").map(|v| v as usize).filter(|&v| v > 0).unwrap_or(d.slots),
+            // 0 = no prefetch at all: with `LB_STAGE_KEEP_MISSES=1` the ring is then only a
+            // Least-Stale cache of demand misses (separates caching from prediction in an A/B)
+            slots: num("LB_STAGE_SLOTS").map(|v| v as usize).unwrap_or(d.slots),
             ring_mib: num("LB_STAGE_RING_MIB").map(|v| v as usize).unwrap_or(d.ring_mib),
             min_margin: num("LB_STAGE_MIN_MARGIN").map(|v| v as f32).unwrap_or(d.min_margin),
             keep_misses: on("LB_STAGE_KEEP_MISSES"),

@@ -394,7 +394,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         Some(ring) => {
                             let x_mid = f32v(&bufs.pop().expect("x read with h2"));
                             let t = Instant::now();
-                            let next = crate::stage::predict(&m.w, li + 1, &x_mid, m.store.stage.slots);
+                            let next = if m.store.stage.slots > 0 { crate::stage::predict(&m.w, li + 1, &x_mid, m.store.stage.slots) } else { None };
                             m.stats.stage.issue_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             Some(crate::stage::RingCall { ring, gpu, w: &m.w, cfg: &m.store.stage, stats: &m.stats.stage, next })
                         }

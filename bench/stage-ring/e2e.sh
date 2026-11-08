@@ -12,7 +12,7 @@
 set -u
 . /mnt/ssd/lb-stage/env.sh
 ARM=$1; ROUND=$2
-case $ARM in b4) SLOTS=4;; b4k) SLOTS=4;; esac
+case $ARM in b4) SLOTS=4;; b4k) SLOTS=4;; k) SLOTS=0;; esac
 MIB=${MIB:-5120}; RING=${RING:-256}; SLOTS=${SLOTS:-8}; MARGIN=${MARGIN:-0}
 OUT=${OUT:-/mnt/t440/fast/lb-stage/2026-11-08}
 TAG=${TAG:-m$MIB}
@@ -27,7 +27,7 @@ COMMON="LB_DD_HOST_MOE=1 LB_EXPERT_VRAM_MIB=$MIB LB_THREADS=8"
 case $ARM in
   a)  env $COMMON $BASE/bin/lemonade-burn-server-stage $LBARGS > "$LOG" 2>&1 & ;;
   b|b4)  env $COMMON LB_STAGE=1 LB_STAGE_SLOTS=$SLOTS LB_STAGE_RING_MIB=$RING LB_STAGE_MIN_MARGIN=$MARGIN $BASE/bin/lemonade-burn-server-stage $LBARGS > "$LOG" 2>&1 & ;;
-  bk|b4k) env $COMMON LB_STAGE=1 LB_STAGE_SLOTS=$SLOTS LB_STAGE_RING_MIB=$RING LB_STAGE_MIN_MARGIN=$MARGIN LB_STAGE_KEEP_MISSES=1 $BASE/bin/lemonade-burn-server-stage $LBARGS > "$LOG" 2>&1 & ;;
+  bk|b4k|k) env $COMMON LB_STAGE=1 LB_STAGE_SLOTS=$SLOTS LB_STAGE_RING_MIB=$RING LB_STAGE_MIN_MARGIN=$MARGIN LB_STAGE_KEEP_MISSES=1 $BASE/bin/lemonade-burn-server-stage $LBARGS > "$LOG" 2>&1 & ;;
   c)  LD_LIBRARY_PATH=$BASE/llama/bin:$BASE/llama/cuda12-libs $BASE/llama/bin/llama-server -m $LB_MODEL --port $PORT -c 2048 -ngl 99 -cmoe --moe-cache-mib $MIB -fa on -t 8 -np 1 -lv 4 > "$LOG" 2>&1 & ;;
   *) echo "unknown arm $ARM"; exit 2;;
 esac

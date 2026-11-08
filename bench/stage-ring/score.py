@@ -42,6 +42,16 @@ for s in sess:
     bw = imc(s["label"], min(r["t0"] for r in rs), max(r["t1"] for r in rs))
     if bw:
         o["dram_read_mb_s"], o["dram_write_mb_s"] = bw
+    lg = f"{d}/logs/server-{s['label']}.log"
+    if s["arm"] == "c" and os.path.exists(lg):
+        import re
+        for line in open(lg, errors="replace"):
+            m = re.search(r"ubatch <= 8: hits = (\d+), misses = (\d+), hit rate = [0-9.]+%, uploaded = ([0-9.]+) MiB", line)
+            if m:
+                h, mi, up = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                # whole session incl. warmup and small prompt ubatches; 38 MoE layers x top-4 per token
+                ntok = toks + (s.get("warmup") or {}).get("tokens", 0)
+                o.update({"hit": h / (h + mi), "stalls_tok": mi / ntok, "llama_uploaded_mb_tok": up * 1.048576 / ntok})
     if s.get("placement_before") and s.get("placement_after"):
         st = diff(s["placement_before"]["stage"], s["placement_after"]["stage"])
         n = st["tokens"] or 1
@@ -52,7 +62,6 @@ for s in sess:
             "stalls_tok": g("all")["demand"] / n,
             "prefetch_mb_tok": st["prefetch_bytes"] / n / 1e6,
             "wasted_mb_tok": st["wasted_bytes"] / n / 1e6,
-            "moe_read_ms_tok": st["moe_read_ms_per_token"] if False else None,
         })
         for grp in ("attn_targets", "conv_targets"):
             x = g(grp)
@@ -73,6 +82,11 @@ for a in arms:
     summ[a] = {"n": len(ts), "tok_s_median": statistics.median(ts), "tok_s_min": ts[0], "tok_s_max": ts[-1], "hit": m("hit"), "staged_rate": m("staged_rate"),
                "stalls_tok": m("stalls_tok"), "prefetch_mb_tok": m("prefetch_mb_tok"), "wasted_mb_tok": m("wasted_mb_tok"),
                "dram_read_mb_s": m("dram_read_mb_s"), "vram_mib": m("vram")}
+    for grp in ("attn_targets", "conv_targets"):
+        g = [o[grp] for o in xs if grp in o]
+        if g:
+            med = lambda k: statistics.median(x[k] for x in g if x.get(k) is not None) if any(x.get(k) is not None for x in g) else None
+            summ[a][grp] = {"hit": med("hit"), "staged_rate": med("staged_rate"), "precision": med("precision")}
     print(a, json.dumps(summ[a]))
 base = summ.get("a")
 for a in arms:
