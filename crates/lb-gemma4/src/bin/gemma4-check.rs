@@ -42,6 +42,11 @@ struct Args {
     report: Option<PathBuf>,
     #[arg(long)]
     trace_dir: Option<PathBuf>,
+    /// Capture-hook / predictor check: capture every layer of each prompt's prefill, then guess
+    /// layer L+1's experts from layer L's `x_mid` (lb-lfm2 `stage::rank` via `Gemma4::predict`)
+    /// and report recall against the routes the engine actually took.
+    #[arg(long, default_value_t = false)]
+    predict_check: bool,
     /// Prefill one token per pass (decode path only) instead of one batched pass.
     #[arg(long, default_value_t = false)]
     serial_prefill: bool,
@@ -110,6 +115,38 @@ fn top5(p: &[f32]) -> Vec<(u32, f32)> {
     t
 }
 
+/// From the capture just taken: (recall@k of the top-k guess, share of token-layers whose k
+/// experts all fall in the top k+4 guess, token-layers scored). Turns the capture off.
+fn predict_recall(model: &Gemma4) -> (f64, f64, usize) {
+    let cap = model.take_capture();
+    model.set_capture(false);
+    let k = model.cfg().n_expert_used;
+    let e = model.cfg().n_embd;
+    let (mut hit, mut tot, mut allk, mut n) = (0usize, 0usize, 0usize, 0usize);
+    for w in cap.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if b.layer != a.layer + 1 || b.routes.is_empty() {
+            continue;
+        }
+        for t in 0..a.m {
+            let x = &a.x_mid[t * e..(t + 1) * e];
+            let Some(g) = model.predict(b.layer, x, k + 4) else {
+                continue;
+            };
+            let actual = &b.routes[t].experts;
+            hit += actual.iter().filter(|x| g.experts[..k].contains(x)).count();
+            tot += actual.len();
+            allk += actual.iter().all(|x| g.experts.contains(x)) as usize;
+            n += 1;
+        }
+    }
+    (
+        hit as f64 / tot.max(1) as f64,
+        allk as f64 / n.max(1) as f64,
+        n,
+    )
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let t = Instant::now();
@@ -154,6 +191,9 @@ fn main() -> Result<()> {
         if args.trace_dir.is_some() {
             model.set_trace(true);
         }
+        if args.predict_check {
+            model.set_capture(true);
+        }
         let t1 = Instant::now();
         let mut logits = if args.serial_prefill {
             let mut l = Vec::new();
@@ -178,6 +218,11 @@ fn main() -> Result<()> {
             )?;
             model.set_trace(false);
         }
+        let predict = if args.predict_check {
+            Some(predict_recall(&model))
+        } else {
+            None
+        };
         println!(
             "\n== case {ci} ({kind}, {} prompt tokens): {:?}",
             ids.len(),
@@ -240,7 +285,10 @@ fn main() -> Result<()> {
             if ok { "PASS" } else { "FAIL" },
             (oracle.len().saturating_sub(1)) as f64 / decode_s.max(1e-9)
         );
-        reports.push(json!({"case": ci, "kind": kind, "prompt": text, "ids": ids, "identical_steps": same_run, "first_diff": first_diff,
+        if let Some((rk, rall, n)) = predict {
+            println!("case {ci}: capture hook {n} token-layers; mid1 guess of layer L+1 from layer L's x_mid: recall@k {rk:.3}, all-k at k+4 {rall:.3}");
+        }
+        reports.push(json!({"predict_recall_k": predict.map(|p| p.0), "predict_allk_k4": predict.map(|p| p.1), "case": ci, "kind": kind, "prompt": text, "ids": ids, "identical_steps": same_run, "first_diff": first_diff,
             "top5_all_match": top5_all, "max_dp": worst_dp, "pass": ok, "prefill_s": prefill_s, "decode_s": decode_s, "steps": steps}));
     }
     println!("\nOVERALL {}", if all_ok { "PASS" } else { "FAIL" });
