@@ -103,6 +103,54 @@ nothing and keeps demand misses in a Least-Stale ring; `b4k` adds the top-4 gues
   pool) before caching can be measured.
 
 
+### Exp. #2b: Tesla P100 at Gen3 x16 (c2 GPU2), the link where prefetch could pay
+
+Same model, prompts, 5120 MiB budget, binaries as above; card UUID-pinned
+(GPU-c012cc70-3f06-1718-84e2-073aa275f0af). llama.cpp rebuilt with sm_60 (`/mnt/fast/llama-build-ivb60`).
+Arms a / b4 / b4m / b interleaved 5 rounds; llama.cpp (c) then 5 rounds interleaved with 5 fresh (a)
+sessions (`m5120c-*`), because its build finished after the first batch had started. Data:
+`/mnt/fast/lb-stage/2026-11-08/c2-p100-x16/` (`RESUME.md` beside it). `b4m` = b4 with
+`LB_STAGE_MIN_MARGIN=0.0054`: the 25th percentile of `mid1` decode margins in exp. #1 (that bottom
+quartile has recall@4 0.753 vs 0.914 for the top quartile), so the gate skips the least confident
+quarter of guesses.
+
+**Bus** (`stage_bench`, this card): 4 experts 2.72 ms on demand = 7.8 GB/s, side-stream copy 8.1 GB/s;
+8 experts 8.3 / 8.4 GB/s; **0.63-0.68 ms an expert** (5.5x the 2060's). A main-stream read with 4
+copies in flight on the side stream: 1.79 ms vs 0.96 alone [measured].
+
+| arm | tok/s median [min-max], 5 rounds | x (a) | hit rate | stalls / token | prefetch MB / token | wasted MB / token | token ms (MoE read / guess on CPU) |
+|---|---|---|---|---|---|---|---|
+| (a) | **10.18** [10.10-10.27]; paired batch 10.20 [10.07-10.32] | 1.00 | 0.482 | 78.7 | 0 | 0 | 99.4 (64.6 / 0) |
+| (b4) | **11.80** [11.67-12.00] | **1.16** | 0.872 | 19.4 | 412 | 93 | 85.8 (48.8 / 9.0) |
+| (b4m) margin >= 0.0054 | **9.88** [9.86-10.01] | **0.97** | 0.765 | 35.7 | 259 | 51 | 102.5 (56.0 / 11.2) |
+| (b) | **9.77** [9.76-9.78] | **0.96** | 0.950 | 7.7 | 849 | 455 | 103.8 (73.0 / 8.0) |
+| (c) llama.cpp | **15.72** [15.64-15.90] | **1.54** (vs the paired a) | 0.72 | ~45 | - | - | ~63.6 |
+
+All [measured]; token ms from the engine's own counters (device-decode ms per token, host time blocked in
+the MoE reads, and the guess: 38 router dots + side-stream submits on the CPU).
+
+**Gates on x16: >= 1.3x over (a) FAIL** (best 1.16x, b4); **>= llama.cpp FAIL** (b4 = 0.75x of it).
+**Sha: PASS**, 25 more lemonade-burn sessions on the P100, same text per prompt as on the 2060 and the 1070
+(sonar `062392b8d2b0361a`), 55 sessions over three cards in all.
+
+**Margin gate (b4m):** it does cut waste (prefetch 412 -> 259 MB, wasted 93 -> 51 MB a token, precision
+82 -> 85 % on conv targets) but it skips whole token-layers, so stalls go back up (19 -> 36 a token) and
+the guess is still computed. Net 0.97x: worse than b4. A per-expert confidence (score gap to the k-th)
+would be the next thing to try, not a per-token-layer gate.
+
+**Does the bytes model hold on x16? Only half.** On the 2060 the token was bytes / bus. Here (a)'s 418 MB
+is 52 ms at 8.1 GB/s of a 99 ms token [derived]; the rest is the 76 host round trips a token (router input
+read 16 ms, launches, the guess). And (b) moves 890 MB a token inside a 104 ms token, which needs >= 8.6
+GB/s: two streams together get more than `stage_bench`'s single-stream 8.1-8.4 (the 11.2 GB/s registered
+slice rate measured on this card on 11-03 is the likely ceiling) [estimate]. So the P100 token is about
+half copies, half host work: that is why overlap pays at all here (1.16x) and why it cannot reach 1.3x
+while the guess costs 9 ms on the CPU and the MoE layers still sync twice each.
+
+**What would it take [estimate]:** the guess on the device (router_topk exists) removes ~9 ms -> ~77 ms,
+~1.29x; folding the guess into the existing h2 read instead of a separate pass is the same lever. llama.cpp
+is at 63.6 ms with a 0.72 hit rate and no per-layer host round trips; matching it needs the dynamic cache
+(hit rate) *and* the device-side routing, not more prefetch.
+
 ### What this says to do next
 
 1. **Not a prefetch problem on these links; a residency problem.** Replace (or back) the static heat
@@ -111,6 +159,7 @@ nothing and keeps demand misses in a Least-Stale ring; `b4k` adds the top-4 gues
    to per-token copy time (P100 on Gen3 x16 at 9-11 GB/s, or after the hit rate is up), behind
    `LB_STAGE` and gated per link (lb-calibrate's measured bandwidth), exactly as the memo and
    Avalon's 2.5 suggested. Top-k guesses only; k+4 doubles the bytes for +8 points of hit rate.
+   Measured on the x16 P100 (exp. #2b): top-k ring 1.16x, the only card where it paid at all.
 2. **Pin the GGUF page cache to the GPU's NUMA node** before page-locking it (or `mbind` the
    mapping), and print the node split at load.
 3. Move the guess to the device (`router_topk` already exists in the device decode) to drop the

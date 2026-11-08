@@ -1155,3 +1155,7 @@ a session:
   bytes. llama.cpp's win is its dynamic cache's hit rate (0.73 vs our static 0.48), not overlap.
 * **c1 side finding:** the page-locked GGUF split across two NUMA nodes made each miss 7.7 ms instead of
   1.5; reloading the file's page cache on the GPU's node took arm (a) from 1.59 to 6.6 tok/s.
+* **Exp. #2b, Tesla P100 Gen3 x16 (c2 GPU2, 7.8-8.4 GB/s):** (a) 10.18 tok/s, (b4) 11.80 (**1.16x**), (b4m,
+  margin >= 0.0054) 9.88 (0.97x), (b) 9.77 (0.96x), llama.cpp 15.72 (1.54x over a paired 10.20). Gates fail
+  here too (best 1.16x; 0.75x of llama.cpp); sha holds (55 sessions, three cards). The token is ~half copies,
+  ~half host round trips; the CPU guess costs 8-11 ms of an 86-104 ms token.
