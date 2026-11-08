@@ -68,6 +68,14 @@ for s in sess:
             o[grp] = {"hit": x["routings"] and (x["resident"] + x["staged"]) / x["routings"], "staged_rate": x["routings"] and x["staged"] / x["routings"],
                       "prefetched": x["prefetched"], "useful": x["prefetch_useful"], "wasted": x["prefetch_wasted"],
                       "precision": (x["prefetch_useful"] / (x["prefetch_useful"] + x["prefetch_wasted"])) if (x["prefetch_useful"] + x["prefetch_wasted"]) else None}
+    va = [r.get("vram_after_mib") for r in rs if r.get("vram_after_mib")]
+    if va:
+        o["vram_after_max"] = max(va)
+        o["vram_after_first"] = va[0]
+    pa = (s.get("placement_after") or {}).get("stage")
+    if pa and pa.get("all", {}).get("routings"):
+        a_ = pa["all"]  # whole process incl. warmup, decode only: comparable to llama.cpp's own counter
+        o["hit_process"] = (a_["resident"] + a_["staged"]) / a_["routings"]
     per.append(o)
 
 for o in per:
@@ -81,7 +89,8 @@ for a in arms:
     m = lambda k: statistics.median(o[k] for o in xs if o.get(k) is not None) if any(o.get(k) is not None for o in xs) else None
     summ[a] = {"n": len(ts), "tok_s_median": statistics.median(ts), "tok_s_min": ts[0], "tok_s_max": ts[-1], "hit": m("hit"), "staged_rate": m("staged_rate"),
                "stalls_tok": m("stalls_tok"), "prefetch_mb_tok": m("prefetch_mb_tok"), "wasted_mb_tok": m("wasted_mb_tok"),
-               "dram_read_mb_s": m("dram_read_mb_s"), "vram_mib": m("vram")}
+               "dram_read_mb_s": m("dram_read_mb_s"), "vram_mib": m("vram"), "vram_after_max": max((o.get("vram_after_max") or 0) for o in xs) or None,
+               "hit_process": m("hit_process")}
     for grp in ("attn_targets", "conv_targets"):
         g = [o[grp] for o in xs if grp in o]
         if g:
@@ -100,3 +109,13 @@ for p in prompts:
     print(f"sha {p}: {'SAME' if len(vals) == 1 else 'DIFFER'} {sorted(vals)} over {len(lb)} lemonade-burn sessions")
 llama = {p: {o['shas'].get(p) for o in per if o['arm'] == 'c'} for p in prompts}
 print("llama.cpp shas:", {p: sorted(v) for p, v in llama.items() if v})
+
+# soak / multi-pass sessions: device memory per pass
+for o in per:
+    rs = [r for r in rows if r["label"] == o["label"] and r.get("pass") is not None]
+    passes = sorted({r["pass"] for r in rs})
+    if len(passes) > 1:
+        by = {p: max(r["vram_after_mib"] or 0 for r in rs if r["pass"] == p) for p in passes}
+        print(f"multi-pass {o['label']}: {len(passes)} passes, {len(rs)} completions, vram after pass 0 = {by[passes[0]]} MiB, "
+              f"pass 1 = {by[passes[1]]}, last = {by[passes[-1]]}, max = {max(by.values())}, min after pass 0 = {min(v for p, v in by.items() if p > 0)}; "
+              f"shas per prompt: {len({(r['prompt'], r['text_sha']) for r in rs})} distinct (prompt, sha) pairs")
