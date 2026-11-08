@@ -85,7 +85,23 @@ node-0 GPU cross QPI. Evicting the file (`posix_fadvise DONTNEED`) and reading i
 two-socket box that DMAs experts out of a page-locked mapping (t440, c4: Le Chonk's helper and RDMA
 window) should check where those pages live; the engine does not today.
 
-EXPLORATORY_PLACEHOLDER
+### Exploratory (not a gate measurement): the ring as a miss cache
+
+To separate caching from prediction, `LB_STAGE_SLOTS=0` + `LB_STAGE_KEEP_MISSES=1` (arm `k`) stages
+nothing and keeps demand misses in a Least-Stale ring; `b4k` adds the top-4 guess. Runs in
+`c2-2060-x/` (binary `lemonade-burn-server-stage2`, commit 9fea30d), total expert budget still 5120 MiB:
+
+* ring 2048 MiB (static 3072) and 1024 MiB (static 4096): **out of device memory** on the first prompts
+  (`allocating 7340032 bytes`). The ring is counted at 5.31 MB an expert, but a kept or staged copy
+  holds CubeCL pool slices rounded to 7 MiB plus a transient raw buffer per copy, and kept misses come
+  from the main stream's pool while prefetches come from the side stream's.
+* ring 512 MiB (static 4609): `k` ran 4 of the 5 prompts at **5.49 / 3.51 / 3.94 / 3.17 tok/s** against
+  arm (a)'s 5.01 / 3.23 / 3.37 / 3.00 the same hour (1.05-1.17x, one session, [measured]), then ran out
+  of device memory on the 5th: device memory grows while kept misses churn. `b4k` failed the same way.
+  Not a result yet. It points in the same direction as llama.cpp's numbers (a dynamic cache is the
+  lever), and it is a bug to fix (count and pre-allocate ring slots at their real size, one stream's
+  pool) before caching can be measured.
+
 
 ### What this says to do next
 
