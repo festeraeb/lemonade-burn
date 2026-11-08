@@ -55,5 +55,31 @@ All [measured]. e1 token 65.2 ms = 13.6 router-input reads + 37.2 MoE reads (ker
 * **Soak:** one server, 50 passes of the 5 prompts (250 completions): device memory 6439 MiB after pass 0
   and after every later pass (min = max = 6439), one sha per prompt throughout.
 
-2060_PLACEHOLDER
+### RTX 2060 SUPER Gen2 x4 (c2 GPU1, UUID GPU-de3ce5bc-..., 1.45 GB/s)
+
+| arm | tok/s median [min-max], 5 rounds | x llama.cpp | hit rate | misses / token | device memory at load / max after any completion |
+|---|---|---|---|---|---|
+| **e1** cache | **7.37** [7.32-7.39] | **1.09** | **0.854** (0.844 whole process) | 22.2 | 6313 / **6419** MiB |
+| c llama.cpp | 6.75 [6.74-6.76] | 1.00 | 0.737 | 41.8 | 6211 / 6249 MiB |
+| a0 static plan | 3.05 [3.05-3.06] | 0.45 | 0.482 | 78.7 | 6749 / **7633** MiB (grows) |
+
+All [measured]. e1 at 3072 MiB: same text on all 5 prompts (sonar `062392b8d2b0361a`), 3.8-6.2 tok/s,
+device memory 4305-4369 MiB; 11 lemonade-burn sessions on this card, one sha per prompt.
+
+## Gate (all [measured])
+
+| gate | P100 x16 | 2060 SUPER x4 |
+|---|---|---|
+| hit rate >= 0.70 at 5120 MiB | **0.854 PASS** | **0.854 PASS** |
+| tok/s >= 0.9x llama.cpp at equal VRAM | **0.975x PASS** | **1.09x PASS** |
+| greedy sha unchanged across budgets (3072 / 5120, sonar `062392b8d2b0361a`) | **PASS** | **PASS** |
+| no device memory growth | **PASS**: 50-pass soak (250 completions) flat at 6439 MiB | **PASS**: 6313 at load, +106 MiB of prefill buffers in the first pass, then flat (as on the P100); no soak on this card |
+
+Why the hit rate beats llama.cpp's with the same policy [estimate]: the cache starts seeded from the
+scrape heat order and the 8 staging buffers are the only overhead, so ~1003 slots vs llama.cpp's 1010 hold
+the same budget; and llama.cpp's counter includes prompt batches of <= 8 tokens. Where the time goes
+now (P100): router-input reads (13.6 ms) and the per-layer host round trips, which is engine step E2.
+The device memory the first pass adds (~106 MiB) is the scratch pool sizing itself to the prompts' prefill
+shapes; it does not grow after.
+
 

@@ -1159,3 +1159,10 @@ a session:
   margin >= 0.0054) 9.88 (0.97x), (b) 9.77 (0.96x), llama.cpp 15.72 (1.54x over a paired 10.20). Gates fail
   here too (best 1.16x; 0.75x of llama.cpp); sha holds (55 sessions, three cards). The token is ~half copies,
   ~half host round trips; the CPU guess costs 8-11 ms of an 86-104 ms token.
+
+## Engine step E1: dynamic SLRU expert cache passes its gate on both c2 cards (Fable, 2026-11-08)
+
+Branch `fable/engine-e1-cache-2026-11-08`; write-up `docs/ENGINE_E1_CACHE.md`. LFM2.5 Q4_0, 5120 MiB experts:
+P100 x16 15.47 tok/s vs llama.cpp 15.87 (0.975x), 2060 SUPER 7.37 vs 6.75 (1.09x); hit rate 0.854 on both
+(static plan 0.482, llama.cpp 0.72-0.74); sha `062392b8d2b0361a` at 3072 and 5120 MiB; device memory flat over a
+50-pass soak. The static plan's device memory grew 6769 -> 7661 MiB in the same runs; the slot bank does not.
