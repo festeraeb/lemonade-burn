@@ -1,0 +1,21 @@
+[package]
+name = "lb-gemma4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Gemma 4 (gemma4 MoE, e.g. gemma-4-26B-A4B) decoder loaded from GGUF, on lb-lfm2's expert store / placement / scrape interfaces"
+
+[dependencies]
+lb-gguf.workspace = true
+# The expert tier/cache interfaces (Route, Placement, PlacementStats, ExpertStore, Scraper,
+# Knobs, CapturedLayer, stage::rank) live in lb-lfm2; gemma uses them as they are so the
+# engine steps E1-E4 apply to both families.
+lb-lfm2.workspace = true
+rayon.workspace = true
+half = "2"
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+ureq = { version = "2", features = ["json"] }

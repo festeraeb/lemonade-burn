@@ -3887,6 +3887,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-gemma4"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "half",
+ "lb-gguf",
+ "lb-lfm2",
+ "rayon",
+ "serde",
+ "serde_json",
+ "ureq 2.12.1",
+]
+
+[[package]]
 name = "lb-gguf"
 version = "0.1.0"
 dependencies = [
