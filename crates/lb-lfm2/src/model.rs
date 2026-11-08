@@ -15,14 +15,14 @@
 
 use crate::config::Config;
 use crate::dense::DenseStore;
-use crate::moe::{moe_ffn, ExpertStore, Placement, PlacementStats, Scraper};
+use crate::moe::{moe_ffn, ExpertStore, Placement, PlacementStats, Route, Scraper};
 use crate::weights::{Ffn, MatRef, Operator, Weights};
 use anyhow::Result;
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::{Bool, Device, Tensor, TensorData};
 use lb_gguf::{matvec_f32, Gguf};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -46,6 +46,27 @@ pub struct Lfm2 {
     /// Device copies for the device-resident decode, built on its first token.
     #[cfg(feature = "gpu")]
     pub(crate) dd: std::sync::Mutex<Option<crate::device_decode::Prep>>,
+    /// Per-layer hidden-state capture for offline analysis (expert prediction, stand-in
+    /// finder; see `docs/EXPERT_PREDICT.md`). Off unless [`Lfm2::set_capture`] turns it on;
+    /// it only copies tensors out, so the forward pass computes the same numbers either way.
+    capture_on: AtomicBool,
+    capture: std::sync::Mutex<Vec<CapturedLayer>>,
+}
+
+/// One layer of one forward pass, captured on the host path for `m` tokens at `pos0..`.
+///
+/// * `x_mid` `[m, n_embd]`: the residual stream after the layer's operator (conv/attention),
+///   i.e. what the layer's FFN pre-norm reads. `rms(x_mid, ffn_norm) ` is the router input.
+/// * `x_out` `[m, n_embd]`: the residual stream after the FFN, the next layer's input.
+/// * `routes`: the experts and weights the engine chose per token (empty for dense layers).
+#[derive(Clone, Debug)]
+pub struct CapturedLayer {
+    pub layer: usize,
+    pub pos0: usize,
+    pub m: usize,
+    pub x_mid: Vec<f32>,
+    pub x_out: Vec<f32>,
+    pub routes: Vec<Route>,
 }
 
 /// Cumulative wall time inside a forward pass, split at the one boundary that decides what
@@ -137,7 +158,28 @@ impl Lfm2 {
             timings: Arc::new(Timings::default()),
             #[cfg(feature = "gpu")]
             dd: std::sync::Mutex::new(None),
+            capture_on: AtomicBool::new(false),
+            capture: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Turn the per-layer hidden-state capture on or off. While on, every forward pass runs
+    /// the host path (the device-resident decode declines) and appends one
+    /// [`CapturedLayer`] per layer; drain them with [`Lfm2::take_capture`].
+    pub fn set_capture(&self, on: bool) {
+        self.capture_on.store(on, Ordering::Relaxed);
+        if !on {
+            self.capture.lock().unwrap().clear();
+        }
+    }
+
+    pub fn capture_enabled(&self) -> bool {
+        self.capture_on.load(Ordering::Relaxed)
+    }
+
+    /// Everything captured since the last call, in pass and layer order.
+    pub fn take_capture(&self) -> Vec<CapturedLayer> {
+        std::mem::take(&mut *self.capture.lock().unwrap())
     }
 
     /// Upload the `Home::Gpu` experts of the current placement to the device
@@ -478,7 +520,7 @@ impl Lfm2 {
         // One decode token device-resident when asked and possible (see `device_decode.rs`);
         // `None` means it declined and nothing changed, so the path below runs as before.
         #[cfg(feature = "gpu")]
-        if tokens.len() == 1 && self.store.knobs.device_decode() {
+        if tokens.len() == 1 && self.store.knobs.device_decode() && !self.capture_enabled() {
             if let Some(logits) = crate::device_decode::token(self, tokens[0], cache) {
                 return logits;
             }
@@ -510,6 +552,7 @@ impl Lfm2 {
         let (cos, sin) = self.rope_tables(pos0, m);
         let e = cfg.n_embd;
 
+        let capturing = self.capture_enabled();
         let mut x = self.embed(tokens);
         for (li, layer) in self.w.layers.iter().enumerate() {
             let h = self.rms_norm(x.clone(), &layer.attn_norm);
@@ -534,8 +577,10 @@ impl Lfm2 {
                 }
             };
             x = x + op_out;
+            let x_mid = if capturing { Some(Self::to_vec(x.clone())) } else { None };
 
             let h2 = self.rms_norm(x.clone(), &layer.ffn_norm);
+            let mut layer_routes: Vec<Route> = Vec::new();
             let ffn_out = match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
                     let g = self.linear(h2.clone(), gate);
@@ -548,10 +593,17 @@ impl Lfm2 {
                     let (out, routes) = moe_ffn(&self.w, router, bias, gate, up, down, &hv, m, &self.store, li, &self.stats);
                     self.timings.matmul_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     self.scraper.record(li, pos0, &routes);
+                    if capturing {
+                        layer_routes = routes;
+                    }
                     self.from_vec(out, m, e)
                 }
             };
             x = x + ffn_out;
+            if let Some(x_mid) = x_mid {
+                let x_out = Self::to_vec(x.clone());
+                self.capture.lock().unwrap().push(CapturedLayer { layer: li, pos0, m, x_mid, x_out, routes: layer_routes });
+            }
         }
         cache.len = total;
         let x = if all_logits { x } else { x.slice([m - 1..m, 0..e]) };

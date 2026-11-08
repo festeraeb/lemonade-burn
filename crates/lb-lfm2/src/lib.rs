@@ -11,4 +11,4 @@ pub mod weights;
 
 pub use config::Config;
 pub use knobs::Knobs;
-pub use model::{Cache, Lfm2};
+pub use model::{Cache, CapturedLayer, Lfm2};
