@@ -1300,3 +1300,152 @@ impl GpuExpertLayer {
         Ok(out)
     }
 }
+
+/// A fixed bank of device slots for experts of one shape (three Q4_0 matrices of the same block
+/// count, e.g. gate/up `[n_ff, n_embd]` and down `[n_embd, n_ff]`), allocated **once**, plus a few
+/// fixed staging buffers for the raw file bytes of an expert being filled. Filling a slot is a DMA
+/// of the three raw slices into a staging buffer (straight from the page-locked mapping when it is
+/// registered) and one repack launch into the slot; nothing is allocated per fill, so the device
+/// bytes are exactly [`ExpertSlots::bytes`] for the life of the bank, whatever the cache does.
+///
+/// Why (MoE exp. #2, `docs/STAGE_RING.md`): experts uploaded one by one and kept took 7 MiB pool
+/// slices plus a transient raw buffer each while being counted as 5.31 MB, and device memory grew
+/// until the card ran out. Slots also give the expert a stable address, which a device-side router
+/// (engine step E2) can index through a slot table.
+///
+/// All work is on the calling stream, in order: a slot refilled after kernels that read its old
+/// contents were queued is written only after those kernels ran, and a staging buffer is rewritten
+/// only after the repack that read it.
+pub struct ExpertSlots {
+    slots: Vec<GpuExpert>,
+    /// Per slot: the three matrices' `qs` and `sc` as one span each, the repack's outputs.
+    spans: Vec<(Handle, Handle)>,
+    staging: Vec<Handle>,
+    next_stage: AtomicUsize,
+    /// File bytes of one matrix (`nb * 18`).
+    raw_len: usize,
+    n_sc: usize,
+    /// The allocations (chunks of slots), kept alive.
+    _chunks: Vec<(Handle, Handle)>,
+    /// Device bytes held: the slot chunks plus the staging buffers.
+    pub bytes: usize,
+}
+
+/// Slots per chunk allocation (32 LFM2.5 experts = 170 MB a chunk).
+const SLOT_CHUNK: usize = 32;
+
+impl ExpertSlots {
+    /// Device bytes of one slot for three matrices of `nb` Q4_0 blocks each (repacked: 16 bytes of
+    /// `qs` and 2 of `sc` a block, the same 18 a block as the file).
+    pub fn slot_bytes(nb: usize) -> usize {
+        3 * (nb * 4 + nb / 2) * 4
+    }
+
+    /// Device bytes of the staging buffers.
+    pub fn staging_bytes(nb: usize, n_staging: usize) -> usize {
+        n_staging * 3 * nb * 18
+    }
+
+    /// `n_slots` slots for experts whose three matrices are `shapes` (rows, cols), Q4_0, all with the
+    /// same even block count; `n_staging` raw staging buffers (one per fill in flight per layer).
+    pub fn new(gpu: &Gpu, n_slots: usize, shapes: [(usize, usize); 3], n_staging: usize) -> Result<Self, String> {
+        let nb = shapes[0].0 * shapes[0].1 / 32;
+        for (r, c) in shapes {
+            if c % 32 != 0 || r * c / 32 != nb {
+                return Err(format!("expert slots need three Q4_0 matrices of one block count, got {shapes:?}"));
+            }
+        }
+        if nb == 0 || nb % 2 != 0 {
+            return Err(format!("expert slots need an even block count, got {nb}"));
+        }
+        let (n_qs, n_sc) = (nb * 4, nb / 2);
+        let raw_len = nb * 18;
+        let mut slots = Vec::with_capacity(n_slots);
+        let mut spans = Vec::with_capacity(n_slots);
+        let mut bytes = 0usize;
+        // Allocated once, in CubeCL's persistent pool: exact-fit slices that the pool never sweeps.
+        // The default adaptive pool carves from pages sized to the largest request seen, which left
+        // ~2 GB of a P100 unused around 5 GB of chunks (measured, `docs/ENGINE_E1_CACHE.md`).
+        let sizes: Vec<usize> = (0..n_slots.div_ceil(SLOT_CHUNK)).map(|c| (n_slots - c * SLOT_CHUNK).min(SLOT_CHUNK)).collect();
+        let n_staging = n_staging.max(1);
+        let (chunks, staging): (Vec<(Handle, Handle)>, Vec<Handle>) = gpu.client.memory_persistent_allocation((), |_| {
+            let chunks = sizes.iter().map(|&ch| (gpu.client.empty(ch * 3 * n_qs * 4), gpu.client.empty(ch * 3 * n_sc * 4))).collect();
+            let staging = (0..n_staging).map(|_| gpu.client.empty(3 * raw_len)).collect();
+            (chunks, staging)
+        });
+        for (&ch, (qs_all, sc_all)) in sizes.iter().zip(&chunks) {
+            bytes += ch * 3 * (n_qs + n_sc) * 4;
+            for i in 0..ch {
+                let (qs_all, sc_all) = (qs_all.clone(), sc_all.clone());
+                let view = |h: &Handle, unit: usize, k: usize, len: usize| -> Handle {
+                    // `k` units in, `len` units long, of a buffer of `ch * 3` units
+                    h.clone().offset_start((k * unit) as u64).offset_end(((ch * 3 - k - len) * unit) as u64)
+                };
+                let (q4, s4) = (n_qs * 4, n_sc * 4);
+                spans.push((view(&qs_all, q4, 3 * i, 3), view(&sc_all, s4, 3 * i, 3)));
+                let mat = |j: usize| -> GpuQ4Mat {
+                    let (rows, cols) = shapes[j];
+                    GpuQ4Mat { rows, cols, row_bytes: cols / 32 * 18, n_qs, n_sc, qs: view(&qs_all, q4, 3 * i + j, 1), sc: view(&sc_all, s4, 3 * i + j, 1), dims: gpu.const_u32(&matvec_dims(rows, cols)) }
+                };
+                slots.push(GpuExpert { gate: mat(0), up: mat(1), down: mat(2) });
+            }
+        }
+        bytes += n_staging * 3 * raw_len;
+        Ok(Self { slots, spans, staging, next_stage: AtomicUsize::new(0), raw_len, n_sc, _chunks: chunks, bytes })
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// The expert held in `slot` (whatever was filled last).
+    pub fn expert(&self, slot: usize) -> &GpuExpert {
+        &self.slots[slot]
+    }
+
+    /// Fill `slot` with the expert whose raw Q4_0 file bytes are `raws` (gate, up, down; each the
+    /// matrix's whole byte range). Queued on the calling stream; returns at once.
+    pub fn fill(&self, gpu: &Gpu, slot: usize, raws: [&[u8]; 3]) -> Result<(), String> {
+        let st = &self.staging[self.next_stage.fetch_add(1, Ordering::Relaxed) % self.staging.len()];
+        for (j, raw) in raws.iter().enumerate() {
+            if raw.len() < self.raw_len {
+                return Err(format!("expert slot fill: matrix {j} has {} bytes, need {}", raw.len(), self.raw_len));
+            }
+            let raw = &raw[..self.raw_len];
+            let dst = st.clone().offset_start((j * self.raw_len) as u64).offset_end(((2 - j) * self.raw_len) as u64);
+            #[cfg(feature = "cuda")]
+            if let Some(b) = self.registered_bytes(gpu, raw) {
+                gpu.client.write(&dst, b);
+                continue;
+            }
+            let words: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            gpu.client.write(&dst, Bytes::from_elems(words));
+        }
+        let (qs, sc) = &self.spans[slot];
+        let n = gpu.const_u32(&[(3 * self.n_sc) as u32]);
+        unsafe {
+            q4_0_repack_kernel::launch(
+                &gpu.client,
+                cube_count(3 * self.n_sc, REPACK_CUBE),
+                CubeDim::new_1d(REPACK_CUBE as u32),
+                BufferArg::from_raw_parts(st.clone(), 3 * self.raw_len / 4),
+                BufferArg::from_raw_parts(qs.clone(), 3 * self.n_sc * 8),
+                BufferArg::from_raw_parts(sc.clone(), 3 * self.n_sc),
+                BufferArg::from_raw_parts(n, 1),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn registered_bytes(&self, gpu: &Gpu, raw: &[u8]) -> Option<Bytes> {
+        if gpu.host_repack() {
+            return None;
+        }
+        gpu.registered_slice(raw)
+    }
+}

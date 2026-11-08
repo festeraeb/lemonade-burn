@@ -207,6 +207,58 @@ impl Lfm2 {
         Ok(cap)
     }
 
+    /// Turn on the dynamic expert cache (`cache.rs`, engine step E1): as many slots as fit in
+    /// `budget_bytes` of **device** bytes (slots plus `n_staging` raw staging buffers), allocated
+    /// once. `seed` is filled in order (hottest last, so they end up most recently used); pass the
+    /// heat order to start warm, or nothing to start cold. Returns (slots, device bytes).
+    #[cfg(feature = "gpu")]
+    pub fn enable_cache(&mut self, budget_bytes: usize, n_staging: usize, seed: &[(usize, usize)]) -> Result<(usize, usize), String> {
+        use crate::weights::Ffn;
+        if self.store.gpu.is_none() {
+            self.store.gpu = Some(crate::moe::ExpertStore::open_gpu(&self.w)?);
+        }
+        let cfg = self.cfg().clone();
+        let mut shape: Option<[(usize, usize); 3]> = None;
+        for layer in &self.w.layers {
+            if let Ffn::Moe { gate, up, down, .. } = &layer.ffn {
+                for m in [gate, up, down] {
+                    if m.ty != lb_gguf::GgmlType::Q4_0 {
+                        return Err(format!("expert cache: experts are {:?}, the slots hold Q4_0 only", m.ty));
+                    }
+                }
+                let sh = [(gate.rows, gate.cols), (up.rows, up.cols), (down.rows, down.cols)];
+                if shape.is_some_and(|s| s != sh) {
+                    return Err("expert cache: MoE layers with different expert shapes".into());
+                }
+                shape = Some(sh);
+            }
+        }
+        let shape = shape.ok_or("expert cache: no MoE layer")?;
+        let nb = shape[0].0 * shape[0].1 / 32;
+        let per = lb_q4_gpu::ExpertSlots::slot_bytes(nb);
+        let n_slots = budget_bytes.saturating_sub(lb_q4_gpu::ExpertSlots::staging_bytes(nb, n_staging)) / per;
+        if n_slots < cfg.n_expert_used {
+            return Err(format!("expert cache: {budget_bytes} bytes hold {n_slots} slots, fewer than top-k {}", cfg.n_expert_used));
+        }
+        let gpu = self.store.gpu.as_ref().expect("opened above");
+        let slots = lb_q4_gpu::ExpertSlots::new(gpu, n_slots, shape, n_staging)?;
+        let bytes = slots.bytes;
+        let mut cache = crate::cache::ExpertCache::new(crate::cache::Slru::new(cfg.n_layer, cfg.n_expert, n_slots), slots);
+        for &(l, e) in seed {
+            let Ffn::Moe { gate, up, down, .. } = &self.w.layers[l].ffn else { continue };
+            if let Some(s) = cache.slru.seed(l, e) {
+                let raw = |r: &crate::weights::MatRef| self.w.mat(r).bytes;
+                cache.slots.fill(gpu, s, [raw(&gate.expert(e)), raw(&up.expert(e)), raw(&down.expert(e))])?;
+                cache.seeds += 1;
+            }
+        }
+        gpu.sync()?;
+        let attn: Vec<bool> = (0..cfg.n_layer).map(|l| cfg.is_attn(l)).collect();
+        self.stats.stage.set_attn_layers(attn);
+        *self.store.cache.lock().unwrap() = Some(cache);
+        Ok((n_slots, bytes))
+    }
+
     /// Upload dense Q4_0 weights to the device, up to `budget_bytes`. Returns how many.
     /// Opens the device if `load_residents` has not already.
     #[cfg(feature = "gpu")]

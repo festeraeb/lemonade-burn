@@ -1,5 +1,6 @@
 //! LFM2 / LFM2-MoE (LiquidAI) decoder on Burn, loaded straight from GGUF.
 //! See `docs/LFM2_CUBECL.md` for the architecture, kernels, placement and verification.
+pub mod cache;
 pub mod config;
 pub mod dense;
 #[cfg(feature = "gpu")]

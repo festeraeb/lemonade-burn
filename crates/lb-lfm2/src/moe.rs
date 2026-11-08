@@ -95,6 +95,24 @@ impl Histogram {
     }
 }
 
+impl Histogram {
+    /// Experts the histogram saw, hottest first by their share of their layer's routings (the
+    /// order `Placement::plan` spends a budget in). Seeds the dynamic cache (`cache.rs`).
+    pub fn heat_order(&self) -> Vec<(usize, usize)> {
+        let mut cands: Vec<(f64, usize, usize)> = Vec::new();
+        for (l, row) in self.counts.iter().enumerate() {
+            let total: u64 = row.iter().sum();
+            for (e, &c) in row.iter().enumerate() {
+                if c > 0 {
+                    cands.push((c as f64 / total as f64, l, e));
+                }
+            }
+        }
+        cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        cands.into_iter().map(|(_, l, e)| (l, e)).collect()
+    }
+}
+
 impl Placement {
     /// Everything on the CPU.
     pub fn all_cpu(n_layer: usize, n_expert: usize) -> Self {
@@ -308,6 +326,10 @@ pub struct ExpertStore {
     pub stage: crate::stage::StageCfg,
     #[cfg(feature = "gpu")]
     pub ring: Mutex<Option<crate::stage::Ring>>,
+    /// The dynamic expert cache (`cache.rs`, engine step E1). When present every expert runs from
+    /// it and the static residents / ring are not used.
+    #[cfg(feature = "gpu")]
+    pub cache: Mutex<Option<crate::cache::ExpertCache>>,
 }
 
 impl ExpertStore {
@@ -501,6 +523,16 @@ pub fn moe_ffn_with(
     }
     let mut experts: Vec<(usize, Vec<(usize, f32)>)> = by_expert.into_iter().collect();
     experts.sort_by_key(|(e, _)| *e);
+    // the dynamic cache, when on, serves every expert of the layer (`cache.rs`)
+    #[cfg(feature = "gpu")]
+    if let (Some(gpu), Ok(mut guard)) = (store.gpu.as_ref(), store.cache.lock()) {
+        if let Some(cache) = guard.as_mut() {
+            match moe_cached(w, gate, up, down, x, m, gpu, cache, layer, stats, &experts) {
+                Ok(out) => return (out, routes),
+                Err(e) => panic!("expert cache, layer {layer}: {e}"),
+            }
+        }
+    }
     let gather = |toks: &[(usize, f32)]| -> Vec<f32> {
         let mut xs = Vec::with_capacity(toks.len() * n_embd);
         for (t, _) in toks {
@@ -681,6 +713,78 @@ pub fn moe_ffn_with(
         }
     }
     (out, routes)
+}
+
+/// One MoE layer through the dynamic cache: plan (hits promoted, misses take SLRU victims), queue
+/// the fills (DMA + repack into fixed slots, same stream), launch every expert from its slot, one
+/// read, sum in ascending expert id (the order `experts` is in). `x` is `m` rows of `n_embd`.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn moe_cached(
+    w: &Weights,
+    gate: &ExpertMats,
+    up: &ExpertMats,
+    down: &ExpertMats,
+    x: &[f32],
+    m: usize,
+    gpu: &lb_q4_gpu::Gpu,
+    cache: &mut crate::cache::ExpertCache,
+    layer: usize,
+    stats: &PlacementStats,
+    experts: &[(usize, Vec<(usize, f32)>)],
+) -> Result<Vec<f32>, String> {
+    let n_embd = w.cfg.n_embd;
+    let needed: Vec<usize> = experts.iter().map(|(e, _)| *e).collect();
+    let t = std::time::Instant::now();
+    let plan = cache.slru.plan(layer, &needed).ok_or_else(|| format!("{} distinct experts > {} cache slots", needed.len(), cache.slru.n_slots()))?;
+    for &(e, s) in &plan.fills {
+        let raw = |r: &crate::weights::MatRef| w.mat(r).bytes;
+        cache.slots.fill(gpu, s, [raw(&gate.expert(e)), raw(&up.expert(e)), raw(&down.expert(e))])?;
+        cache.count_fill();
+    }
+    let fill_ns = t.elapsed().as_nanos() as u64;
+    let (n_hit, n_fill) = (plan.hits.len(), plan.fills.len());
+    stats.gpu_hits.fetch_add(n_hit as u64, Ordering::Relaxed);
+    stats.on_demand.fetch_add(n_fill as u64, Ordering::Relaxed);
+    stats.on_demand_ns.fetch_add(fill_ns, Ordering::Relaxed);
+    if m == 1 {
+        stats.stage.layer(layer, n_hit, 0, n_fill);
+    }
+    let t = std::time::Instant::now();
+    let mut uploaded: HashMap<Vec<usize>, cubecl_handle::Handle> = HashMap::new();
+    let mut launched = Vec::with_capacity(experts.len());
+    for (e, toks) in experts {
+        let s = cache.slru.slot(layer, *e).expect("planned");
+        let key: Vec<usize> = toks.iter().map(|(t, _)| *t).collect();
+        let xh = uploaded
+            .entry(key)
+            .or_insert_with(|| {
+                let mut xs = Vec::with_capacity(toks.len() * n_embd);
+                for (t, _) in toks {
+                    xs.extend_from_slice(&x[t * n_embd..(t + 1) * n_embd]);
+                }
+                gpu.upload_f32(&xs)
+            })
+            .clone();
+        launched.push(cache.slots.expert(s).launch(gpu, &xh, toks.len()));
+    }
+    let outs = gpu.read_all(launched)?;
+    let dt = t.elapsed().as_nanos() as u64;
+    stats.gpu_ns.fetch_add(dt, Ordering::Relaxed);
+    if m == 1 {
+        stats.stage.moe_read_ns.fetch_add(dt, Ordering::Relaxed);
+    }
+    // ascending expert id (the order of `experts`), as `moe_ffn_with`
+    let mut out = vec![0f32; m * n_embd];
+    for ((_, toks), y) in experts.iter().zip(outs) {
+        for (i, (t, wt)) in toks.iter().enumerate() {
+            let o = &mut out[t * n_embd..(t + 1) * n_embd];
+            for (oj, yj) in o.iter_mut().zip(&y[i * n_embd..(i + 1) * n_embd]) {
+                *oj += wt * yj;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Read every `run-*.json` scrape file in `dir` (unreadable files are skipped).

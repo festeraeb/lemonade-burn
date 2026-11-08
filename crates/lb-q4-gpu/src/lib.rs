@@ -19,7 +19,7 @@
 pub mod decode;
 pub mod store;
 pub use decode::TokenParams;
-pub use store::{pick_cube_device, Gpu, SideStream, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat};
+pub use store::{pick_cube_device, ExpertSlots, Gpu, SideStream, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat};
 #[cfg(feature = "cuda")]
 pub mod pinned;
 #[cfg(feature = "cuda")]

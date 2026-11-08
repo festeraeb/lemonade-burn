@@ -546,10 +546,30 @@ fn main() -> Result<()> {
         let ring_bytes = stage_cfg.ring_slots(expert_bytes_max) * expert_bytes_max;
         let expert_budget = lb_lfm2::stage::expert_vram_budget(args.gpu_budget_mb * 1_000_000);
         let resident_budget = expert_budget.saturating_sub(ring_bytes);
+        // Dynamic expert cache (lb-lfm2 `cache.rs`, engine step E1): on by default when the expert
+        // budget is smaller than the model's experts (a card that cannot hold them all), unless
+        // `LB_EXPERT_CACHE=0` (the static heat plan) or `--whole-layers`.
+        let all_expert_bytes: usize = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l) * cfg.n_expert).sum();
+        let cache_on = args.gpu
+            && !args.whole_layers
+            && match std::env::var("LB_EXPERT_CACHE") {
+                Ok(v) => !v.is_empty() && v != "0",
+                Err(_) => expert_budget > 0 && expert_budget < all_expert_bytes,
+            };
         if stage_cfg.on || std::env::var_os("LB_EXPERT_VRAM_MIB").is_some() {
             eprintln!("expert vram: {:.0} MiB budget = {:.0} MiB static residents + {:.0} MiB staging ring ({:?})", expert_budget as f64 / 1048576.0, resident_budget as f64 / 1048576.0, ring_bytes as f64 / 1048576.0, stage_cfg);
         }
-        if args.whole_layers {
+        let mut cache_seed: Vec<(usize, usize)> = Vec::new();
+        if cache_on {
+            // no static residents: the cache takes the whole expert budget; scrapes only seed it
+            if let Some(dir) = &args.placement_from_scrapes {
+                let scrapes = lb_lfm2::moe::read_scrape_dir(dir)?;
+                cache_seed = lb_lfm2::moe::Histogram::from_scrapes("lfm2", cfg.n_layer, cfg.n_expert, &scrapes).heat_order();
+            }
+            if std::env::var("LB_EXPERT_CACHE_SEED").is_ok_and(|v| v == "0") {
+                cache_seed.clear();
+            }
+        } else if args.whole_layers {
             let bytes: Vec<usize> = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).collect();
             model.placement = lb_lfm2::moe::Placement::whole_layers(cfg.n_expert, &bytes, resident_budget);
             eprintln!("placement: {} experts in whole layers ({:.0} MB)", model.placement.n_resident(), model.placement.resident_bytes as f64 / 1e6);
@@ -583,7 +603,30 @@ fn main() -> Result<()> {
             anyhow::bail!("--gpu-dense-mb needs the `gpu` feature");
         }
         #[cfg(feature = "gpu")]
-        if args.gpu {
+        if cache_on {
+            let n_staging: usize = std::env::var("LB_EXPERT_CACHE_STAGING").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let t = Instant::now();
+            // seed hottest last: `heat_order` is hottest first, and only what fits is useful
+            let (n_slots, bytes) = {
+                let eb = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).max().unwrap_or(1).max(1);
+                let fit = expert_budget / eb;
+                let seed: Vec<(usize, usize)> = cache_seed.iter().take(fit).rev().copied().collect();
+                model.enable_cache(expert_budget, n_staging, &seed).map_err(|e| anyhow::anyhow!(e))?
+            };
+            model.knobs().set_dd_host_moe(true);
+            eprintln!(
+                "expert cache: {n_slots} slots (SLRU), {:.0} MiB device bytes of a {:.0} MiB budget, {n_staging} staging buffers, seeded {} in {:.1}s; LB_DD_HOST_MOE on",
+                bytes as f64 / 1048576.0,
+                expert_budget as f64 / 1048576.0,
+                cache_seed.len().min(n_slots),
+                t.elapsed().as_secs_f64()
+            );
+            if stage_cfg.on {
+                eprintln!("expert cache: LB_STAGE ignored (the cache serves every expert; no prefetch in E1)");
+            }
+        }
+        #[cfg(feature = "gpu")]
+        if args.gpu && !cache_on {
             let cap = model.enable_stage(stage_cfg.clone()).map_err(|e| anyhow::anyhow!(e))?;
             if cap > 0 {
                 eprintln!("stage: ring of {cap} experts on a side stream, {} guesses a layer, min margin {}, keep misses {}", stage_cfg.slots, stage_cfg.min_margin, stage_cfg.keep_misses);
