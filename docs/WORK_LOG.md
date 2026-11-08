@@ -1135,3 +1135,23 @@ per-shape r or split-K is next); the kernel sits at 28% of HBM2 so a further 1.5
 is 2.5-3x llama.cpp's; `c4_e2e.sh` / `c4_llama.sh` should get the AF:00.0 UUID as their default `CUDA_DEV`
 (left unchanged here: not in the repo, and they were to be kept as they are); and why llama.cpp's scraper
 changes its output text is not ours to fix but should be told to whoever owns that build.
+
+## MoE exp. #2, expert staging ring under VRAM pressure: gate fails, sha holds, NUMA is worth 4x (Fable, 2026-11-08)
+
+Branch `fable/stage-ring-2026-11-08`; full write-up, tables and resume commands in `docs/STAGE_RING.md`.
+LFM2.5-24B-A2B Q4_0 with a 5120 MiB expert budget on 8 GB cards, interleaved 5 rounds, 288 decode tokens
+a session:
+
+* **RTX 2060 SUPER (c2, PCH slot, Gen2 x4, 1.45 GB/s):** (a) heat residency + on-demand 3.13 tok/s; (b4)
+  + ring, top-4 guesses 2.67 (0.85x); (b) + ring, 8 guesses 1.60 (0.51x); llama.cpp `--moe-cache-mib 5120`
+  6.75 (2.16x). Spread under 3 % in every arm. Each arm's token time is its bus bytes / 1.45 GB/s + ~30 ms.
+* **GTX 1070 (c1, Gen3 x8, host at load 35):** a ~7.7, b4 ~7.9 (paired median ~1.05x, 0.60-1.70), b ~5.6,
+  llama.cpp ~12 (collapsed in 2 of 5 rounds). Noisy; no claim beyond "the ring breaks even at best".
+* **Gate (1.3x over (a), >= llama.cpp): FAIL** on both cards. **Same greedy text with the ring on and off:
+  PASS**, 30/30 sessions, and the sonar prompt gives the all-resident P100 sha `062392b8d2b0361a` at 41.6 %
+  residency because `moe_ffn` now sums experts in ascending id whatever served them.
+* The `mid1` guess works (ring raises the hit rate 0.48 -> 0.87 / 0.95; staged-expert precision 82 % conv
+  targets, 65 % attention targets at 4 guesses); it loses because the token is copy-bound and the guess adds
+  bytes. llama.cpp's win is its dynamic cache's hit rate (0.73 vs our static 0.48), not overlap.
+* **c1 side finding:** the page-locked GGUF split across two NUMA nodes made each miss 7.7 ms instead of
+  1.5; reloading the file's page cache on the GPU's node took arm (a) from 1.59 to 6.6 tok/s.
