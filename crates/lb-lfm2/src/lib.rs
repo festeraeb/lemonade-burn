@@ -7,6 +7,7 @@ pub mod device_decode;
 pub mod knobs;
 pub mod model;
 pub mod moe;
+pub mod stage;
 pub mod weights;
 
 pub use config::Config;

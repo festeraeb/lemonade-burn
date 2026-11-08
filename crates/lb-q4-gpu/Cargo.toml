@@ -19,6 +19,9 @@ cuda = ["cubecl/cuda", "dep:cudarc"]
 lb-gguf.workspace = true
 lb-ternary-gpu = { path = "../lb-ternary-gpu" }
 cubecl.workspace = true
+# `StreamId` for the expert staging ring's second stream (`Gpu::side_stream`); already in the
+# lock through cubecl, std feature as cubecl uses it.
+cubecl-environment = { version = "=0.11.2", default-features = false, features = ["std"] }
 # Only for the page-locked staging pool (`pinned.rs`), the same crate and feature set cubecl-cuda
 # itself uses; nothing is linked at build time.
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "fallback-dynamic-loading", "cuda-version-from-build-system", "fallback-latest"] }
@@ -32,3 +35,11 @@ required-features = ["cuda"]
 [[example]]
 name = "miss_bench"
 required-features = ["cuda"]
+
+[[example]]
+name = "stage_bench"
+required-features = ["cuda"]
+
+[dev-dependencies]
+# `examples/imc_bw.rs` only (perf_event_open on the uncore memory controllers); already in the lock.
+libc = "=0.2.191"

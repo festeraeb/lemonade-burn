@@ -189,6 +189,24 @@ impl Lfm2 {
         store.load(w, placement)
     }
 
+    /// Turn the expert staging ring on (`stage.rs`), after the residents and dense weights are
+    /// loaded: `cfg.ring_mib` of ring on the open device. Returns the ring's capacity in experts
+    /// (0 and nothing changed when `cfg.on` is false). Restart-only, like residency.
+    #[cfg(feature = "gpu")]
+    pub fn enable_stage(&mut self, cfg: crate::stage::StageCfg) -> Result<usize, String> {
+        let attn: Vec<bool> = (0..self.cfg().n_layer).map(|l| self.cfg().is_attn(l)).collect();
+        self.stats.stage.set_attn_layers(attn);
+        let eb = (0..self.cfg().n_layer).map(|l| self.w.expert_bytes(l)).max().unwrap_or(0);
+        let cap = cfg.ring_slots(eb);
+        self.store.stage = cfg;
+        if cap == 0 {
+            return Ok(0);
+        }
+        let gpu = self.store.gpu.as_ref().ok_or("staging needs the device open (--gpu)")?;
+        *self.store.ring.lock().unwrap() = Some(crate::stage::Ring::new(gpu, cap));
+        Ok(cap)
+    }
+
     /// Upload dense Q4_0 weights to the device, up to `budget_bytes`. Returns how many.
     /// Opens the device if `load_residents` has not already.
     #[cfg(feature = "gpu")]

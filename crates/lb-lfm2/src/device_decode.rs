@@ -44,7 +44,7 @@
 
 use crate::dense::conv_blocks_enabled;
 use crate::model::{Cache, Lfm2};
-use crate::moe::{moe_ffn, Route};
+use crate::moe::{moe_ffn_with, Route};
 use crate::weights::{Ffn, MatRef, Operator};
 use burn::tensor::{Tensor, TensorData};
 use lb_q4_gpu::cubecl_server::Handle;
@@ -325,6 +325,12 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
         (d.k.clone(), d.v.clone(), d.conv.clone())
     };
 
+    // the staging ring (`stage.rs`): a new token makes everything it holds stale
+    let mut ring_guard = m.store.ring.lock().expect("stage ring");
+    if let Some(r) = ring_guard.as_mut() {
+        r.begin_token();
+    }
+    m.stats.stage.tokens.fetch_add(1, Ordering::Relaxed);
     let mut emb = vec![0f32; e];
     m.w.embed_row(tok, &mut emb);
     gpu.write_f32(&prep.x, &emb);
@@ -368,12 +374,33 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                     gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots))
                 }
                 _ => {
-                    // not resident as a stack: the old host path for this layer, one sync
-                    let hv = match gpu.read_all(vec![(h2, e)]) {
-                        Ok(mut v) => v.remove(0),
-                        Err(err) => return abandon(m, cache, &format!("host MoE layer {li} read: {err}")),
+                    // not resident as a stack: the old host path for this layer, one sync. With
+                    // the staging ring the same read also brings back the residual stream after
+                    // this layer's operator (`x`, updated in place by `add_rms_norm`), the input
+                    // of the next layer's guess.
+                    let t_read = Instant::now();
+                    let read = if ring_guard.is_some() { gpu.read_raw(vec![(h2, e * 4), (prep.x.clone(), e * 4)]) } else { gpu.read_raw(vec![(h2, e * 4)]) };
+                    let mut bufs = match read {
+                        Ok(b) => b,
+                        Err(err) => {
+                            drop(ring_guard);
+                            return abandon(m, cache, &format!("host MoE layer {li} read: {err}"));
+                        }
                     };
-                    let (out, routes) = moe_ffn(&m.w, router, bias, gate, up, down, &hv, 1, &m.store, li, &m.stats);
+                    m.stats.stage.h2_read_ns.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let f32v = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
+                    let hv = f32v(&bufs[0]);
+                    let rc = match ring_guard.as_mut() {
+                        Some(ring) => {
+                            let x_mid = f32v(&bufs.pop().expect("x read with h2"));
+                            let t = Instant::now();
+                            let next = crate::stage::predict(&m.w, li + 1, &x_mid, m.store.stage.slots);
+                            m.stats.stage.issue_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            Some(crate::stage::RingCall { ring, gpu, w: &m.w, cfg: &m.store.stage, stats: &m.stats.stage, next })
+                        }
+                        None => None,
+                    };
+                    let (out, routes) = moe_ffn_with(&m.w, router, bias, gate, up, down, &hv, 1, &m.store, li, &m.stats, rc);
                     host_routes.push((li, routes.into_iter().next().expect("one token, one route")));
                     let hnd = gpu.upload_f32(&out);
                     keep.push(hnd.clone());
@@ -391,6 +418,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     };
     let read = gpu.read_raw(vec![(logits, vocab * 4), (prep.routes.clone(), prep.n_slots * 8), (prep.weights.clone(), prep.n_slots * 4)]);
     drop(keep);
+    drop(ring_guard);
     let bytes = match read {
         Ok(b) => b,
         Err(err) => return abandon(m, cache, &format!("token read: {err}")),

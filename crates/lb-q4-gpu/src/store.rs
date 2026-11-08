@@ -549,7 +549,27 @@ impl Gpu {
     pub fn pooled(&self) -> usize {
         self.free.lock().expect("scratch pool").values().map(Vec::len).sum()
     }
+
+    /// A second device stream for work that must not queue behind the caller's (the expert
+    /// staging ring's prefetch copies, `lb-lfm2` `stage.rs`). CubeCL 0.11 gives every OS thread
+    /// its own stream and orders work across streams itself: a kernel on the main stream that
+    /// binds a buffer written on this one waits for it on the device (`cuStreamWaitEvent`), so
+    /// the host never blocks on a copy it issued here, and a read on the main stream does not
+    /// wait for this stream's queue. See [`Gpu::on_stream`].
+    pub fn side_stream(&self) -> SideStream {
+        SideStream(cubecl_environment::stream::StreamId::allocate())
+    }
+
+    /// Run `f` with every device call it makes submitted on `s` instead of the calling
+    /// thread's stream (restored afterwards, also on unwind).
+    pub fn on_stream<T>(&self, s: &SideStream, f: impl FnOnce() -> T) -> T {
+        s.0.executes(f)
+    }
 }
+
+/// A device stream other than the calling thread's (see [`Gpu::side_stream`]).
+#[derive(Clone, Copy, Debug)]
+pub struct SideStream(cubecl_environment::stream::StreamId);
 
 /// A Q4_0 matrix resident on the device, repacked (see [`repack_q4_0`]).
 pub struct GpuQ4Mat {

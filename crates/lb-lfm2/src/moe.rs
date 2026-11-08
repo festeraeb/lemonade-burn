@@ -215,6 +215,9 @@ pub struct PlacementStats {
     /// counted apart from `gpu_hits` so the residency plan's own hit rate stays readable.
     pub on_demand: AtomicU64,
     pub on_demand_ns: AtomicU64,
+    /// Decode-only, per-layer hit/miss/prefetch counters (both with and without the staging
+    /// ring, so the two compare): `stage.rs`.
+    pub stage: crate::stage::StageStats,
 }
 
 /// A reading of [`PlacementStats`]. `hit_rate` is the share of expert calls the residency
@@ -301,6 +304,10 @@ pub struct ExpertStore {
     pub bytes: usize,
     /// The live settings (how to serve a miss, which upload path), shared with the host.
     pub knobs: std::sync::Arc<crate::knobs::Knobs>,
+    /// Expert staging (`stage.rs`), restart-only; the ring exists only when it is on.
+    pub stage: crate::stage::StageCfg,
+    #[cfg(feature = "gpu")]
+    pub ring: Mutex<Option<crate::stage::Ring>>,
 }
 
 impl ExpertStore {
@@ -447,6 +454,40 @@ pub fn moe_ffn(
     layer: usize,
     stats: &PlacementStats,
 ) -> (Vec<f32>, Vec<Route>) {
+    moe_ffn_with(w, router, bias, gate, up, down, x, m, store, layer, stats, None)
+}
+
+/// No staging ring without a device (keeps `moe_ffn_with`'s signature the same in every build).
+#[cfg(not(feature = "gpu"))]
+pub struct NoRing;
+
+#[cfg(feature = "gpu")]
+type RingArg<'a> = Option<crate::stage::RingCall<'a>>;
+#[cfg(not(feature = "gpu"))]
+type RingArg<'a> = Option<&'a mut NoRing>;
+
+/// [`moe_ffn`] with the expert staging ring (`stage.rs`): experts found in the ring launch from
+/// it, and once this layer's launches are queued the guess for the next layer is staged, before
+/// the read that waits for this layer. Every expert's output is added in **ascending expert
+/// id**, whichever of resident / ring / demand copy / CPU served it, so neither the ring nor the
+/// residency plan changes the arithmetic (it was resident-group-first before, which made the
+/// sum order, and so the greedy text, depend on the VRAM budget; an all-resident or all-CPU
+/// layer already summed in ascending id and is unchanged).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_ffn_with(
+    w: &Weights,
+    router: &[f32],
+    bias: &[f32],
+    gate: &ExpertMats,
+    up: &ExpertMats,
+    down: &ExpertMats,
+    x: &[f32],
+    m: usize,
+    store: &ExpertStore,
+    layer: usize,
+    stats: &PlacementStats,
+    #[allow(unused_mut, unused_variables)] mut ring: RingArg<'_>,
+) -> (Vec<f32>, Vec<Route>) {
     let cfg = &w.cfg;
     let n_embd = cfg.n_embd;
     let routes: Vec<Route> =
@@ -469,6 +510,19 @@ pub fn moe_ffn(
     };
     let (gpu_part, mut cpu_part): (Vec<_>, Vec<_>) = experts.into_iter().partition(|(e, _)| store.is_resident(layer, *e));
     stats.gpu_hits.fetch_add(gpu_part.len() as u64, Ordering::Relaxed);
+    // experts the staging ring holds: launched from it like residents
+    #[cfg(feature = "gpu")]
+    let staged_part: Vec<(usize, Vec<(usize, f32)>)> = match ring.as_ref() {
+        Some(rc) => {
+            let (st, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut cpu_part).into_iter().partition(|(e, _)| rc.ring.contains(layer, *e));
+            cpu_part = rest;
+            st
+        }
+        None => Vec::new(),
+    };
+    #[cfg(not(feature = "gpu"))]
+    let staged_part: Vec<(usize, Vec<(usize, f32)>)> = Vec::new();
+    let n_resident_part = gpu_part.len();
 
     // `MissPolicy::OnDemand`: take the misses away from the CPU and serve them by copying
     // the expert over. Each copy is a repack plus a host-to-device transfer, paid per call
@@ -480,7 +534,7 @@ pub fn moe_ffn(
 
     // Resident experts: launch everything first (asynchronous), read back after the CPU work.
     #[cfg(feature = "gpu")]
-    let gpu_launched: Vec<(Vec<(usize, f32)>, (cubecl_handle::Handle, usize))> = {
+    let gpu_launched: Vec<(usize, Vec<(usize, f32)>, (cubecl_handle::Handle, usize))> = {
         let t = std::time::Instant::now();
         let v = match store.gpu.as_ref() {
             Some(gpu) => {
@@ -489,14 +543,23 @@ pub fn moe_ffn(
                 // expert in the layer draws token 0, so this is one upload per layer instead
                 // of one per resident expert.
                 let mut uploaded: HashMap<Vec<usize>, cubecl_handle::Handle> = HashMap::new();
-                gpu_part
+                let mut v: Vec<(usize, Vec<(usize, f32)>, (cubecl_handle::Handle, usize))> = gpu_part
                     .iter()
                     .map(|(e, toks)| {
                         let key: Vec<usize> = toks.iter().map(|(t, _)| *t).collect();
                         let xh = uploaded.entry(key).or_insert_with(|| gpu.upload_f32(&gather(toks))).clone();
-                        (toks.clone(), store.resident[&(layer, *e)].launch(gpu, &xh, toks.len()))
+                        (*e, toks.clone(), store.resident[&(layer, *e)].launch(gpu, &xh, toks.len()))
                     })
-                    .collect()
+                    .collect();
+                if let Some(rc) = ring.as_mut() {
+                    for (e, toks) in &staged_part {
+                        let key: Vec<usize> = toks.iter().map(|(t, _)| *t).collect();
+                        let xh = uploaded.entry(key).or_insert_with(|| gpu.upload_f32(&gather(toks))).clone();
+                        let ex = rc.ring.take_use(layer, *e, rc.stats).expect("partitioned on contains");
+                        v.push((*e, toks.clone(), ex.launch(gpu, &xh, toks.len())));
+                    }
+                }
+                v
             }
             None => Vec::new(),
         };
@@ -506,7 +569,7 @@ pub fn moe_ffn(
     // The transient experts have to outlive the readback, so they are held here and dropped
     // (freeing their device buffers) only once `read_all` has returned.
     #[cfg(feature = "gpu")]
-    let (_od_held, od_launched): (Vec<lb_q4_gpu::GpuExpert>, Vec<(Vec<(usize, f32)>, (cubecl_handle::Handle, usize))>) = {
+    let (od_held, od_launched): (Vec<(usize, lb_q4_gpu::GpuExpert)>, Vec<(usize, Vec<(usize, f32)>, (cubecl_handle::Handle, usize))>) = {
         let t = std::time::Instant::now();
         let mut held = Vec::with_capacity(od_part.len());
         let mut launched = Vec::with_capacity(od_part.len());
@@ -515,8 +578,8 @@ pub fn moe_ffn(
                 match lb_q4_gpu::GpuExpert::upload(gpu, w.mat(&gate.expert(*e)), w.mat(&up.expert(*e)), w.mat(&down.expert(*e))) {
                     Ok(ex) => {
                         let xh = gpu.upload_f32(&gather(toks));
-                        launched.push((toks.clone(), ex.launch(gpu, &xh, toks.len())));
-                        held.push(ex);
+                        launched.push((*e, toks.clone(), ex.launch(gpu, &xh, toks.len())));
+                        held.push((*e, ex));
                     }
                     // out of VRAM or an unsupported type: fall back to the CPU for this one
                     Err(_) => cpu_part.push((*e, toks.clone())),
@@ -531,21 +594,42 @@ pub fn moe_ffn(
     #[cfg(not(feature = "gpu"))]
     let _ = &gpu_part;
 
+    // Decode counters, both arms (`stage.rs`): what served each of this token-layer's routings.
+    // A CPU-served or copied-in expert is a demand fetch on the critical path.
+    #[cfg(feature = "gpu")]
+    let n_od = od_launched.len();
+    #[cfg(not(feature = "gpu"))]
+    let n_od = 0usize;
+    if m == 1 {
+        stats.stage.layer(layer, n_resident_part, staged_part.len(), n_od + cpu_part.len());
+    }
+
+    // The ring's refill for the next layer goes in now: this layer's work is already queued on
+    // the main stream, so these side-stream copies overlap it and the read below does not wait
+    // for them.
+    #[cfg(feature = "gpu")]
+    if let (Some(rc), Some(gpu)) = (ring.as_mut(), store.gpu.as_ref()) {
+        if let Some(g) = rc.next.take() {
+            let resident = |l: usize, e: usize| store.is_resident(l, e);
+            rc.ring.prefetch(gpu, rc.w, rc.cfg, &g, &resident, rc.stats);
+        }
+    }
+
     // With every expert resident `cpu_part` is empty for all 38 MoE layers of every token, and
     // a rayon scope still costs something to set up and tear down -- 38 times a token, inside
     // the timed region. Skip it when there is nothing to run.
     // `mut` is only needed with the `gpu` feature, where the resident outputs are extended in.
     #[allow(unused_mut)]
-    let mut parts: Vec<(Vec<(usize, f32)>, Vec<f32>)> = if cpu_part.is_empty() {
+    let mut parts: Vec<(usize, Vec<(usize, f32)>, Vec<f32>)> = if cpu_part.is_empty() {
         Vec::new()
     } else {
         let t = std::time::Instant::now();
-        let v: Vec<(Vec<(usize, f32)>, Vec<f32>)> = cpu_part
+        let v: Vec<(usize, Vec<(usize, f32)>, Vec<f32>)> = cpu_part
             .into_par_iter()
             .map(|(e, toks)| {
                 let xs = gather(&toks);
                 let y = expert_ffn(w, gate, up, down, e, &xs, toks.len());
-                (toks, y)
+                (e, toks, y)
             })
             .collect();
         stats.cpu_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -559,10 +643,13 @@ pub fn moe_ffn(
         // scratch pool only recycles after a read, so splitting this into two reads would
         // cost a second round trip for no gain.
         let n_res = gpu_launched.len();
-        let (toks, hs): (Vec<_>, Vec<_>) = gpu_launched.into_iter().chain(od_launched).unzip();
+        let (keys, hs): (Vec<_>, Vec<_>) = gpu_launched.into_iter().chain(od_launched).map(|(e, toks, h)| ((e, toks), h)).unzip();
         let outs = gpu.read_all(hs).expect("GPU expert read");
-        parts.extend(toks.into_iter().zip(outs));
+        parts.extend(keys.into_iter().zip(outs).map(|((e, toks), y)| (e, toks, y)));
         let dt = t.elapsed().as_nanos() as u64;
+        if m == 1 {
+            stats.stage.moe_read_ns.fetch_add(dt, Ordering::Relaxed);
+        }
         // charge the readback to whichever side actually used it
         if n_res > 0 {
             stats.gpu_ns.fetch_add(dt, Ordering::Relaxed);
@@ -571,8 +658,21 @@ pub fn moe_ffn(
         }
     }
 
+    // demand misses the ring may keep (`LB_STAGE_KEEP_MISSES`), now that the read is done
+    #[cfg(feature = "gpu")]
+    match ring.as_mut() {
+        Some(rc) if rc.cfg.keep_misses && m == 1 => {
+            for (e, ex) in od_held {
+                rc.ring.admit(layer, e, ex, rc.stats);
+            }
+        }
+        _ => drop(od_held),
+    }
+
+    // ascending expert id: the sum is the same whatever served each expert (see above)
+    parts.sort_by_key(|(e, _, _)| *e);
     let mut out = vec![0f32; m * n_embd];
-    for (toks, y) in parts {
+    for (_, toks, y) in parts {
         for (i, (t, wt)) in toks.iter().enumerate() {
             let o = &mut out[t * n_embd..(t + 1) * n_embd];
             for (oj, yj) in o.iter_mut().zip(&y[i * n_embd..(i + 1) * n_embd]) {

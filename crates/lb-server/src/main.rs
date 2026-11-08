@@ -469,6 +469,8 @@ async fn placement_stats(State(st): State<Arc<AppState>>) -> Json<Value> {
         "gpu_hit_rate": t.hit_rate,
         "gpu_s": t.gpu_s, "cpu_s": t.cpu_s, "on_demand_s": t.on_demand_s
     });
+    // decode hit / miss / prefetch counters per target-layer type (lb-lfm2 `stage.rs`)
+    v["stage"] = s.stage.snapshot();
     // Where a forward pass went, so "what is left to optimise" is read off the server
     // instead of inferred from the token rate.
     if let Some(tm) = st.timings.as_ref() {
@@ -536,9 +538,20 @@ fn main() -> Result<()> {
         let mut model = lb_lfm2::Lfm2::load(&args.model, &dev)?;
         let cfg = model.cfg().clone();
         model.store.knobs.set_miss_policy(lb_lfm2::moe::MissPolicy::parse(&args.miss_policy).map_err(|e| anyhow::anyhow!(e))?);
+        // Expert VRAM: `LB_EXPERT_VRAM_MIB` overrides `--gpu-budget-mb`; the staging ring
+        // (`LB_STAGE=1`, lb-lfm2 `stage.rs`) is carved out of it, so ring-on and ring-off runs
+        // hold the same expert bytes on the card.
+        let stage_cfg = lb_lfm2::stage::StageCfg::from_env();
+        let expert_bytes_max = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).max().unwrap_or(0);
+        let ring_bytes = stage_cfg.ring_slots(expert_bytes_max) * expert_bytes_max;
+        let expert_budget = lb_lfm2::stage::expert_vram_budget(args.gpu_budget_mb * 1_000_000);
+        let resident_budget = expert_budget.saturating_sub(ring_bytes);
+        if stage_cfg.on || std::env::var_os("LB_EXPERT_VRAM_MIB").is_some() {
+            eprintln!("expert vram: {:.0} MiB budget = {:.0} MiB static residents + {:.0} MiB staging ring ({:?})", expert_budget as f64 / 1048576.0, resident_budget as f64 / 1048576.0, ring_bytes as f64 / 1048576.0, stage_cfg);
+        }
         if args.whole_layers {
             let bytes: Vec<usize> = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).collect();
-            model.placement = lb_lfm2::moe::Placement::whole_layers(cfg.n_expert, &bytes, args.gpu_budget_mb * 1_000_000);
+            model.placement = lb_lfm2::moe::Placement::whole_layers(cfg.n_expert, &bytes, resident_budget);
             eprintln!("placement: {} experts in whole layers ({:.0} MB)", model.placement.n_resident(), model.placement.resident_bytes as f64 / 1e6);
             if args.gpu {
                 let n = model.load_residents().map_err(|e| anyhow::anyhow!(e))?;
@@ -548,7 +561,7 @@ fn main() -> Result<()> {
             let scrapes = lb_lfm2::moe::read_scrape_dir(dir)?;
             let hist = lb_lfm2::moe::Histogram::from_scrapes("lfm2", cfg.n_layer, cfg.n_expert, &scrapes);
             let bytes: Vec<usize> = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).collect();
-            model.placement = lb_lfm2::moe::Placement::plan(&hist, &bytes, args.gpu_budget_mb * 1_000_000);
+            model.placement = lb_lfm2::moe::Placement::plan(&hist, &bytes, resident_budget);
             eprintln!("placement: {} experts planned resident ({:.0} MB) from {} scrape files", model.placement.n_resident(), model.placement.resident_bytes as f64 / 1e6, scrapes.len());
             if args.gpu {
                 let n = model.load_residents().map_err(|e| anyhow::anyhow!(e))?;
@@ -568,6 +581,17 @@ fn main() -> Result<()> {
             }
             #[cfg(not(feature = "gpu"))]
             anyhow::bail!("--gpu-dense-mb needs the `gpu` feature");
+        }
+        #[cfg(feature = "gpu")]
+        if args.gpu {
+            let cap = model.enable_stage(stage_cfg.clone()).map_err(|e| anyhow::anyhow!(e))?;
+            if cap > 0 {
+                eprintln!("stage: ring of {cap} experts on a side stream, {} guesses a layer, min margin {}, keep misses {}", stage_cfg.slots, stage_cfg.min_margin, stage_cfg.keep_misses);
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        if stage_cfg.on {
+            anyhow::bail!("LB_STAGE=1 needs the `gpu` feature");
         }
         let dir = args.model.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
         let codec = Arc::new(TextCodec::load_with(&dir.join("tokenizer.json"), cfg.bos, ChatStyle::ChatMl, vec![cfg.eos])?);

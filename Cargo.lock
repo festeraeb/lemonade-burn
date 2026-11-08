@@ -3936,10 +3936,12 @@ name = "lb-q4-gpu"
 version = "0.1.0"
 dependencies = [
  "cubecl",
+ "cubecl-environment",
  "cudarc",
  "half",
  "lb-gguf",
  "lb-ternary-gpu",
+ "libc",
  "rayon",
 ]
 
