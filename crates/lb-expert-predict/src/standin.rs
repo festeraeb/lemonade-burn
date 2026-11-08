@@ -147,7 +147,9 @@ pub fn score_table(outputs: &[Vec<f32>], samples: &[Vec<usize>], n_embd: usize) 
 /// The two best stand-ins for `i` by mean cosine (excluding `i` itself), best first.
 pub fn best_two(line: &[PairAcc], i: usize) -> (usize, usize) {
     let mut order: Vec<usize> = (0..line.len()).filter(|&j| j != i).collect();
-    order.sort_by(|&a, &b| line[b].cos().partial_cmp(&line[a].cos()).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+    // NaN (no samples) sorts last, so the order stays total
+    let key = |j: usize| if line[j].cos().is_nan() { f64::NEG_INFINITY } else { line[j].cos() };
+    order.sort_by(|&a, &b| key(b).total_cmp(&key(a)).then(a.cmp(&b)));
     (order[0], order[1])
 }
 

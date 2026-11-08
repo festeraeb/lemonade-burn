@@ -35,7 +35,7 @@ pub fn router_scores(router: &[f32], bias: &[f32], h: &[f32]) -> (Vec<f32>, Vec<
 /// `sel[k-th chosen] - sel[best unchosen]` (0 when `k == n`).
 pub fn topk_margin(sel: &[f32], k: usize) -> (Vec<usize>, f32) {
     let mut order: Vec<usize> = (0..sel.len()).collect();
-    order.sort_by(|&a, &b| sel[b].partial_cmp(&sel[a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| sel[b].partial_cmp(&sel[a]).unwrap_or(std::cmp::Ordering::Equal)); // as route_sigmoid
     let chosen = order[..k].to_vec();
     let margin = if k < sel.len() { sel[order[k - 1]] - sel[order[k]] } else { 0.0 };
     (chosen, margin)
