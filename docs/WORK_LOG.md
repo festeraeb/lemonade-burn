@@ -1166,3 +1166,10 @@ Branch `fable/engine-e1-cache-2026-11-08`; write-up `docs/ENGINE_E1_CACHE.md`. L
 P100 x16 15.47 tok/s vs llama.cpp 15.87 (0.975x), 2060 SUPER 7.37 vs 6.75 (1.09x); hit rate 0.854 on both
 (static plan 0.482, llama.cpp 0.72-0.74); sha `062392b8d2b0361a` at 3072 and 5120 MiB; device memory flat over a
 50-pass soak. The static plan's device memory grew 6769 -> 7661 MiB in the same runs; the slot bank does not.
+
+## Engine step E2: device router over the cache's slot bank, 1.85x E1, one sync a layer (Fable, 2026-11-09)
+
+Branch `fable/engine-e2-router-2026-11-09`; write-up `docs/ENGINE_E2_ROUTER.md`. Re-baselined on c4's P100 x16 (D8:00.0, NUMA 1,
+bound): E1 16.50 tok/s, llama.cpp 17.04, **E2 30.49** (1.85x E1, 1.79x llama.cpp); 2060 SUPER 7.41 / 6.79 / 9.48. Same sha at five
+budgets, flat 50-pass soak. Round trips per token 39, not the plan's <= 4: 15.2 of 38 layers miss at 5120 MiB, and a host-served miss
+needs the host to see that layer's routes. Token 32.7 ms = 12.2 compute + 6.6 syncs + 13.9 misses.
