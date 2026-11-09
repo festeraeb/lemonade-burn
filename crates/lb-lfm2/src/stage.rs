@@ -115,11 +115,14 @@ pub struct LookaheadCfg {
     pub cycle_window: usize,
     /// One JSON line per layer pass to this path (`LB_LA_TRACE`, offline simulator).
     pub trace: Option<std::path::PathBuf>,
+    /// Diagnostic: a `LB_LA_TRACE` file of the same session, replayed as a perfect guess of the next
+    /// layer (no x read, no router dots), to measure what overlap alone can buy (`LB_LA_ORACLE`).
+    pub oracle: Option<std::path::PathBuf>,
 }
 
 impl Default for LookaheadCfg {
     fn default() -> Self {
-        Self { on: false, n_guess: 8, keep: false, keep_depth: 1, promote: 0, prefetch_cap: 0, min_conf: f32::NEG_INFINITY, landings: 8, cycle_window: 0, trace: None }
+        Self { on: false, n_guess: 8, keep: false, keep_depth: 1, promote: 0, prefetch_cap: 0, min_conf: f32::NEG_INFINITY, landings: 8, cycle_window: 0, trace: None, oracle: None }
     }
 }
 
@@ -132,6 +135,7 @@ impl LookaheadCfg {
         let promote = num("LB_LA_PROMOTE").map(|v| v as u8).unwrap_or(d.promote);
         let prefetch_cap = num("LB_LA_PREFETCH_CAP").map(|v| v as usize).unwrap_or(d.prefetch_cap);
         let trace = std::env::var("LB_LA_TRACE").ok().filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        let oracle = std::env::var("LB_LA_ORACLE").ok().filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
         Self {
             on: on("LB_LOOKAHEAD") || keep || promote > 0 || prefetch_cap > 0 || trace.is_some(),
             n_guess: num("LB_LA_N_GUESS").map(|v| v as usize).unwrap_or(d.n_guess),
@@ -143,6 +147,7 @@ impl LookaheadCfg {
             landings: num("LB_LA_LANDINGS").map(|v| v as usize).unwrap_or(d.landings),
             cycle_window: num("LB_LA_CYCLE_W").map(|v| v as usize).unwrap_or(d.cycle_window),
             trace,
+            oracle,
         }
     }
 
@@ -190,8 +195,8 @@ pub fn predict(w: &Weights, target: usize, x_mid: &[f32], slots: usize) -> Optio
 
 /// Dot product for the guess. A plain float `sum()` cannot be vectorized (the compiler may not
 /// reorder float additions), so the lanes are kept as separate accumulators and added at the end;
-/// with the AVX2 path this took the guess from 15 ms to well under 1 ms a token. The order of
-/// additions differs from `route_sigmoid`'s, which is fine: this only ranks a guess, the real route
+/// with the AVX2 path this took the guess from 15 ms to 2.5-3.1 ms a token [measured, c4 P100 host,
+/// socket 0 busy]. The order of additions differs from `route_sigmoid`'s, which is fine: this only ranks a guess, the real route
 /// is computed elsewhere.
 #[inline(always)]
 fn dot_body(a: &[f32], b: &[f32]) -> f32 {

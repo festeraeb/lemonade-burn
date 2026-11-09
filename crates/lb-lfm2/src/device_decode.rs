@@ -403,7 +403,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                     // E3: the residual stream comes back with the routes (same sync) for the host's
                     // guess of the next layer (`x` is this layer's x_mid here)
                     let la = &m.store.la;
-                    let x_at = la.on.then(|| { want.push((prep.x.clone(), e * 4)); want.len() - 1 });
+                    let x_at = (la.on && la.oracle.is_none()).then(|| { want.push((prep.x.clone(), e * 4)); want.len() - 1 });
                     // the host learns this layer's routes: the one sync a layer that a miss served
                     // from host memory cannot avoid
                     let t_read = Instant::now();
@@ -438,6 +438,15 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                     let t_fill = Instant::now();
                     let mut guard = m.store.cache.lock().expect("expert cache");
                     let c = guard.as_mut().expect("checked above");
+                    // LB_LA_ORACLE: the recorded next pass replaces the guess (diagnostic, no host cost)
+                    let guess = match c.oracle.as_mut() {
+                        Some((passes, i)) => {
+                            let cur = *i;
+                            *i += 1;
+                            passes.get(cur + 1).filter(|(l, _)| *l == li + 1).map(|(l, ex)| crate::stage::Guess { layer: *l, experts: ex.clone(), margin: 0.0, scores: vec![1.0; ex.len()], ref_score: 0.0 })
+                        }
+                        None => guess,
+                    };
                     c.trace_pass("d", li, pos0, &needed, guess.as_ref());
                     // this sync finished every repack queued before it: their landing buffers are free
                     if let Some(l) = c.landings.as_mut() {

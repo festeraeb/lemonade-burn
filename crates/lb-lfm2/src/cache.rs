@@ -417,11 +417,13 @@ mod dev {
         pub landings: Option<Landings>,
         /// `LB_LA_TRACE`: one JSON line per layer pass for the offline simulator.
         pub trace: Option<std::sync::Mutex<std::io::LineWriter<std::fs::File>>>,
+        /// `LB_LA_ORACLE`: the decode passes of a recorded session and the replay position.
+        pub oracle: Option<(Vec<(usize, Vec<usize>)>, usize)>,
     }
 
     impl ExpertCache {
         pub fn new(slru: Slru, slots: ExpertSlots) -> Self {
-            Self { slru, slots, fills: AtomicU64::new(0), seeds: 0, landings: None, trace: None }
+            Self { slru, slots, fills: AtomicU64::new(0), seeds: 0, landings: None, trace: None, oracle: None }
         }
 
         /// Record one layer pass for the offline simulator (`LB_LA_TRACE`, off by default).

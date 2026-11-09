@@ -256,6 +256,19 @@ impl Lfm2 {
             let buffers = cache.slots.landing_buffers(gpu, &side, n_landing);
             cache.landings = Some(crate::cache::Landings { book: crate::cache::LandingBook::new(n_landing), side, buffers, sentinels: vec![None; n_landing] });
         }
+        if let Some(p) = &self.store.la.oracle {
+            let txt = std::fs::read_to_string(p).map_err(|e| format!("look-ahead oracle {}: {e}", p.display()))?;
+            let mut passes = Vec::new();
+            for line in txt.lines().filter(|l| !l.is_empty()) {
+                let v: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("oracle line: {e}"))?;
+                if v["k"] == "d" {
+                    let need = v["need"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect()).unwrap_or_default();
+                    passes.push((v["l"].as_u64().unwrap_or(0) as usize, need));
+                }
+            }
+            eprintln!("look-ahead oracle: {} decode passes from {}", passes.len(), p.display());
+            cache.oracle = Some((passes, 0));
+        }
         if let Some(p) = &self.store.la.trace {
             let f = std::fs::File::create(p).map_err(|e| format!("look-ahead trace {}: {e}", p.display()))?;
             cache.trace = Some(std::sync::Mutex::new(std::io::LineWriter::new(f)));
