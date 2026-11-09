@@ -65,6 +65,12 @@ pub struct Prep {
     routes: Handle,
     weights: Handle,
     n_slots: usize,
+    /// The same shape as `routes`, holding cache-slot numbers instead of expert ids: what the expert
+    /// kernels index the slot bank with (engine step E2, `routes` stays expert ids for the sum).
+    slot_routes: Handle,
+    /// The on-device next-layer guess, when `LB_DEVICE_GUESS=1`: routes and weights at slot
+    /// `moe_index(target) * k`.
+    guess: Option<(Handle, Handle)>,
     rope: Option<(Handle, usize)>,
     tp: TokenParams,
     /// Why no token can take this path (a matrix not resident, ...); `None` = it can.
@@ -197,6 +203,8 @@ impl Prep {
             routes: gpu.upload_u32(vec![0u32; 2 * n_slots]),
             weights: gpu.upload_f32(&vec![0f32; n_slots]),
             n_slots,
+            slot_routes: gpu.upload_u32(vec![0u32; 2 * n_slots]),
+            guess: std::env::var("LB_DEVICE_GUESS").is_ok_and(|v| !v.is_empty() && v != "0").then(|| (gpu.upload_u32(vec![0u32; 2 * n_slots]), gpu.upload_f32(&vec![0f32; n_slots]))),
             rope: None,
             tp: TokenParams::new(gpu, 0, 1, 1),
             blocker,
@@ -339,6 +347,11 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     let mut host_routes: Vec<(usize, Route)> = Vec::new();
     let mut y: Option<Handle> = None;
     let mut dev_moe = 0u64;
+    // engine step E2: experts routed on the device and served from the cache's slot bank
+    let e2 = knobs.e2_device_router() && m.store.cache.lock().expect("expert cache").is_some();
+    let mut slot_words = vec![0u32; 2 * prep.n_slots];
+    let mut guessed: Option<Vec<u32>> = None;
+    let stage = &m.stats.stage;
     for (li, layer) in m.w.layers.iter().enumerate() {
         let lp = &prep.layers[li];
         let h = gpu.add_rms_norm(&prep.x, y.as_ref(), &lp.attn_norm, e, eps);
@@ -371,6 +384,72 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                     gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), knobs.dd_router_seq());
                     let (outs, _) = stack.launch_device(gpu, &h2, 1, &prep.routes, prep.n_slots, base, k_used);
                     dev_moe += 1;
+                    gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots))
+                }
+                (None, Some(mi), Some((rh, bh))) if e2 => {
+                    let base = mi * k_used;
+                    let seq = knobs.dd_router_seq();
+                    gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), seq);
+                    // the guess of the next MoE layer, from the same residual stream (`x` is this
+                    // layer's x_mid here): its router on its own FFN pre-norm
+                    let mut want = vec![(prep.routes.clone(), prep.n_slots * 8)];
+                    if let (Some((gr, gw)), Some(next)) = (prep.guess.as_ref(), prep.layers.get(li + 1)) {
+                        if let (Some(nmi), Some((nr, nb))) = (next.moe_index, next.router.as_ref()) {
+                            let hn = gpu.add_rms_norm(&prep.x, None, &next.ffn_norm, e, eps);
+                            gpu.router_topk(&hn, nr, nb, gr, gw, (n_exp, k_used, e, nmi * k_used, prep.n_slots), seq);
+                            want.push((gr.clone(), prep.n_slots * 8));
+                        }
+                    }
+                    // the host learns this layer's routes: the one sync a layer that a miss served
+                    // from host memory cannot avoid
+                    let t_read = Instant::now();
+                    let bufs = match gpu.read_raw_keep(want) {
+                        Ok(b) => b,
+                        Err(err) => return abandon(m, cache, &format!("MoE layer {li} routes read: {err}")),
+                    };
+                    stage.h2_read_ns.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    stage.host_syncs.fetch_add(1, Ordering::Relaxed);
+                    let u32s = |b: &[u8]| b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<u32>>();
+                    let routes_now = u32s(&bufs[0]);
+                    let ids: Vec<u32> = (0..k_used).map(|i| routes_now[2 * (base + i)]).collect();
+                    if let Some(g) = guessed.take() {
+                        stage.guess_named.fetch_add(g.iter().filter(|e| ids.contains(e)).count() as u64, Ordering::Relaxed);
+                        stage.guess_total.fetch_add(k_used as u64, Ordering::Relaxed);
+                    }
+                    if let (Some(b), Some(nmi)) = (bufs.get(1), prep.layers.get(li + 1).and_then(|n| n.moe_index)) {
+                        let g = u32s(b);
+                        guessed = Some((0..k_used).map(|i| g[2 * (nmi * k_used + i)]).collect());
+                    }
+                    let mut needed: Vec<usize> = ids.iter().map(|&x| x as usize).collect();
+                    needed.sort_unstable();
+                    let t_fill = Instant::now();
+                    let mut guard = m.store.cache.lock().expect("expert cache");
+                    let c = guard.as_mut().expect("checked above");
+                    let plan = match c.slru.plan(li, &needed) {
+                        Some(p) => p,
+                        None => return abandon(m, cache, &format!("layer {li}: {} experts > {} cache slots", needed.len(), c.slru.n_slots())),
+                    };
+                    for &(x, s) in &plan.fills {
+                        let raw = |r: &MatRef| m.w.mat(r).bytes;
+                        if let Err(err) = c.slots.fill(gpu, s, [raw(&gate.expert(x)), raw(&up.expert(x)), raw(&down.expert(x))]) {
+                            return abandon(m, cache, &format!("layer {li} slot fill: {err}"));
+                        }
+                        c.count_fill();
+                    }
+                    let (n_hit, n_fill) = (plan.hits.len(), plan.fills.len());
+                    m.stats.gpu_hits.fetch_add(n_hit as u64, Ordering::Relaxed);
+                    m.stats.on_demand.fetch_add(n_fill as u64, Ordering::Relaxed);
+                    m.stats.on_demand_ns.fetch_add(t_fill.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    stage.layer(li, n_hit, 0, n_fill);
+                    stage.moe_layers.fetch_add(1, Ordering::Relaxed);
+                    if n_fill > 0 {
+                        stage.miss_layers.fetch_add(1, Ordering::Relaxed);
+                    }
+                    for (i, &x) in ids.iter().enumerate() {
+                        slot_words[2 * (base + i)] = c.slru.slot(li, x as usize).expect("planned") as u32;
+                    }
+                    gpu.write_u32(&prep.slot_routes, &slot_words);
+                    let (outs, _) = c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used);
                     gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots))
                 }
                 _ => {
@@ -417,6 +496,9 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
         Head::Q4(h4) => h4.launch(gpu, &hf, 1),
     };
     let read = gpu.read_raw(vec![(logits, vocab * 4), (prep.routes.clone(), prep.n_slots * 8), (prep.weights.clone(), prep.n_slots * 4)]);
+    if e2 {
+        stage.host_syncs.fetch_add(1, Ordering::Relaxed);
+    }
     drop(keep);
     drop(ring_guard);
     let bytes = match read {

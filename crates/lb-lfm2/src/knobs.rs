@@ -28,6 +28,10 @@ pub struct Knobs {
     /// old path. `LB_DD_HOST_MOE=1` at start; off by default (the plan's rule: a token takes
     /// the device path only when everything it needs is resident).
     dd_host_moe: AtomicBool,
+    /// With the dynamic expert cache, route each MoE layer on the device and run its experts from
+    /// the slot bank, the host seeing only the routes (engine step E2, one sync a layer instead of
+    /// two, nothing uploaded or summed on the host). `LB_E2=0` keeps E1's host-routed layer.
+    e2_device_router: AtomicBool,
     /// Router logits as one sequential dot per expert (the host's summation order) instead
     /// of a plane reduce: slower, for parity checks. `LB_DD_ROUTER_SEQ=1`; off by default.
     dd_router_seq: AtomicBool,
@@ -50,6 +54,7 @@ impl Default for Knobs {
             batch_miss: AtomicBool::new(std::env::var_os("LB_NO_BATCH_MISS").is_none()),
             device_decode: AtomicBool::new(env_or("LB_DEVICE_DECODE", true)),
             dd_host_moe: AtomicBool::new(env_on("LB_DD_HOST_MOE")),
+            e2_device_router: AtomicBool::new(env_or("LB_E2", true)),
             dd_router_seq: AtomicBool::new(env_on("LB_DD_ROUTER_SEQ")),
         }
     }
@@ -97,6 +102,14 @@ impl Knobs {
 
     pub fn set_dd_host_moe(&self, on: bool) {
         self.dd_host_moe.store(on, Ordering::Relaxed);
+    }
+
+    pub fn e2_device_router(&self) -> bool {
+        self.e2_device_router.load(Ordering::Relaxed)
+    }
+
+    pub fn set_e2_device_router(&self, on: bool) {
+        self.e2_device_router.store(on, Ordering::Relaxed);
     }
 
     pub fn dd_router_seq(&self) -> bool {

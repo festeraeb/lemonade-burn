@@ -164,6 +164,14 @@ pub struct StageStats {
     /// Host time issuing prefetches (predict + uploads on the side stream).
     pub issue_ns: AtomicU64,
     pub tokens: AtomicU64,
+    /// Engine step E2: stream syncs the host waited on in device-routed decode tokens (one a layer
+    /// plus the token's last read), the MoE layers that had at least one miss, and the on-device
+    /// next-layer guess's score (experts of the real set it named, out of k per layer).
+    pub host_syncs: AtomicU64,
+    pub miss_layers: AtomicU64,
+    pub moe_layers: AtomicU64,
+    pub guess_named: AtomicU64,
+    pub guess_total: AtomicU64,
     attn: std::sync::Mutex<Vec<bool>>,
 }
 
@@ -196,6 +204,11 @@ impl Default for StageStats {
             moe_read_ns: AtomicU64::new(0),
             issue_ns: AtomicU64::new(0),
             tokens: AtomicU64::new(0),
+            host_syncs: AtomicU64::new(0),
+            miss_layers: AtomicU64::new(0),
+            moe_layers: AtomicU64::new(0),
+            guess_named: AtomicU64::new(0),
+            guess_total: AtomicU64::new(0),
             attn: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -242,6 +255,10 @@ impl StageStats {
         let tokens = self.tokens.load(o);
         let per_tok = |x: u64| if tokens > 0 { x as f64 / tokens as f64 } else { 0.0 };
         let demand: u64 = sum(&self.demand, &|_| true);
+        let guess_recall = match self.guess_total.load(o) {
+            0 => 0.0,
+            t => self.guess_named.load(o) as f64 / t as f64,
+        };
         json!({
             "schema": "lemonade-burn.stage.v1",
             "tokens": tokens,
@@ -262,6 +279,10 @@ impl StageStats {
             "h2_read_ms_per_token": per_tok(self.h2_read_ns.load(o)) / 1e6,
             "moe_read_ms_per_token": per_tok(self.moe_read_ns.load(o)) / 1e6,
             "issue_ms_per_token": per_tok(self.issue_ns.load(o)) / 1e6,
+            "host_syncs_per_token": per_tok(self.host_syncs.load(o)),
+            "miss_layers_per_token": per_tok(self.miss_layers.load(o)),
+            "moe_layers_per_token": per_tok(self.moe_layers.load(o)),
+            "guess_recall": guess_recall,
         })
     }
 }
