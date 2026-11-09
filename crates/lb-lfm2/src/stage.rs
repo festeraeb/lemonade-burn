@@ -115,6 +115,19 @@ pub struct LookaheadCfg {
     pub cycle_window: usize,
     /// One JSON line per layer pass to this path (`LB_LA_TRACE`, offline simulator).
     pub trace: Option<std::path::PathBuf>,
+    /// Layers ahead the prefetch looks at (`LB_LA_PF_DEPTH`, default 1): depth 2 also issues copies for
+    /// L+2 at layer L, a longer lead time for each copy at a less accurate guess.
+    pub pf_depth: usize,
+    /// Prefetch into spare bank slots, repacked on the side stream, and rename the slot on use: a
+    /// covered miss then costs the main stream nothing but one fence (`LB_LA_SPARE=1`). Otherwise the
+    /// landing is raw bytes, repacked on the main stream on use.
+    pub spare: bool,
+    /// With the worker, pick its answer up just before the next layer's read instead of right after
+    /// this layer's launches (`LB_LA_DEFER=1`), so the main thread does not wait for the router dots.
+    pub defer: bool,
+    /// Compute the guess on a worker thread so the router dots leave the critical path
+    /// (`LB_LA_WORKER=1`; prefetch only, the keep guard needs the guess before planning).
+    pub worker: bool,
     /// Diagnostic: a `LB_LA_TRACE` file of the same session, replayed as a perfect guess of the next
     /// layer (no x read, no router dots), to measure what overlap alone can buy (`LB_LA_ORACLE`).
     pub oracle: Option<std::path::PathBuf>,
@@ -122,7 +135,7 @@ pub struct LookaheadCfg {
 
 impl Default for LookaheadCfg {
     fn default() -> Self {
-        Self { on: false, n_guess: 8, keep: false, keep_depth: 1, promote: 0, prefetch_cap: 0, min_conf: f32::NEG_INFINITY, landings: 8, cycle_window: 0, trace: None, oracle: None }
+        Self { on: false, n_guess: 8, keep: false, keep_depth: 1, promote: 0, prefetch_cap: 0, min_conf: f32::NEG_INFINITY, landings: 8, cycle_window: 0, trace: None, pf_depth: 1, spare: false, defer: false, worker: false, oracle: None }
     }
 }
 
@@ -147,6 +160,10 @@ impl LookaheadCfg {
             landings: num("LB_LA_LANDINGS").map(|v| v as usize).unwrap_or(d.landings),
             cycle_window: num("LB_LA_CYCLE_W").map(|v| v as usize).unwrap_or(d.cycle_window),
             trace,
+            pf_depth: num("LB_LA_PF_DEPTH").map(|v| (v as usize).max(1)).unwrap_or(d.pf_depth),
+            spare: on("LB_LA_SPARE"),
+            defer: on("LB_LA_DEFER"),
+            worker: on("LB_LA_WORKER"),
             oracle,
         }
     }
@@ -247,6 +264,57 @@ pub fn rank(router: &[f32], bias: &[f32], norm: &[f32], x: &[f32], eps: f32, n_e
     order.truncate(slots.min(n_expert));
     let scores = order.iter().map(|&e| score[e]).collect();
     Guess { layer, experts: order, margin, scores, ref_score }
+}
+
+
+/// The next-layer guess on its own thread (engine step E3): the host read of `x_mid` hands the bytes
+/// over and the main thread goes on planning and launching the layer while the router dots run, so
+/// the ~3 ms a token of guessing leaves the critical path. It owns copies of the routers (20 MB).
+pub struct GuessWorker {
+    tx: std::sync::mpsc::Sender<(usize, Vec<u8>)>,
+    rx: std::sync::mpsc::Receiver<Vec<Guess>>,
+}
+
+/// One target layer's router, bias and FFN pre-norm weights.
+pub type RouterCopy = (Vec<f32>, Vec<f32>, Vec<f32>);
+
+impl GuessWorker {
+    /// `routers[l]` is `None` for a layer with no MoE FFN. For layer `l` the worker guesses `l + 1 ..=
+    /// l + depth`.
+    pub fn new(routers: Vec<Option<RouterCopy>>, eps: f32, n_expert: usize, k: usize, slots: usize, depth: usize) -> Self {
+        let (tx, jobs) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+        let (out, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("lb-guess".into())
+            .spawn(move || {
+                while let Ok((li, bytes)) = jobs.recv() {
+                    let x: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let gs: Vec<Guess> = (1..=depth)
+                        .filter_map(|d| {
+                            let (r, b, n) = routers.get(li + d)?.as_ref()?;
+                            Some(rank(r, b, n, &x, eps, n_expert, k, slots, li + d))
+                        })
+                        .collect();
+                    if out.send(gs).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn lb-guess");
+        Self { tx, rx }
+    }
+
+    /// Start the guess from layer `li`'s `x_mid` (raw little-endian bytes).
+    pub fn send(&self, li: usize, x_mid: Vec<u8>) {
+        // an answer nobody took (a token abandoned mid-way) must not meet this job
+        while self.rx.try_recv().is_ok() {}
+        let _ = self.tx.send((li, x_mid));
+    }
+
+    /// The guesses for the job last sent, nearest layer first; empty if the worker is gone.
+    pub fn recv(&self) -> Vec<Guess> {
+        self.rx.recv().unwrap_or_default()
+    }
 }
 
 /// Decode-only counters, per layer, for both arms (ring on or off), so hit rates compare.
@@ -618,6 +686,17 @@ mod tests {
         assert!((g.margin - (s[order[1]] - s[order[2]])).abs() < 1e-6);
         // the bias decides selection: expert 3 is first with a 0.3 bias
         assert_eq!(g.experts[0], 3);
+    }
+
+    #[test]
+    fn the_worker_gives_the_same_guess_as_the_direct_call() {
+        let (router, bias, norm) = (vec![1.0f32, 0.0, 0.0, 1.0, -1.0, 0.0, 0.5, 0.5], vec![0.0f32; 4], vec![1.0f32; 2]);
+        let x = [3.0f32, 4.0];
+        let direct = rank(&router, &bias, &norm, &x, 1e-6, 4, 2, 3, 1);
+        let w = GuessWorker::new(vec![None, Some((router, bias, norm))], 1e-6, 4, 2, 3, 2);
+        w.send(0, x.iter().flat_map(|v| v.to_le_bytes()).collect());
+        // depth 2 asks for layers 1 and 2; layer 2 does not exist, so one guess
+        assert_eq!(w.recv(), vec![direct]);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! returns the output handle and `Gpu::read_all` fetches a batch of outputs in one sync,
 //! so a layer's resident experts cost one round trip, not one per expert.
 
-use crate::{conv_decode_kernel, cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_gate_up_silu_rows_kernel, q4_0_matvec_kernel, q4_0_matvec_rows_kernel, q4_0_repack_kernel, q4_0_routed_gate_up_silu_kernel, q4_0_routed_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, REPACK_CUBE, THREADS};
+use crate::{conv_decode_kernel, cube_count, matvec_dims, q4_0_gate_up_silu_kernel, q4_0_gate_up_silu_rows_kernel, q4_0_matvec_kernel, q4_0_matvec_rows_kernel, q4_0_repack_kernel, stream_fence_kernel, q4_0_routed_gate_up_silu_kernel, q4_0_routed_matvec_kernel, q6_k_matvec_kernel, repack_q4_0, repack_q6_k, QuantMat, REPACK_CUBE, THREADS};
 use cubecl::bytes::Bytes;
 use cubecl::client::Client;
 use cubecl::prelude::*;
@@ -1344,6 +1344,8 @@ pub struct ExpertSlots {
     /// File bytes of one matrix (`nb * 18`).
     raw_len: usize,
     n_sc: usize,
+    /// Output of [`ExpertSlots::fence`]; nothing reads it.
+    fence_out: Handle,
     /// Device bytes held: the slots plus the staging buffers.
     pub bytes: usize,
 }
@@ -1401,7 +1403,8 @@ impl ExpertSlots {
         };
         let slots: Vec<GpuExpert> = (0..n_slots).map(|s| bank.expert(gpu, s)).collect::<Result<_, _>>()?;
         let bytes = bank.bytes + n_staging * 3 * raw_len;
-        Ok(Self { bank, slots, staging, next_stage: AtomicUsize::new(0), raw_len, n_sc, bytes })
+        let fence_out = gpu.upload_u32(vec![0u32]);
+        Ok(Self { bank, slots, staging, next_stage: AtomicUsize::new(0), raw_len, n_sc, fence_out, bytes })
     }
 
     pub fn len(&self) -> usize {
@@ -1507,6 +1510,56 @@ impl ExpertSlots {
             }
             gpu.upload_u32(vec![self.n_sc as u32])
         }))
+    }
+
+    /// Prefetch into a spare slot: copy the raw slices into `raw_buf` and repack them into slot `phys`,
+    /// all on `side`, so neither the bus nor the repack is on the main stream. `phys` must be a slot no
+    /// kernel can be reading (one that no expert maps to). Returns a sentinel allocated after the
+    /// repack; [`ExpertSlots::fence`] on the main stream waits for it before the slot is read.
+    pub fn land_spare(&self, gpu: &Gpu, side: &SideStream, raw_buf: &Handle, phys: usize, raws: [&[u8]; 3]) -> Result<Handle, String> {
+        for (j, raw) in raws.iter().enumerate() {
+            if raw.len() < self.raw_len {
+                return Err(format!("expert landing: matrix {j} has {} bytes, need {}", raw.len(), self.raw_len));
+            }
+        }
+        let ex = &self.slots[phys];
+        Ok(gpu.on_stream(side, || {
+            let n = gpu.const_u32(&[self.n_sc as u32]);
+            for (j, (raw, m)) in raws.iter().zip([&ex.gate, &ex.up, &ex.down]).enumerate() {
+                let raw = &raw[..self.raw_len];
+                let dst = raw_buf.clone().offset_start((j * self.raw_len) as u64).offset_end(((2 - j) * self.raw_len) as u64);
+                #[cfg(feature = "cuda")]
+                let reg = if gpu.host_repack() { None } else { gpu.registered_slice(raw) };
+                #[cfg(not(feature = "cuda"))]
+                let reg: Option<Bytes> = None;
+                match reg {
+                    Some(b) => gpu.client.write(&dst, b),
+                    None => {
+                        let words: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                        gpu.client.write(&dst, Bytes::from_elems(words));
+                    }
+                }
+                unsafe {
+                    q4_0_repack_kernel::launch(
+                        &gpu.client,
+                        cube_count(self.n_sc, REPACK_CUBE),
+                        CubeDim::new_1d(REPACK_CUBE as u32),
+                        BufferArg::from_raw_parts(dst, self.raw_len / 4),
+                        BufferArg::from_raw_parts(m.qs.clone(), m.n_qs),
+                        BufferArg::from_raw_parts(m.sc.clone(), m.n_sc),
+                        BufferArg::from_raw_parts(n.clone(), 1),
+                    );
+                }
+            }
+            gpu.upload_u32(vec![self.n_sc as u32])
+        }))
+    }
+
+    /// Make the calling stream wait on the device for the side-stream work that produced `sentinel`.
+    pub fn fence(&self, gpu: &Gpu, sentinel: &Handle) {
+        unsafe {
+            stream_fence_kernel::launch(&gpu.client, cube_count(1, 1), CubeDim::new_1d(1), BufferArg::from_raw_parts(sentinel.clone(), 1), BufferArg::from_raw_parts(self.fence_out.clone(), 1));
+        }
     }
 
     /// Fill `slot` from a landing buffer filled by [`ExpertSlots::land`]: repack only (three launches

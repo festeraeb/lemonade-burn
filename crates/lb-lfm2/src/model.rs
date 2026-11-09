@@ -243,18 +243,38 @@ impl Lfm2 {
         let shape = shape.ok_or("expert cache: no MoE layer")?;
         let nb = shape[0].0 * shape[0].1 / 32;
         let per = lb_q4_gpu::ExpertSlots::slot_bytes(nb);
-        let n_slots = budget_bytes.saturating_sub(lb_q4_gpu::ExpertSlots::staging_bytes(nb, n_staging) + lb_q4_gpu::ExpertSlots::landing_bytes(nb, n_landing)) / per;
+        // LB_LA_SPARE: `n_landing` spare slots in the bank and two raw buffers instead of one raw buffer a landing
+        let spare = n_landing > 0 && self.store.la.spare;
+        let n_sides = if spare { self.store.la.pf_depth.max(1) } else { 1 };
+        let (n_spare, n_raw) = if spare { (n_landing, 2 * n_sides) } else { (0, n_landing) };
+        let n_slots = budget_bytes.saturating_sub(lb_q4_gpu::ExpertSlots::staging_bytes(nb, n_staging) + lb_q4_gpu::ExpertSlots::landing_bytes(nb, n_raw) + n_spare * per) / per;
         if n_slots < cfg.n_expert_used {
             return Err(format!("expert cache: {budget_bytes} bytes hold {n_slots} slots, fewer than top-k {}", cfg.n_expert_used));
         }
         let gpu = self.store.gpu.as_ref().expect("opened above");
-        let slots = lb_q4_gpu::ExpertSlots::new(gpu, n_slots, shape, n_staging)?;
-        let bytes = slots.bytes + lb_q4_gpu::ExpertSlots::landing_bytes(nb, n_landing);
+        let slots = lb_q4_gpu::ExpertSlots::new(gpu, n_slots + n_spare, shape, n_staging)?;
+        let bytes = slots.bytes + lb_q4_gpu::ExpertSlots::landing_bytes(nb, n_raw);
         let mut cache = crate::cache::ExpertCache::new(crate::cache::Slru::new(cfg.n_layer, cfg.n_expert, n_slots), slots);
         if n_landing > 0 {
             let side = gpu.side_stream();
-            let buffers = cache.slots.landing_buffers(gpu, &side, n_landing);
-            cache.landings = Some(crate::cache::Landings { book: crate::cache::LandingBook::new(n_landing), side, buffers, sentinels: vec![None; n_landing] });
+            let buffers = if spare { Vec::new() } else { cache.slots.landing_buffers(gpu, &side, n_raw) };
+            let sides: Vec<lb_q4_gpu::SideStream> = (0..n_sides).map(|i| if i == 0 { side } else { gpu.side_stream() }).collect();
+            let raw = if spare { sides.iter().map(|sd| cache.slots.landing_buffers(gpu, sd, 2)).collect() } else { Vec::new() };
+            cache.landings = Some(crate::cache::Landings { book: crate::cache::LandingBook::new(n_landing), side, buffers, sentinels: vec![None; n_landing], spare: vec![None; n_landing], next_raw: 0, sides, raw });
+            cache.spares = (n_slots..n_slots + n_spare).collect();
+        }
+        if self.store.la.worker && !self.store.la.keep {
+            let routers: Vec<Option<crate::stage::RouterCopy>> = self
+                .w
+                .layers
+                .iter()
+                .map(|l| match &l.ffn {
+                    Ffn::Moe { router, bias, .. } => Some((router.to_vec(), bias.to_vec(), l.ffn_norm.to_vec())),
+                    _ => None,
+                })
+                .collect();
+            let la = &self.store.la;
+            cache.worker = Some(crate::stage::GuessWorker::new(routers, cfg.rms_eps, cfg.n_expert, cfg.n_expert_used, la.n_guess, la.pf_depth));
         }
         if let Some(p) = &self.store.la.oracle {
             let txt = std::fs::read_to_string(p).map_err(|e| format!("look-ahead oracle {}: {e}", p.display()))?;

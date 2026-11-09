@@ -351,6 +351,8 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     let e2 = knobs.e2_device_router() && m.store.cache.lock().expect("expert cache").is_some();
     let mut slot_words = vec![0u32; 2 * prep.n_slots];
     let mut guessed: Option<Vec<u32>> = None;
+    // a guess job on the worker, to be picked up and issued before the next layer's read
+    let mut deferred = false;
     let stage = &m.stats.stage;
     for (li, layer) in m.w.layers.iter().enumerate() {
         let lp = &prep.layers[li];
@@ -404,10 +406,19 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                     // guess of the next layer (`x` is this layer's x_mid here)
                     let la = &m.store.la;
                     let x_at = (la.on && la.oracle.is_none()).then(|| { want.push((prep.x.clone(), e * 4)); want.len() - 1 });
+                    if deferred {
+                        deferred = false;
+                        let t = Instant::now();
+                        let mut g2 = m.store.cache.lock().expect("expert cache");
+                        let c2 = g2.as_mut().expect("checked above");
+                        let gs = c2.worker.as_ref().map(|w| w.recv()).unwrap_or_default();
+                        stage.la_guess_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        la_issue(m, gpu, c2, &gs);
+                    }
                     // the host learns this layer's routes: the one sync a layer that a miss served
                     // from host memory cannot avoid
                     let t_read = Instant::now();
-                    let bufs = match gpu.read_raw_keep(want) {
+                    let mut bufs = match gpu.read_raw_keep(want) {
                         Ok(b) => b,
                         Err(err) => return abandon(m, cache, &format!("MoE layer {li} routes read: {err}")),
                     };
@@ -428,25 +439,32 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                     needed.sort_unstable();
                     // E3: the host guess of the next MoE layers, from the state before this layer's
                     // experts run (`docs/ENGINE_E3_LOOKAHEAD.md`)
-                    let guess: Option<crate::stage::Guess> = x_at.and_then(|i| {
+                    // with the worker the guess is picked up after the launches (`pending`)
+                    let mut pending = false;
+                    let mut guesses: Vec<crate::stage::Guess> = Vec::new();
+                    if let Some(i) = x_at {
                         let t = Instant::now();
-                        let x_mid: Vec<f32> = bufs[i].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                        let g = crate::stage::predict(&m.w, li + 1, &x_mid, la.n_guess);
+                        let worker = m.store.cache.lock().expect("expert cache").as_ref().and_then(|c| c.worker.as_ref().map(|w| { w.send(li, std::mem::take(&mut bufs[i])); }));
+                        if worker.is_some() {
+                            pending = true;
+                        } else {
+                            let x_mid: Vec<f32> = bufs[i].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                            guesses.extend((1..=la.pf_depth).filter_map(|d| crate::stage::predict(&m.w, li + d, &x_mid, la.n_guess)));
+                        }
                         stage.la_guess_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        g
-                    });
+                    }
                     let t_fill = Instant::now();
                     let mut guard = m.store.cache.lock().expect("expert cache");
                     let c = guard.as_mut().expect("checked above");
                     // LB_LA_ORACLE: the recorded next pass replaces the guess (diagnostic, no host cost)
-                    let guess = match c.oracle.as_mut() {
-                        Some((passes, i)) => {
-                            let cur = *i;
-                            *i += 1;
-                            passes.get(cur + 1).filter(|(l, _)| *l == li + 1).map(|(l, ex)| crate::stage::Guess { layer: *l, experts: ex.clone(), margin: 0.0, scores: vec![1.0; ex.len()], ref_score: 0.0 })
-                        }
-                        None => guess,
-                    };
+                    if let Some((passes, i)) = c.oracle.as_mut() {
+                        let cur = *i;
+                        *i += 1;
+                        guesses = (1..=la.pf_depth)
+                            .filter_map(|d| passes.get(cur + d).filter(|(l, _)| *l == li + d).map(|(l, ex)| crate::stage::Guess { layer: *l, experts: ex.clone(), margin: 0.0, scores: vec![1.0; ex.len()], ref_score: 0.0 }))
+                            .collect();
+                    }
+                    let guess = guesses.first().cloned();
                     c.trace_pass("d", li, pos0, &needed, guess.as_ref());
                     // this sync finished every repack queued before it: their landing buffers are free
                     if let Some(l) = c.landings.as_mut() {
@@ -484,6 +502,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         }
                     }
                     let mut n_landed = 0;
+                    let mut fence: Option<Handle> = None;
                     for &(x, s) in &plan.fills {
                         let raw = |r: &MatRef| m.w.mat(r).bytes;
                         // a miss the prefetch already copied in: repack from the landing buffer, the
@@ -491,7 +510,17 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         if let Some(l) = c.landings.as_mut() {
                             if let Some(i) = l.book.consume(li, x) {
                                 let sent = l.sentinels[i].take().expect("a landing in flight has its sentinel");
-                                c.slots.repack_landed(gpu, s, &l.buffers[i], &sent);
+                                match l.spare[i].take() {
+                                    // the spare slot already holds the expert: it becomes this slot, and
+                                    // the slot it replaces becomes a spare
+                                    Some(p) => {
+                                        let old = c.phys[s] as usize;
+                                        c.phys[s] = p as u32;
+                                        c.spares.push(old);
+                                        fence = Some(sent);
+                                    }
+                                    None => c.slots.repack_landed(gpu, c.phys[s] as usize, &l.buffers[i], &sent),
+                                }
                                 n_landed += 1;
                                 if li < crate::stage::MAX_LAYERS {
                                     stage.useful[li].fetch_add(1, Ordering::Relaxed);
@@ -500,7 +529,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                                 continue;
                             }
                         }
-                        if let Err(err) = c.slots.fill(gpu, s, [raw(&gate.expert(x)), raw(&up.expert(x)), raw(&down.expert(x))]) {
+                        if let Err(err) = c.slots.fill(gpu, c.phys[s] as usize, [raw(&gate.expert(x)), raw(&up.expert(x)), raw(&down.expert(x))]) {
                             return abandon(m, cache, &format!("layer {li} slot fill: {err}"));
                         }
                         c.count_fill();
@@ -516,61 +545,43 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         stage.miss_layers.fetch_add(1, Ordering::Relaxed);
                     }
                     for (i, &x) in ids.iter().enumerate() {
-                        slot_words[2 * (base + i)] = c.slru.slot(li, x as usize).expect("planned") as u32;
+                        slot_words[2 * (base + i)] = c.phys[c.slru.slot(li, x as usize).expect("planned")];
                     }
                     gpu.write_u32(&prep.slot_routes, &slot_words);
+                    if let Some(f) = fence.take() {
+                        c.slots.fence(gpu, &f);
+                    }
                     let (outs, _) = c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used);
                     let sum = gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots));
                     // landings this layer did not use were wrong guesses: they cost bus, nothing else
                     if let Some(l) = c.landings.as_mut() {
                         let raw_b = c.slots.raw_expert_bytes() as u64;
-                        let n = l.book.expire_through(li) as u64;
+                        let expired = l.book.expire_through(li);
+                        for &i in &expired {
+                            l.sentinels[i] = None;
+                            if let Some(p) = l.spare[i].take() {
+                                c.spares.push(p);
+                            }
+                        }
+                        let n = expired.len() as u64;
                         if n > 0 && li < crate::stage::MAX_LAYERS {
                             stage.wasted[li].fetch_add(n, Ordering::Relaxed);
                             stage.wasted_bytes.fetch_add(n * raw_b, Ordering::Relaxed);
                         }
-                        let (cap, mc) = (la.prefetch_cap, la.min_conf);
-                        if let (Some(g), true) = (guess.as_ref(), cap > 0) {
+                        if pending && la.defer {
+                            // the job is picked up just before the next layer's read: the worker gets
+                            // this layer's launches and the next operator's to finish in
+                            deferred = true;
+                        } else if pending {
                             let t = Instant::now();
-                            let mut issued = 0usize;
-                            for (rank, &x) in g.experts.iter().enumerate() {
-                                if issued >= cap {
-                                    break;
-                                }
-                                // the guesses are in descending score, so nothing later passes
-                                if g.scores[rank] - g.ref_score < mc {
-                                    stage.guess_low_margin.fetch_add((g.experts.len() - rank) as u64, Ordering::Relaxed);
-                                    break;
-                                }
-                                if c.slru.slot(g.layer, x).is_some() {
-                                    stage.guess_resident.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                                if l.book.find(g.layer, x).is_some() {
-                                    stage.guess_in_ring.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                                let Some(i) = l.book.free_one() else {
-                                    stage.guess_no_room.fetch_add(1, Ordering::Relaxed);
-                                    break;
-                                };
-                                let Ffn::Moe { gate: ng, up: nu, down: nd, .. } = &m.w.layers[g.layer].ffn else { break };
-                                let raw = |r: &MatRef| m.w.mat(r).bytes;
-                                match c.slots.land(gpu, &l.side, &l.buffers[i], [raw(&ng.expert(x)), raw(&nu.expert(x)), raw(&nd.expert(x))]) {
-                                    Ok(sent) => {
-                                        l.sentinels[i] = Some(sent);
-                                        l.book.issue(i, g.layer, x);
-                                        issued += 1;
-                                        stage.prefetched[g.layer.min(crate::stage::MAX_LAYERS - 1)].fetch_add(1, Ordering::Relaxed);
-                                        stage.prefetch_bytes.fetch_add(raw_b, Ordering::Relaxed);
-                                    }
-                                    Err(_) => {
-                                        stage.upload_errors.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
+                            if let Some(w) = c.worker.as_ref() {
+                                guesses = w.recv();
                             }
-                            stage.issue_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            stage.la_guess_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
+                    }
+                    if !deferred {
+                        la_issue(m, gpu, c, &guesses);
                     }
                     sum
                 }
@@ -610,6 +621,14 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             },
         };
         y = Some(ffn_out);
+    }
+    // the last layer's job is for no layer: take its answer so it does not meet the next token's
+    if deferred {
+        if let Some(c) = m.store.cache.lock().expect("expert cache").as_ref() {
+            if let Some(w) = c.worker.as_ref() {
+                let _ = w.recv();
+            }
+        }
     }
     let hf = gpu.add_rms_norm(&prep.x, y.as_ref(), &prep.final_norm, e, eps);
     let vocab = cfg.n_vocab;
@@ -654,6 +673,74 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     m.timings.dd_tokens.fetch_add(1, Ordering::Relaxed);
     m.timings.dd_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     Some(Tensor::from_data(TensorData::new(logits, [1, vocab]), &m.device))
+}
+
+/// Issue the prefetch copies for `guesses` on the side stream (`stage.rs` `LookaheadCfg`): the guessed
+/// experts not cached and not already in flight, best first, at most the cap per target layer.
+fn la_issue(m: &Lfm2, gpu: &Gpu, c: &mut crate::cache::ExpertCache, guesses: &[crate::stage::Guess]) {
+    let (la, stage) = (&m.store.la, &m.stats.stage);
+    let (cap, mc) = (la.prefetch_cap, la.min_conf);
+    let raw_b = c.slots.raw_expert_bytes() as u64;
+    let Some(l) = c.landings.as_mut() else { return };
+        for g in guesses.iter().filter(|_| cap > 0) {
+            let t = Instant::now();
+            let mut issued = 0usize;
+            for (rank, &x) in g.experts.iter().enumerate() {
+                if issued >= cap {
+                    break;
+                }
+                // the guesses are in descending score, so nothing later passes
+                if g.scores[rank] - g.ref_score < mc {
+                    stage.guess_low_margin.fetch_add((g.experts.len() - rank) as u64, Ordering::Relaxed);
+                    break;
+                }
+                if c.slru.slot(g.layer, x).is_some() {
+                    stage.guess_resident.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if l.book.find(g.layer, x).is_some() {
+                    stage.guess_in_ring.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let Some(i) = l.book.free_one() else {
+                    stage.guess_no_room.fetch_add(1, Ordering::Relaxed);
+                    break;
+                };
+                let Ffn::Moe { gate: ng, up: nu, down: nd, .. } = &m.w.layers[g.layer].ffn else { break };
+                let raw = |r: &MatRef| m.w.mat(r).bytes;
+                let raws = [raw(&ng.expert(x)), raw(&nu.expert(x)), raw(&nd.expert(x))];
+                let landed = if la.spare {
+                    let Some(p) = c.spares.pop() else {
+                        stage.guess_no_room.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    };
+                    let si = g.layer % l.sides.len();
+                let rb = l.next_raw % l.raw[si].len();
+                l.next_raw += 1;
+                let r = c.slots.land_spare(gpu, &l.sides[si], &l.raw[si][rb], p, raws);
+                    match &r {
+                        Ok(_) => l.spare[i] = Some(p),
+                        Err(_) => c.spares.push(p),
+                    }
+                    r
+                } else {
+                    c.slots.land(gpu, &l.side, &l.buffers[i], raws)
+                };
+                match landed {
+                    Ok(sent) => {
+                        l.sentinels[i] = Some(sent);
+                        l.book.issue(i, g.layer, x);
+                        issued += 1;
+                        stage.prefetched[g.layer.min(crate::stage::MAX_LAYERS - 1)].fetch_add(1, Ordering::Relaxed);
+                        stage.prefetch_bytes.fetch_add(raw_b, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        stage.upload_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            stage.issue_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
 }
 
 /// The device copy can no longer be trusted (a read failed mid-token, after the KV append and

@@ -364,16 +364,16 @@ impl LandingBook {
     }
 
     /// Landings for layers up to `layer` that nothing consumed: the guesses were wrong. They go
-    /// straight back (no repack read them). Returns how many.
-    pub fn expire_through(&mut self, layer: usize) -> usize {
-        let mut n = 0;
-        for s in &mut self.st {
+    /// straight back (no repack read them). Returns their buffers.
+    pub fn expire_through(&mut self, layer: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (i, s) in self.st.iter_mut().enumerate() {
             if matches!(s, Landing::Flight(l, _) if *l <= layer) {
                 *s = Landing::Free;
-                n += 1;
+                out.push(i);
             }
         }
-        n
+        out
     }
 
     /// Free the buffers consumed before this sync (their repacks have run).
@@ -404,6 +404,16 @@ mod dev {
         /// Per buffer: the sentinel the repack binds so it waits for that buffer's copy (see
         /// [`ExpertSlots::land`]).
         pub sentinels: Vec<Option<Handle>>,
+        /// `LB_LA_SPARE`: the physical slot each landing is repacked into.
+        pub spare: Vec<Option<usize>>,
+        /// `LB_LA_SPARE`: which raw buffer the next copy uses (the side stream keeps them in order).
+        pub next_raw: usize,
+        /// `LB_LA_SPARE`: one side stream per look-ahead depth (`target layer % len`). A fence waits for
+        /// everything issued on its stream so far, so copies for a later layer must not share a stream
+        /// with the layer being fenced or they cancel their own lead time.
+        pub sides: Vec<SideStream>,
+        /// Raw buffers of each of `sides`, allocated on it.
+        pub raw: Vec<Vec<Handle>>,
     }
 
     /// The SLRU plus its device slots.
@@ -413,17 +423,25 @@ mod dev {
         /// Fills since start (demand misses plus seeds).
         pub fills: AtomicU64,
         pub seeds: usize,
+        /// Logical slot (the SLRU's) -> physical slot in the bank. The identity unless `LB_LA_SPARE`
+        /// has renamed slots.
+        pub phys: Vec<u32>,
+        /// `LB_LA_SPARE`: physical slots no expert maps to, the prefetch targets.
+        pub spares: Vec<usize>,
         /// Prefetch landing buffers (E3 miss-only prefetch); `None` when prefetch is off.
         pub landings: Option<Landings>,
         /// `LB_LA_TRACE`: one JSON line per layer pass for the offline simulator.
         pub trace: Option<std::sync::Mutex<std::io::LineWriter<std::fs::File>>>,
+        /// `LB_LA_WORKER`: the guess on its own thread.
+        pub worker: Option<crate::stage::GuessWorker>,
         /// `LB_LA_ORACLE`: the decode passes of a recorded session and the replay position.
         pub oracle: Option<(Vec<(usize, Vec<usize>)>, usize)>,
     }
 
     impl ExpertCache {
         pub fn new(slru: Slru, slots: ExpertSlots) -> Self {
-            Self { slru, slots, fills: AtomicU64::new(0), seeds: 0, landings: None, trace: None, oracle: None }
+            let phys = (0..slru.n_slots() as u32).collect();
+            Self { slru, slots, fills: AtomicU64::new(0), seeds: 0, phys, spares: Vec::new(), landings: None, trace: None, worker: None, oracle: None }
         }
 
         /// Record one layer pass for the offline simulator (`LB_LA_TRACE`, off by default).
@@ -604,7 +622,7 @@ mod tests {
         assert!(b.free_one().is_none(), "both taken");
         // layer 5 routes expert 3 only: 4 was a wrong guess
         assert_eq!(b.consume(5, 3), Some(i));
-        assert_eq!(b.expire_through(5), 1);
+        assert_eq!(b.expire_through(5), vec![j]);
         assert_eq!(b.state(j), Landing::Free);
         assert_eq!(b.state(i), Landing::Consumed, "held until the repack ran");
         assert!(b.free_one().is_some());
@@ -612,7 +630,7 @@ mod tests {
         assert_eq!(b.state(i), Landing::Free);
         // a landing for a later layer is not expired by an earlier one
         b.issue(0, 9, 1);
-        assert_eq!(b.expire_through(8), 0);
+        assert!(b.expire_through(8).is_empty());
         assert_eq!(b.state(0), Landing::Flight(9, 1));
     }
 

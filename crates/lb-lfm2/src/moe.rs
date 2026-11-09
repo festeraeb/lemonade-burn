@@ -742,7 +742,7 @@ fn moe_cached(
     let plan = cache.slru.plan(layer, &needed).ok_or_else(|| format!("{} distinct experts > {} cache slots", needed.len(), cache.slru.n_slots()))?;
     for &(e, s) in &plan.fills {
         let raw = |r: &crate::weights::MatRef| w.mat(r).bytes;
-        cache.slots.fill(gpu, s, [raw(&gate.expert(e)), raw(&up.expert(e)), raw(&down.expert(e))])?;
+        cache.slots.fill(gpu, cache.phys[s] as usize, [raw(&gate.expert(e)), raw(&up.expert(e)), raw(&down.expert(e))])?;
         cache.count_fill();
     }
     let fill_ns = t.elapsed().as_nanos() as u64;
@@ -769,7 +769,7 @@ fn moe_cached(
                 gpu.upload_f32(&xs)
             })
             .clone();
-        launched.push(cache.slots.expert(s).launch(gpu, &xh, toks.len()));
+        launched.push(cache.slots.expert(cache.phys[s] as usize).launch(gpu, &xh, toks.len()));
     }
     let outs = gpu.read_all(launched)?;
     let dt = t.elapsed().as_nanos() as u64;

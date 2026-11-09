@@ -495,6 +495,13 @@ pub const REPACK_CUBE: usize = 256;
 /// This is how a miss is served with no host work at all: the file mapping is page-locked
 /// once (`Gpu::register_mapping`), the driver DMAs the expert's raw bytes straight out of
 /// the page cache, and the device does the repack (measured 2026-11-03 on c2, `docs/WORK_LOG.md`).
+/// Copies one word: launched only for its binding of `s`, which makes this stream wait on the device
+/// for the work that produced `s` on another stream (`ExpertSlots::fence`).
+#[cube(launch)]
+fn stream_fence_kernel(s: &[u32], d: &mut [u32]) {
+    d[0] = s[0];
+}
+
 #[cube(launch)]
 fn q4_0_repack_kernel(raw: &[u32], qs: &mut [u32], sc: &mut [u32], n: &[u32]) {
     let p = CUBE_POS * CUBE_DIM_X as usize + UNIT_POS_X as usize;
