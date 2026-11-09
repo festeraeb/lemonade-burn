@@ -324,6 +324,8 @@ pub struct ExpertStore {
     pub knobs: std::sync::Arc<crate::knobs::Knobs>,
     /// Expert staging (`stage.rs`), restart-only; the ring exists only when it is on.
     pub stage: crate::stage::StageCfg,
+    /// Look-ahead over the expert cache (engine step E3, `stage.rs`), restart-only; off by default.
+    pub la: crate::stage::LookaheadCfg,
     #[cfg(feature = "gpu")]
     pub ring: Mutex<Option<crate::stage::Ring>>,
     /// The dynamic expert cache (`cache.rs`, engine step E1). When present every expert runs from
@@ -736,6 +738,7 @@ fn moe_cached(
     let n_embd = w.cfg.n_embd;
     let needed: Vec<usize> = experts.iter().map(|(e, _)| *e).collect();
     let t = std::time::Instant::now();
+    cache.trace_pass("p", layer, 0, &needed, None);
     let plan = cache.slru.plan(layer, &needed).ok_or_else(|| format!("{} distinct experts > {} cache slots", needed.len(), cache.slru.n_slots()))?;
     for &(e, s) in &plan.fills {
         let raw = |r: &crate::weights::MatRef| w.mat(r).bytes;

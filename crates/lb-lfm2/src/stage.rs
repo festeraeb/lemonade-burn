@@ -85,6 +85,77 @@ impl StageCfg {
     }
 }
 
+
+/// Engine step E3 settings, read once from the environment (restart-only); all off by default, in
+/// which case the decode path is E2's byte for byte.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LookaheadCfg {
+    /// Compute a guess at all (`LB_LOOKAHEAD=1`, implied by keep/prefetch).
+    pub on: bool,
+    /// Guesses per layer for the keep guard and the prefetch candidates (`LB_LA_N_GUESS`, default 8).
+    pub n_guess: usize,
+    /// Spare predicted experts from eviction (`LB_LA_KEEP=1`).
+    pub keep: bool,
+    /// Layers ahead the guard looks at (`LB_LA_KEEP_DEPTH`, default 1; the guess for L+2 reads the
+    /// same state and costs another router dot).
+    pub keep_depth: usize,
+    /// Refresh predicted experts that are cached: 0 no, 1 to the MRU end of their segment, 2 to
+    /// protected (`LB_LA_PROMOTE`, default 0).
+    pub promote: u8,
+    /// Prefetch at most this many predicted experts per layer that are NOT cached (0 = none,
+    /// `LB_LA_PREFETCH_CAP`).
+    pub prefetch_cap: usize,
+    /// Only prefetch guesses with confidence `score - ref_score` at or above this (`LB_LA_MIN_CONF`,
+    /// default negative infinity = no threshold).
+    pub min_conf: f32,
+    /// Prefetch landing buffers (`LB_LA_LANDINGS`, default 8), charged to the budget.
+    pub landings: usize,
+    /// Cycle-aware eviction: among the `cycle_window` least recently used probation slots, take the
+    /// one whose layer comes up furthest in the fixed layer order (0 = plain LRU, `LB_LA_CYCLE_W`).
+    pub cycle_window: usize,
+    /// One JSON line per layer pass to this path (`LB_LA_TRACE`, offline simulator).
+    pub trace: Option<std::path::PathBuf>,
+}
+
+impl Default for LookaheadCfg {
+    fn default() -> Self {
+        Self { on: false, n_guess: 8, keep: false, keep_depth: 1, promote: 0, prefetch_cap: 0, min_conf: f32::NEG_INFINITY, landings: 8, cycle_window: 0, trace: None }
+    }
+}
+
+impl LookaheadCfg {
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let on = |k: &str| std::env::var(k).map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+        let num = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<f64>().ok());
+        let keep = on("LB_LA_KEEP");
+        let promote = num("LB_LA_PROMOTE").map(|v| v as u8).unwrap_or(d.promote);
+        let prefetch_cap = num("LB_LA_PREFETCH_CAP").map(|v| v as usize).unwrap_or(d.prefetch_cap);
+        let trace = std::env::var("LB_LA_TRACE").ok().filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        Self {
+            on: on("LB_LOOKAHEAD") || keep || promote > 0 || prefetch_cap > 0 || trace.is_some(),
+            n_guess: num("LB_LA_N_GUESS").map(|v| v as usize).unwrap_or(d.n_guess),
+            keep,
+            keep_depth: num("LB_LA_KEEP_DEPTH").map(|v| v as usize).unwrap_or(d.keep_depth),
+            promote,
+            prefetch_cap,
+            min_conf: num("LB_LA_MIN_CONF").map(|v| v as f32).unwrap_or(d.min_conf),
+            landings: num("LB_LA_LANDINGS").map(|v| v as usize).unwrap_or(d.landings),
+            cycle_window: num("LB_LA_CYCLE_W").map(|v| v as usize).unwrap_or(d.cycle_window),
+            trace,
+        }
+    }
+
+    /// Landing buffers to allocate (none unless prefetch is on).
+    pub fn n_landings(&self) -> usize {
+        if self.prefetch_cap > 0 {
+            self.landings
+        } else {
+            0
+        }
+    }
+}
+
 /// The expert VRAM budget in bytes: `LB_EXPERT_VRAM_MIB` (MiB) when set, else `fallback_bytes`
 /// (the server's `--gpu-budget-mb`). The staging ring is carved out of it, so both arms of an
 /// A/B hold the same expert bytes on the card.
@@ -100,6 +171,11 @@ pub struct Guess {
     pub experts: Vec<usize>,
     /// `score[k-1] - score[k]` of the ranking (k = the model's top-k).
     pub margin: f32,
+    /// Biased selection score of each expert in `experts`, same order.
+    pub scores: Vec<f32>,
+    /// `score[k]`, the best score left out of the real top-k: `scores[i] - ref_score` is expert `i`'s
+    /// confidence (engine step E3), positive inside the top-k, the margin above the cut.
+    pub ref_score: f32,
 }
 
 /// The `mid1` guess of `target`'s experts from the residual stream `x_mid` of the layer before
@@ -112,6 +188,40 @@ pub fn predict(w: &Weights, target: usize, x_mid: &[f32], slots: usize) -> Optio
     Some(rank(router, bias, &layer.ffn_norm, x_mid, cfg.rms_eps, cfg.n_expert, cfg.n_expert_used, slots, target))
 }
 
+/// Dot product for the guess. A plain float `sum()` cannot be vectorized (the compiler may not
+/// reorder float additions), so the lanes are kept as separate accumulators and added at the end;
+/// with the AVX2 path this took the guess from 15 ms to well under 1 ms a token. The order of
+/// additions differs from `route_sigmoid`'s, which is fine: this only ranks a guess, the real route
+/// is computed elsewhere.
+#[inline(always)]
+fn dot_body(a: &[f32], b: &[f32]) -> f32 {
+    const W: usize = 32;
+    let mut acc = [0f32; W];
+    let (mut ia, mut ib) = (a.chunks_exact(W), b.chunks_exact(W));
+    for (x, y) in (&mut ia).zip(&mut ib) {
+        for i in 0..W {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let tail: f32 = ia.remainder().iter().zip(ib.remainder()).map(|(p, q)| p * q).sum();
+    acc.iter().sum::<f32>() + tail
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    dot_body(a, b)
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the features were just detected.
+        return unsafe { dot_avx2(a, b) };
+    }
+    dot_body(a, b)
+}
+
 /// The arithmetic of [`predict`], apart from the weights so it can be tested.
 #[allow(clippy::too_many_arguments)]
 pub fn rank(router: &[f32], bias: &[f32], norm: &[f32], x: &[f32], eps: f32, n_expert: usize, k: usize, slots: usize, layer: usize) -> Guess {
@@ -121,15 +231,17 @@ pub fn rank(router: &[f32], bias: &[f32], norm: &[f32], x: &[f32], eps: f32, n_e
     let h: Vec<f32> = x.iter().zip(norm).map(|(a, b)| a * r * b).collect();
     let score: Vec<f32> = (0..n_expert)
         .map(|e| {
-            let logit: f32 = router[e * n..(e + 1) * n].iter().zip(&h).map(|(a, b)| a * b).sum();
+            let logit = dot(&router[e * n..(e + 1) * n], &h);
             1.0 / (1.0 + (-logit).exp()) + bias[e]
         })
         .collect();
     let mut order: Vec<usize> = (0..n_expert).collect();
     order.sort_by(|&a, &b| score[b].partial_cmp(&score[a]).unwrap_or(std::cmp::Ordering::Equal));
     let margin = if k >= 1 && k < n_expert { score[order[k - 1]] - score[order[k]] } else { 0.0 };
+    let ref_score = if k < n_expert { score[order[k]] } else { f32::NEG_INFINITY };
     order.truncate(slots.min(n_expert));
-    Guess { layer, experts: order, margin }
+    let scores = order.iter().map(|&e| score[e]).collect();
+    Guess { layer, experts: order, margin, scores, ref_score }
 }
 
 /// Decode-only counters, per layer, for both arms (ring on or off), so hit rates compare.
@@ -172,6 +284,11 @@ pub struct StageStats {
     pub moe_layers: AtomicU64,
     pub guess_named: AtomicU64,
     pub guess_total: AtomicU64,
+    /// E3 look-ahead: LRU candidates passed over because a guess named them, experts promoted, and
+    /// host time computing guesses (the router dots; `issue_ns` is the prefetch copies).
+    pub la_spared: AtomicU64,
+    pub la_promoted: AtomicU64,
+    pub la_guess_ns: AtomicU64,
     attn: std::sync::Mutex<Vec<bool>>,
 }
 
@@ -209,6 +326,9 @@ impl Default for StageStats {
             moe_layers: AtomicU64::new(0),
             guess_named: AtomicU64::new(0),
             guess_total: AtomicU64::new(0),
+            la_spared: AtomicU64::new(0),
+            la_promoted: AtomicU64::new(0),
+            la_guess_ns: AtomicU64::new(0),
             attn: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -283,6 +403,9 @@ impl StageStats {
             "miss_layers_per_token": per_tok(self.miss_layers.load(o)),
             "moe_layers_per_token": per_tok(self.moe_layers.load(o)),
             "guess_recall": guess_recall,
+            "la_spared_per_token": per_tok(self.la_spared.load(o)),
+            "la_promoted_per_token": per_tok(self.la_promoted.load(o)),
+            "la_guess_ms_per_token": per_tok(self.la_guess_ns.load(o)) / 1e6,
         })
     }
 }
@@ -490,6 +613,14 @@ mod tests {
         assert!((g.margin - (s[order[1]] - s[order[2]])).abs() < 1e-6);
         // the bias decides selection: expert 3 is first with a 0.3 bias
         assert_eq!(g.experts[0], 3);
+    }
+
+    #[test]
+    fn the_lane_dot_agrees_with_the_plain_sum() {
+        let a: Vec<f32> = (0..2048).map(|i| (i as f32 * 0.37).sin()).collect();
+        let b: Vec<f32> = (0..2048).map(|i| (i as f32 * 0.11).cos()).collect();
+        let plain: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+        assert!((dot(&a, &b) - plain).abs() < 1e-2, "{} vs {plain}", dot(&a, &b));
     }
 
     #[test]

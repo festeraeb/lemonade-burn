@@ -611,7 +611,12 @@ fn main() -> Result<()> {
                 let eb = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).max().unwrap_or(1).max(1);
                 let fit = expert_budget / eb;
                 let seed: Vec<(usize, usize)> = cache_seed.iter().take(fit).rev().copied().collect();
-                model.enable_cache(expert_budget, n_staging, &seed).map_err(|e| anyhow::anyhow!(e))?
+                model.store.la = lb_lfm2::stage::LookaheadCfg::from_env();
+                let la = model.store.la.clone();
+                if la.on {
+                    eprintln!("look-ahead (E3): {la:?}");
+                }
+                model.enable_cache_la(expert_budget, n_staging, la.n_landings(), &seed).map_err(|e| anyhow::anyhow!(e))?
             };
             model.knobs().set_dd_host_moe(true);
             eprintln!(

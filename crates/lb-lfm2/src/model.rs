@@ -213,6 +213,13 @@ impl Lfm2 {
     /// heat order to start warm, or nothing to start cold. Returns (slots, device bytes).
     #[cfg(feature = "gpu")]
     pub fn enable_cache(&mut self, budget_bytes: usize, n_staging: usize, seed: &[(usize, usize)]) -> Result<(usize, usize), String> {
+        self.enable_cache_la(budget_bytes, n_staging, 0, seed)
+    }
+
+    /// [`Lfm2::enable_cache`] with `n_landing` prefetch landing buffers (engine step E3), charged to
+    /// the budget beside the slots and the staging buffers.
+    #[cfg(feature = "gpu")]
+    pub fn enable_cache_la(&mut self, budget_bytes: usize, n_staging: usize, n_landing: usize, seed: &[(usize, usize)]) -> Result<(usize, usize), String> {
         use crate::weights::Ffn;
         if self.store.gpu.is_none() {
             self.store.gpu = Some(crate::moe::ExpertStore::open_gpu(&self.w)?);
@@ -236,14 +243,23 @@ impl Lfm2 {
         let shape = shape.ok_or("expert cache: no MoE layer")?;
         let nb = shape[0].0 * shape[0].1 / 32;
         let per = lb_q4_gpu::ExpertSlots::slot_bytes(nb);
-        let n_slots = budget_bytes.saturating_sub(lb_q4_gpu::ExpertSlots::staging_bytes(nb, n_staging)) / per;
+        let n_slots = budget_bytes.saturating_sub(lb_q4_gpu::ExpertSlots::staging_bytes(nb, n_staging) + lb_q4_gpu::ExpertSlots::landing_bytes(nb, n_landing)) / per;
         if n_slots < cfg.n_expert_used {
             return Err(format!("expert cache: {budget_bytes} bytes hold {n_slots} slots, fewer than top-k {}", cfg.n_expert_used));
         }
         let gpu = self.store.gpu.as_ref().expect("opened above");
         let slots = lb_q4_gpu::ExpertSlots::new(gpu, n_slots, shape, n_staging)?;
-        let bytes = slots.bytes;
+        let bytes = slots.bytes + lb_q4_gpu::ExpertSlots::landing_bytes(nb, n_landing);
         let mut cache = crate::cache::ExpertCache::new(crate::cache::Slru::new(cfg.n_layer, cfg.n_expert, n_slots), slots);
+        if n_landing > 0 {
+            let side = gpu.side_stream();
+            let buffers = cache.slots.landing_buffers(gpu, &side, n_landing);
+            cache.landings = Some(crate::cache::Landings { book: crate::cache::LandingBook::new(n_landing), side, buffers, sentinels: vec![None; n_landing] });
+        }
+        if let Some(p) = &self.store.la.trace {
+            let f = std::fs::File::create(p).map_err(|e| format!("look-ahead trace {}: {e}", p.display()))?;
+            cache.trace = Some(std::sync::Mutex::new(std::io::LineWriter::new(f)));
+        }
         for &(l, e) in seed {
             let Ffn::Moe { gate, up, down, .. } = &self.w.layers[l].ffn else { continue };
             if let Some(s) = cache.slru.seed(l, e) {

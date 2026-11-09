@@ -400,6 +400,10 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                             want.push((gr.clone(), prep.n_slots * 8));
                         }
                     }
+                    // E3: the residual stream comes back with the routes (same sync) for the host's
+                    // guess of the next layer (`x` is this layer's x_mid here)
+                    let la = &m.store.la;
+                    let x_at = la.on.then(|| { want.push((prep.x.clone(), e * 4)); want.len() - 1 });
                     // the host learns this layer's routes: the one sync a layer that a miss served
                     // from host memory cannot avoid
                     let t_read = Instant::now();
@@ -422,27 +426,84 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                     }
                     let mut needed: Vec<usize> = ids.iter().map(|&x| x as usize).collect();
                     needed.sort_unstable();
+                    // E3: the host guess of the next MoE layers, from the state before this layer's
+                    // experts run (`docs/ENGINE_E3_LOOKAHEAD.md`)
+                    let guess: Option<crate::stage::Guess> = x_at.and_then(|i| {
+                        let t = Instant::now();
+                        let x_mid: Vec<f32> = bufs[i].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                        let g = crate::stage::predict(&m.w, li + 1, &x_mid, la.n_guess);
+                        stage.la_guess_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        g
+                    });
                     let t_fill = Instant::now();
                     let mut guard = m.store.cache.lock().expect("expert cache");
                     let c = guard.as_mut().expect("checked above");
-                    let plan = match c.slru.plan(li, &needed) {
-                        Some(p) => p,
+                    c.trace_pass("d", li, pos0, &needed, guess.as_ref());
+                    // this sync finished every repack queued before it: their landing buffers are free
+                    if let Some(l) = c.landings.as_mut() {
+                        l.book.reclaim();
+                    }
+                    // keep guard: what the coming layers are predicted to need is not evicted now
+                    let keep: Vec<(usize, usize)> = if la.keep {
+                        let mut v: Vec<(usize, usize)> = guess.iter().flat_map(|g| g.experts.iter().map(|&x| (g.layer, x))).collect();
+                        if la.keep_depth > 1 {
+                            let x_mid: Vec<f32> = x_at.map(|i| bufs[i].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()).unwrap_or_default();
+                            for d in 2..=la.keep_depth {
+                                if let Some(g) = crate::stage::predict(&m.w, li + d, &x_mid, la.n_guess) {
+                                    v.extend(g.experts.iter().map(|&x| (g.layer, x)));
+                                }
+                            }
+                        }
+                        v
+                    } else {
+                        Vec::new()
+                    };
+                    let plan = match c.slru.plan_la(li, &needed, &keep, la.cycle_window, cfg.n_layer) {
+                        Some((p, spared)) => {
+                            stage.la_spared.fetch_add(spared, Ordering::Relaxed);
+                            p
+                        }
                         None => return abandon(m, cache, &format!("layer {li}: {} experts > {} cache slots", needed.len(), c.slru.n_slots())),
                     };
+                    if la.promote > 0 {
+                        if let Some(g) = guess.as_ref() {
+                            for &x in &g.experts {
+                                if c.slru.promote(g.layer, x, la.promote > 1) {
+                                    stage.la_promoted.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    let mut n_landed = 0;
                     for &(x, s) in &plan.fills {
                         let raw = |r: &MatRef| m.w.mat(r).bytes;
+                        // a miss the prefetch already copied in: repack from the landing buffer, the
+                        // bus already paid
+                        if let Some(l) = c.landings.as_mut() {
+                            if let Some(i) = l.book.consume(li, x) {
+                                let sent = l.sentinels[i].take().expect("a landing in flight has its sentinel");
+                                c.slots.repack_landed(gpu, s, &l.buffers[i], &sent);
+                                n_landed += 1;
+                                if li < crate::stage::MAX_LAYERS {
+                                    stage.useful[li].fetch_add(1, Ordering::Relaxed);
+                                }
+                                c.count_fill();
+                                continue;
+                            }
+                        }
                         if let Err(err) = c.slots.fill(gpu, s, [raw(&gate.expert(x)), raw(&up.expert(x)), raw(&down.expert(x))]) {
                             return abandon(m, cache, &format!("layer {li} slot fill: {err}"));
                         }
                         c.count_fill();
                     }
                     let (n_hit, n_fill) = (plan.hits.len(), plan.fills.len());
+                    let n_demand = n_fill - n_landed;
                     m.stats.gpu_hits.fetch_add(n_hit as u64, Ordering::Relaxed);
                     m.stats.on_demand.fetch_add(n_fill as u64, Ordering::Relaxed);
                     m.stats.on_demand_ns.fetch_add(t_fill.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    stage.layer(li, n_hit, 0, n_fill);
+                    stage.layer(li, n_hit, n_landed, n_demand);
                     stage.moe_layers.fetch_add(1, Ordering::Relaxed);
-                    if n_fill > 0 {
+                    if n_demand > 0 {
                         stage.miss_layers.fetch_add(1, Ordering::Relaxed);
                     }
                     for (i, &x) in ids.iter().enumerate() {
@@ -450,7 +511,59 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                     }
                     gpu.write_u32(&prep.slot_routes, &slot_words);
                     let (outs, _) = c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used);
-                    gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots))
+                    let sum = gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots));
+                    // landings this layer did not use were wrong guesses: they cost bus, nothing else
+                    if let Some(l) = c.landings.as_mut() {
+                        let raw_b = c.slots.raw_expert_bytes() as u64;
+                        let n = l.book.expire_through(li) as u64;
+                        if n > 0 && li < crate::stage::MAX_LAYERS {
+                            stage.wasted[li].fetch_add(n, Ordering::Relaxed);
+                            stage.wasted_bytes.fetch_add(n * raw_b, Ordering::Relaxed);
+                        }
+                        let (cap, mc) = (la.prefetch_cap, la.min_conf);
+                        if let (Some(g), true) = (guess.as_ref(), cap > 0) {
+                            let t = Instant::now();
+                            let mut issued = 0usize;
+                            for (rank, &x) in g.experts.iter().enumerate() {
+                                if issued >= cap {
+                                    break;
+                                }
+                                // the guesses are in descending score, so nothing later passes
+                                if g.scores[rank] - g.ref_score < mc {
+                                    stage.guess_low_margin.fetch_add((g.experts.len() - rank) as u64, Ordering::Relaxed);
+                                    break;
+                                }
+                                if c.slru.slot(g.layer, x).is_some() {
+                                    stage.guess_resident.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                if l.book.find(g.layer, x).is_some() {
+                                    stage.guess_in_ring.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                let Some(i) = l.book.free_one() else {
+                                    stage.guess_no_room.fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                };
+                                let Ffn::Moe { gate: ng, up: nu, down: nd, .. } = &m.w.layers[g.layer].ffn else { break };
+                                let raw = |r: &MatRef| m.w.mat(r).bytes;
+                                match c.slots.land(gpu, &l.side, &l.buffers[i], [raw(&ng.expert(x)), raw(&nu.expert(x)), raw(&nd.expert(x))]) {
+                                    Ok(sent) => {
+                                        l.sentinels[i] = Some(sent);
+                                        l.book.issue(i, g.layer, x);
+                                        issued += 1;
+                                        stage.prefetched[g.layer.min(crate::stage::MAX_LAYERS - 1)].fetch_add(1, Ordering::Relaxed);
+                                        stage.prefetch_bytes.fetch_add(raw_b, Ordering::Relaxed);
+                                    }
+                                    Err(_) => {
+                                        stage.upload_errors.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            stage.issue_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
+                    }
+                    sum
                 }
                 _ => {
                     // not resident as a stack: the old host path for this layer, one sync. With

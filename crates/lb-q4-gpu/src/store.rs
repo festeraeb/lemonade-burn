@@ -1459,4 +1459,74 @@ impl ExpertSlots {
         }
         Ok(())
     }
+
+    /// Device bytes of `n` prefetch landing buffers (see [`ExpertSlots::land`]).
+    pub fn landing_bytes(nb: usize, n: usize) -> usize {
+        n * 3 * nb * 18
+    }
+
+    /// Bytes of one expert's raw file slices (the size of a landing buffer).
+    pub fn raw_expert_bytes(&self) -> usize {
+        3 * self.raw_len
+    }
+
+    /// Allocate `n` landing buffers on `side` (persistent pool, once) for [`ExpertSlots::land`].
+    pub fn landing_buffers(&self, gpu: &Gpu, side: &SideStream, n: usize) -> Vec<Handle> {
+        let size = 3 * self.raw_len;
+        gpu.on_stream(side, || gpu.client.memory_persistent_allocation((), |_| (0..n).map(|_| gpu.client.empty(size)).collect()))
+    }
+
+    /// Prefetch: copy an expert's raw Q4_0 slices (gate, up, down) into the landing buffer `lb`,
+    /// queued on `side` so the copy overlaps the main stream's kernels. Returns a sentinel handle
+    /// created on `side` **after** the copies: CubeCL's cross-stream ordering works by buffer cursors
+    /// set when a buffer is allocated, not when it is written, so a kernel binding the (long-lived)
+    /// landing buffer would not wait for this copy; a freshly allocated sentinel has a cursor after
+    /// the copies, and a main-stream kernel that binds it waits on the device for them. The sentinel
+    /// doubles as the repack's block-count argument, so the kernel signature does not change.
+    pub fn land(&self, gpu: &Gpu, side: &SideStream, lb: &Handle, raws: [&[u8]; 3]) -> Result<Handle, String> {
+        for (j, raw) in raws.iter().enumerate() {
+            if raw.len() < self.raw_len {
+                return Err(format!("expert landing: matrix {j} has {} bytes, need {}", raw.len(), self.raw_len));
+            }
+        }
+        Ok(gpu.on_stream(side, || {
+            for (j, raw) in raws.iter().enumerate() {
+                let raw = &raw[..self.raw_len];
+                let dst = lb.clone().offset_start((j * self.raw_len) as u64).offset_end(((2 - j) * self.raw_len) as u64);
+                #[cfg(feature = "cuda")]
+                let reg = if gpu.host_repack() { None } else { gpu.registered_slice(raw) };
+                #[cfg(not(feature = "cuda"))]
+                let reg: Option<Bytes> = None;
+                match reg {
+                    Some(b) => gpu.client.write(&dst, b),
+                    None => {
+                        let words: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                        gpu.client.write(&dst, Bytes::from_elems(words));
+                    }
+                }
+            }
+            gpu.upload_u32(vec![self.n_sc as u32])
+        }))
+    }
+
+    /// Fill `slot` from a landing buffer filled by [`ExpertSlots::land`]: repack only (three launches
+    /// on the calling stream), the bus already paid. `sentinel` is the handle `land` returned; binding
+    /// it makes the calling stream wait on the device for the copy if it has not landed yet.
+    pub fn repack_landed(&self, gpu: &Gpu, slot: usize, lb: &Handle, sentinel: &Handle) {
+        let ex = &self.slots[slot];
+        for (j, m) in [&ex.gate, &ex.up, &ex.down].into_iter().enumerate() {
+            let src = lb.clone().offset_start((j * self.raw_len) as u64).offset_end(((2 - j) * self.raw_len) as u64);
+            unsafe {
+                q4_0_repack_kernel::launch(
+                    &gpu.client,
+                    cube_count(self.n_sc, REPACK_CUBE),
+                    CubeDim::new_1d(REPACK_CUBE as u32),
+                    BufferArg::from_raw_parts(src, self.raw_len / 4),
+                    BufferArg::from_raw_parts(m.qs.clone(), m.n_qs),
+                    BufferArg::from_raw_parts(m.sc.clone(), m.n_sc),
+                    BufferArg::from_raw_parts(sentinel.clone(), 1),
+                );
+            }
+        }
+    }
 }
