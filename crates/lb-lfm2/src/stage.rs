@@ -122,6 +122,10 @@ pub struct LookaheadCfg {
     /// covered miss then costs the main stream nothing but one fence (`LB_LA_SPARE=1`). Otherwise the
     /// landing is raw bytes, repacked on the main stream on use.
     pub spare: bool,
+    /// Diagnostic: issue one useless copy on every `ballast`-th layer whatever is cached (`LB_LA_BALLAST=N`,
+    /// with `LB_LA_ORACLE` and cap 1). Nothing consumes them, so there is no fence: what they cost the
+    /// main stream is contention alone.
+    pub ballast: usize,
     /// With the worker, pick its answer up just before the next layer's read instead of right after
     /// this layer's launches (`LB_LA_DEFER=1`), so the main thread does not wait for the router dots.
     pub defer: bool,
@@ -135,7 +139,7 @@ pub struct LookaheadCfg {
 
 impl Default for LookaheadCfg {
     fn default() -> Self {
-        Self { on: false, n_guess: 8, keep: false, keep_depth: 1, promote: 0, prefetch_cap: 0, min_conf: f32::NEG_INFINITY, landings: 8, cycle_window: 0, trace: None, pf_depth: 1, spare: false, defer: false, worker: false, oracle: None }
+        Self { on: false, n_guess: 8, keep: false, keep_depth: 1, promote: 0, prefetch_cap: 0, min_conf: f32::NEG_INFINITY, landings: 8, cycle_window: 0, trace: None, pf_depth: 1, spare: false, ballast: 0, defer: false, worker: false, oracle: None }
     }
 }
 
@@ -162,6 +166,7 @@ impl LookaheadCfg {
             trace,
             pf_depth: num("LB_LA_PF_DEPTH").map(|v| (v as usize).max(1)).unwrap_or(d.pf_depth),
             spare: on("LB_LA_SPARE"),
+            ballast: num("LB_LA_BALLAST").map(|v| v as usize).unwrap_or(d.ballast),
             defer: on("LB_LA_DEFER"),
             worker: on("LB_LA_WORKER"),
             oracle,

@@ -97,3 +97,147 @@ All [measured]. A perfect free guess gives 1.13-1.28x paired (cap 2 best, median
 saves roughly 0.25 ms of its ~0.6 ms of bus time [derived]. A wrong guess costs about its whole bus time: the real
 arms at similar coverage save 1 ms, not 4-5, and the difference is close to wasted copies x 0.55 ms [derived from the
 5120 MiB table: pf2 tau .02 covers 11.1 and wastes 3.5, which predicts 11.1 x 0.25 - 3.5 x 0.55 = 0.9 ms; measured 1.04].
+
+### Worker-thread guess, spare-slot prefetch, and the deferred pick-up (n = 3 per arm, interleaved with e2)
+
+Set B (`w...` = guess on a worker thread, raw landing + repack on the main stream):
+
+arm | n | tok/s med [min-max] | x e2 (paired) | token ms | read wait | hit | misses/t | on bus/t | covered/t | prefetched/t | precision | wasted MB/t | guess ms | issue ms | spared/t | syncs/t | miss layers/t | VRAM MiB
+---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---
+e2 | 3 | 30.32 [30.31-30.40] | 1.000 [1.000-1.000] | 32.86 | 24.99 | 0.854 | 22.20 | 22.20 | 0.00 | 0.00 | - | 0.0 | 0.00 | 0.00 | 0.00 | 39.00 | 15.18 | 6337/6443
+orc4 | 3 | 36.58 [35.88-36.80] | 1.207 [1.180-1.214] | 27.37 | 19.46 | 0.852 | 22.49 | 0.56 | 21.93 | 21.93 | 1.00 | 0.0 | 0.00 | 0.14 | 0.00 | 39.00 | 0.37 | 6343/6457
+orcd2 | 3 | 36.42 [36.42-37.46] | 1.201 [1.198-1.236] | 27.49 | 19.62 | 0.850 | 22.73 | 0.57 | 22.16 | 22.16 | 1.00 | 0.0 | 0.00 | 0.15 | 0.00 | 39.00 | 0.38 | 6349/6463
+orcd3 | 3 | 36.21 [35.97-37.00] | 1.191 [1.186-1.221] | 27.65 | 19.62 | 0.849 | 22.90 | 0.57 | 22.33 | 22.33 | 1.00 | 0.0 | 0.00 | 0.17 | 0.00 | 39.00 | 0.38 | 6355/6469
+w0 | 3 | 30.30 [30.09-30.36] | 0.997 [0.992-1.002] | 33.15 | 25.10 | 0.854 | 22.20 | 22.20 | 0.00 | 0.00 | - | 0.0 | 0.18 | 0.00 | 0.00 | 39.00 | 15.18 | 6337/6443
+w2t01 | 3 | 30.20 [29.78-30.38] | 0.996 [0.983-0.999] | 33.29 | 24.01 | 0.852 | 22.49 | 9.85 | 12.64 | 18.35 | 0.69 | 30.3 | 1.94 | 0.12 | 0.00 | 39.00 | 8.54 | 6343/6457
+w2t02 | 3 | 29.43 [29.42-29.54] | 0.971 [0.970-0.972] | 34.12 | 24.02 | 0.852 | 22.49 | 11.40 | 11.09 | 14.62 | 0.76 | 18.7 | 1.82 | 0.11 | 0.00 | 39.00 | 9.68 | 6343/6457
+w2t02d2 | 3 | 27.29 [27.07-27.80] | 0.898 [0.893-0.917] | 36.86 | 24.89 | 0.850 | 22.73 | 9.85 | 12.88 | 20.85 | 0.62 | 42.3 | 3.94 | 0.16 | 0.00 | 39.00 | 8.50 | 6349/6463
+w2t05 | 3 | 30.20 [29.34-30.50] | 0.996 [0.968-1.003] | 33.33 | 24.22 | 0.852 | 22.49 | 14.59 | 7.90 | 9.02 | 0.88 | 5.9 | 1.92 | 0.06 | 0.00 | 39.00 | 11.74 | 6343/6457
+
+Set D (`...s` = spare-slot prefetch: DMA and repack on a side stream into a bank slot no expert maps to, the slot number
+swapped when the layer really routes the expert; `d...` = worker answer picked up just before the next layer's read):
+
+arm | n | tok/s med [min-max] | x e2 (paired) | token ms | read wait | hit | misses/t | on bus/t | covered/t | prefetched/t | precision | wasted MB/t | guess ms | issue ms | spared/t | syncs/t | miss layers/t | VRAM MiB
+---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---
+e2 | 3 | 30.18 [29.80-30.67] | 1.000 [1.000-1.000] | 32.99 | 25.09 | 0.854 | 22.20 | 22.20 | 0.00 | 0.00 | - | 0.0 | 0.00 | 0.00 | 0.00 | 39.00 | 15.18 | 6337/6443
+d2t01s | 3 | 31.46 [31.19-31.46] | 1.042 [1.017-1.056] | 31.64 | 22.80 | 0.851 | 22.58 | 9.89 | 12.69 | 18.39 | 0.69 | 30.3 | 0.24 | 0.69 | 0.00 | 39.00 | 8.56 | 6331/6445
+d2t02s | 3 | 31.12 [31.07-33.03] | 1.030 [1.015-1.108] | 31.96 | 22.94 | 0.851 | 22.58 | 11.44 | 11.14 | 14.66 | 0.76 | 18.7 | 0.25 | 0.57 | 0.00 | 39.00 | 9.70 | 6331/6445
+d2t02sd2 | 3 | 30.74 [30.35-30.89] | 1.005 [1.002-1.037] | 32.44 | 22.74 | 0.850 | 22.84 | 9.90 | 12.94 | 20.93 | 0.62 | 42.4 | 1.29 | 0.76 | 0.00 | 39.00 | 8.54 | 6337/6459
+d2t05s | 3 | 31.06 [31.02-31.50] | 1.028 [1.027-1.042] | 32.03 | 23.32 | 0.851 | 22.58 | 14.64 | 7.94 | 9.06 | 0.88 | 5.9 | 0.30 | 0.37 | 0.00 | 39.00 | 11.75 | 6331/6445
+orcs4 | 3 | 37.60 [37.01-38.88] | 1.246 [1.242-1.268] | 26.39 | 18.80 | 0.851 | 22.58 | 0.56 | 22.02 | 22.02 | 1.00 | 0.0 | 0.00 | 0.61 | 0.00 | 39.00 | 0.37 | 6331/6445
+orcsd2 | 3 | 37.77 [37.43-38.60] | 1.256 [1.232-1.279] | 26.20 | 18.16 | 0.850 | 22.84 | 0.57 | 22.27 | 22.27 | 1.00 | 0.0 | 0.00 | 0.75 | 0.00 | 39.00 | 0.38 | 6337/6459
+orcsd3 | 3 | 36.93 [36.83-38.55] | 1.236 [1.224-1.257] | 26.83 | 18.56 | 0.848 | 23.08 | 0.57 | 22.51 | 22.51 | 1.00 | 0.0 | 0.00 | 0.79 | 0.00 | 39.00 | 0.38 | 6337/6467
+
+All [measured]. Moving the guess off the critical path took host guess cost from 2.9 ms to 0.25-0.30 ms a token, and the
+spare slot took a covered miss's main-stream repack away (read wait 24.0 to 22.8 at the same coverage). `d2t01s` =
+1.042x paired [1.017-1.056].
+
+### The floor and the ballast: where the rest goes (12500 MiB, every expert cached, n = 3 per arm)
+
+`bal2` / `bal1` issue a useless copy every 2nd layer / every layer (18 / 37 a token); nothing consumes them, so there is
+no fence and no dependency, only a copy competing with the main stream.
+
+arm | n | tok/s med [min-max] | x e2 (paired) | token ms | read wait | hit | misses/t | on bus/t | covered/t | prefetched/t | precision | wasted MB/t | guess ms | issue ms | spared/t | syncs/t | miss layers/t | VRAM MiB
+---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---
+e2 | 3 | 50.22 [50.05-51.91] | 1.000 [1.000-1.000] | 19.52 | 12.33 | 0.998 | 0.25 | 0.25 | 0.00 | 0.00 | - | 0.0 | 0.00 | 0.00 | 0.00 | 39.00 | 0.24 | 13711/13817
+bal1 | 3 | 38.97 [38.43-39.40] | 0.776 [0.740-0.787] | 25.41 | 17.39 | 0.998 | 0.25 | 0.19 | 0.06 | 37.00 | 0.00 | 196.1 | 0.00 | 1.13 | 0.00 | 39.00 | 0.19 | 13717/13833
+bal2 | 3 | 43.61 [42.51-44.31] | 0.868 [0.819-0.885] | 22.65 | 15.26 | 0.998 | 0.25 | 0.22 | 0.04 | 18.00 | 0.00 | 95.4 | 0.00 | 0.55 | 0.00 | 39.00 | 0.21 | 13717/13831
+
+All [measured]. The floor is **12.33 ms read wait, 19.52 ms token** on this card (e2 at 0.25 misses a token). A
+useless copy costs the main stream **0.14-0.16 ms of read wait** (+2.93 ms for 18, +5.06 for 37), and about 0.17 ms
+of token with its host issue, with nothing waiting for it: bus and engine contention, the 1.79 vs 0.96 ms that exp. #2b
+measured on a read with copies in flight.
+
+### 3072 MiB (4.01x overfill), n = 3 per arm, interleaved with e2
+
+arm | n | tok/s med [min-max] | x e2 (paired) | token ms | read wait | hit | misses/t | on bus/t | covered/t | prefetched/t | precision | wasted MB/t | guess ms | issue ms | spared/t | syncs/t | miss layers/t | VRAM MiB
+---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---
+e2 | 3 | 20.68 [20.64-21.66] | 1.000 [1.000-1.000] | 48.47 | 38.99 | 0.683 | 48.20 | 48.20 | 0.00 | 0.00 | - | 0.0 | 0.00 | 0.00 | 0.00 | 39.00 | 26.47 | 4285/4391
+d2t01s | 3 | 23.08 [22.98-23.38] | 1.116 [1.061-1.132] | 43.42 | 33.77 | 0.678 | 48.88 | 21.16 | 27.72 | 36.13 | 0.77 | 44.6 | 0.49 | 1.19 | 0.00 | 39.00 | 16.54 | 4279/4393
+d2t02s | 3 | 22.78 [22.77-22.81] | 1.101 [1.052-1.105] | 43.94 | 33.66 | 0.678 | 48.88 | 23.88 | 24.99 | 30.42 | 0.82 | 28.8 | 0.27 | 1.20 | 0.00 | 39.00 | 18.12 | 4279/4393
+d2t05s | 3 | 22.57 [22.40-22.96] | 1.092 [1.034-1.112] | 44.40 | 34.93 | 0.678 | 48.88 | 30.10 | 18.78 | 20.59 | 0.91 | 9.6 | 0.37 | 0.79 | 0.00 | 39.00 | 21.11 | 4279/4393
+orcs4 | 3 | 26.90 [26.80-26.94] | 1.298 [1.242-1.303] | 37.13 | 28.07 | 0.678 | 48.88 | 1.33 | 47.55 | 47.55 | 1.00 | 0.0 | 0.00 | 1.45 | 0.00 | 39.00 | 0.73 | 4279/4393
+orcsd2 | 3 | 27.38 [27.29-27.55] | 1.324 [1.260-1.335] | 36.47 | 27.58 | 0.674 | 49.52 | 1.34 | 48.18 | 48.18 | 1.00 | 0.0 | 0.00 | 1.64 | 0.00 | 39.00 | 0.73 | 4285/4407
+w2t02s | 3 | 22.35 [22.22-22.44] | 1.074 [1.032-1.087] | 44.83 | 33.54 | 0.678 | 48.88 | 23.88 | 24.99 | 30.42 | 0.82 | 28.8 | 1.67 | 1.01 | 0.00 | 39.00 | 18.12 | 4279/4393
+
+All [measured]. The harder budget (48 misses a token) is where look-ahead pays: `d2t01s` 1.116x [1.061-1.132], oracle 1.30-1.32x.
+
+### True overfill on a smaller card: c2 RTX 2060 (12 GB, Gen3 x4 at 2.9-3.0 GB/s measured), 9800 MiB, n = 2 per arm
+
+10800 MiB ran the card out of device memory (`allocating 8388608 bytes`, the slot bank plus dense weights plus scratch); 9800 fits at 11065 MiB
+used. Experts are 1.26x that budget, and the whole model does not fit on this card.
+
+arm | n | tok/s med [min-max] | x e2 (paired) | token ms | read wait | hit | misses/t | on bus/t | covered/t | prefetched/t | precision | wasted MB/t | guess ms | issue ms | spared/t | syncs/t | miss layers/t | VRAM MiB
+---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---
+e2 | 2 | 37.08 [36.84-37.32] | 1.000 [1.000-1.000] | 26.96 | 22.36 | 0.976 | 3.71 | 3.71 | 0.00 | 0.00 | - | 0.0 | 0.00 | 0.00 | 0.00 | 39.00 | 3.33 | 10951/11057
+d2t01s | 2 | 32.28 [32.26-32.30] | 0.870 [0.864-0.877] | 31.01 | 25.03 | 0.975 | 3.81 | 1.89 | 1.92 | 3.57 | 0.54 | 8.7 | 0.68 | 0.10 | 0.00 | 39.00 | 1.81 | 10951/11065
+orcs4 | 2 | 41.16 [40.83-41.50] | 1.110 [1.094-1.126] | 24.39 | 20.21 | 0.975 | 3.81 | 0.11 | 3.71 | 3.71 | 1.00 | 0.0 | 0.00 | 0.06 | 0.00 | 39.00 | 0.10 | 10951/11065
+
+All [measured]. On this slow bus at a 97.6 % hit rate, the real guess **loses** (0.87x: 3.7 misses a token, half of them covered, and the guess, the wrong copies and the x read cost more than they hide); the perfect guess gains 1.11x. Prediction prefetch is a fast-bus / heavy-miss tool.
+
+### llama.cpp e14a779 on the same card, interleaved (`-cmoe --moe-cache-mib` at the same VRAM, n = 3 per arm)
+
+`c` is llama.cpp. 5120 MiB, then 3072 MiB:
+
+arm | n | tok/s med [min-max] | x e2 (paired) | token ms | read wait | hit | misses/t | on bus/t | covered/t | prefetched/t | precision | wasted MB/t | guess ms | issue ms | spared/t | syncs/t | miss layers/t | VRAM MiB
+---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---
+e2 | 3 | 30.40 [30.04-30.93] | 1.000 [1.000-1.000] | 32.79 | 25.04 | 0.854 | 22.20 | 22.20 | 0.00 | 0.00 | - | 0.0 | 0.00 | 0.00 | 0.00 | 39.00 | 15.18 | 6337/6443
+c | 3 | 16.64 [16.53-16.71] | 0.544 [0.538-0.556] | - | - | - | - | - | - | - | - | - | - | - | - | - | - | 6233/6293
+d2t01s | 3 | 31.46 [31.07-31.59] | 1.034 [1.017-1.039] | 31.64 | 22.89 | 0.851 | 22.58 | 9.89 | 12.69 | 18.39 | 0.69 | 30.3 | 0.27 | 0.68 | 0.00 | 39.00 | 8.56 | 6331/6445
+
+arm | n | tok/s med [min-max] | x e2 (paired) | token ms | read wait | hit | misses/t | on bus/t | covered/t | prefetched/t | precision | wasted MB/t | guess ms | issue ms | spared/t | syncs/t | miss layers/t | VRAM MiB
+---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---
+e2 | 3 | 20.95 [20.64-21.20] | 1.000 [1.000-1.000] | 47.87 | 38.96 | 0.683 | 48.20 | 48.20 | 0.00 | 0.00 | - | 0.0 | 0.00 | 0.00 | 0.00 | 39.00 | 26.47 | 4285/4391
+c | 3 | 11.05 [11.04-11.13] | 0.527 [0.525-0.535] | - | - | - | - | - | - | - | - | - | - | - | - | - | - | 4181/4241
+d2t01s | 3 | 22.98 [22.81-23.57] | 1.089 [1.084-1.142] | 43.59 | 33.61 | 0.678 | 48.88 | 21.16 | 27.72 | 36.13 | 0.77 | 44.6 | 0.35 | 1.26 | 0.00 | 39.00 | 16.54 | 4279/4393
+
+All [measured]. The look-ahead engine is 1.9-2.1x llama.cpp at both budgets. llama.cpp's own text is a different sha on this prompt set; only lemonade-burn's sha is compared across budgets and arms.
+
+## Diagnosis: where a miss's time goes (5120 MiB, read wait, ms a token, all [derived] from the runs above)
+
+| | read wait | above the no-miss floor |
+|---|---|---|
+| no-miss floor (every expert cached) | 12.33 | 0 |
+| E2 | 25.1 | +12.8 (22.2 misses x 0.575 ms) |
+| perfect free guess, cap 4, spare slots | 18.80 | +6.5 |
+| ... of which contention: 22 copies x 0.15 ms (ballast, no dependency at all) | | ~3.3 |
+| ... of which waits, repack and fences together (not separable with these arms) | | ~3.2 |
+| best real arm `d2t01s` | 22.80 | +10.5: 9.9 unpredicted misses x 0.575 = 5.7, ~2.8 contention from 18.4 copies, ~2 the rest |
+
+* **Copy lead time is not the limit.** Issuing copies 2 or 3 layers ahead with their own side stream each (`orcsd2`, `orcsd3`) moves read wait by under 0.7 ms.
+  (A first attempt with one shared side stream looked the same but was not a valid test: a fence waits for everything queued on its stream, so
+  deeper copies cancelled their own lead time. That is why each depth now has its own stream.)
+* **Repacking on the main stream costs about 0.7 ms a token at full coverage**, and more at the real arms' mix (read wait 24.0 to 22.8 with the spare slot).
+  Fixed by the spare slot.
+* **Contention is the hard limit.** A copy that nothing waits for still takes about 0.15 ms of the main stream's read wait, roughly a quarter
+  of its 0.575 ms bus time, so overlap is partial however good the guess. Half of the oracle's remaining gap to the floor is this.
+* **Wrong guesses are paid in full.** The real arm wastes 5.7 copies a token at about 0.15-0.3 ms each, against 12.7 misses covered.
+* **The guess cost** is handled: the worker and deferred pick-up take it from 2.9 ms to 0.25-0.5 ms (host issue of the copies adds 0.7-1.2 ms).
+* **Hit rate** is where the remaining large lever sits: Belady's 0.943 vs SLRU's 0.843 is ~13 misses a token (~7.5 ms at 5120 MiB, in the simulator); prediction-guided keep and cycle-aware eviction, the cheap attempts here, gain under 0.5 points.
+* **Syncs:** the host syncs every layer in every arm (39.0 a token). Skipping them was not tested; the guess cannot replace reading the real routes without device-side miss detection and rollback (exp. #1: all four guessed correctly 43 % of the time at k).
+
+## Off by default
+
+With no `LB_LOOKAHEAD` / `LB_LA_*` set, the final binary (`off`) against the E2 binary, n = 3 interleaved:
+
+arm | n | tok/s med [min-max] | x e2 (paired) | token ms | read wait | hit | misses/t | on bus/t | covered/t | prefetched/t | precision | wasted MB/t | guess ms | issue ms | spared/t | syncs/t | miss layers/t | VRAM MiB
+---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---
+e2 | 3 | 30.27 [30.19-30.38] | 1.000 [1.000-1.000] | 32.89 | 24.99 | 0.854 | 22.20 | 22.20 | 0.00 | 0.00 | - | 0.0 | 0.00 | 0.00 | 0.00 | 39.00 | 15.18 | 6337/6443
+off | 3 | 30.48 [30.41-30.51] | 1.005 [1.003-1.011] | 32.69 | 25.03 | 0.854 | 22.20 | 22.20 | 0.00 | 0.00 | - | 0.0 | 0.00 | 0.00 | 0.00 | 39.00 | 15.18 | 6337/6443
+
+All [measured]. 1.005x [1.003-1.011]: no cost when off.
+
+## Gate (P100 x16, all [measured])
+
+| gate | result |
+|---|---|
+| tok/s >= 1.10x the interleaved E2 baseline at 5120 MiB, net of guess cost | **FAIL: best real arm `d2t01s` 1.042x** [1.017-1.056], n = 3; a second interleaved set gives 1.034x [1.017-1.039]. Perfect free guess (oracle) 1.25x |
+| the same at 3072 MiB (the harder budget, not the gate's) | **d2t01s 1.116x** [1.061-1.132] in one interleaved set and **1.089x** [1.084-1.142] in a second (n = 3 each), so about the gate; oracle 1.30-1.32x |
+| >= llama.cpp e14a779 at the same VRAM on this card | **PASS**: 31.46 vs 16.64 tok/s (1.89x) at 5120, 22.98 vs 11.05 (2.08x) at 3072, n = 3 |
+| greedy sha unchanged across arms and budgets | **PASS**: 1248 lemonade-burn completions across every arm and set above, one text per prompt (sonar `062392b8d2b0361a`), at 3072, 5120, 9800 and 12500 MiB on two cards |
+| no device memory growth | **PASS** for `d2t01s`: 250 completions (50 passes) at 3072 MiB flat at 4393 MiB after pass 0; 100 completions at 5120 MiB flat at 6445 |
+| wasted bytes per token | reported: `d2t01s` 30.3 MB/token at 5120, 44.6 at 3072 (of 18.4 / 36.1 copies issued a token, precision 0.69 / 0.77) |
+
+Not done: `LB_DEVICE_GUESS` as the guess source (the 4.9 ms device guess was not measured as a replacement; the worker took host cost below it), a skip-the-sync design, stronger eviction than the keep guard (Belady's 0.943 is the bound), and the c2 2060's numbers at more rounds.
+
+Caveat: c4 socket 0 carried a 40-thread photogrammetry run for most of these sessions (load 22-46), with quiet stretches between; the arms are interleaved so drift cancels, but host-side timings may be inflated. Spread between rounds is 1-4 % for most arms.

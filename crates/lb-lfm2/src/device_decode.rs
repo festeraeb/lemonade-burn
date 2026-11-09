@@ -694,7 +694,10 @@ fn la_issue(m: &Lfm2, gpu: &Gpu, c: &mut crate::cache::ExpertCache, guesses: &[c
                     stage.guess_low_margin.fetch_add((g.experts.len() - rank) as u64, Ordering::Relaxed);
                     break;
                 }
-                if c.slru.slot(g.layer, x).is_some() {
+                if la.ballast > 0 && g.layer % la.ballast != 0 {
+                    break;
+                }
+                if la.ballast == 0 && c.slru.slot(g.layer, x).is_some() {
                     stage.guess_resident.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
