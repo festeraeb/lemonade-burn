@@ -1,0 +1,17 @@
+[package]
+name = "lb-cofire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Neighbouring-expert analysis for card preload: co-firing pairs, layer-to-layer transitions, runner-up promotion, held-out next-layer coverage, and a co-fire placement in lb-expert-host's format, from NautiBurn scrapes (v1/v2) or the histogram DB"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+lb-expert-host.workspace = true
