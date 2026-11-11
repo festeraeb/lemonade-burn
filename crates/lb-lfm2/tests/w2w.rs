@@ -124,6 +124,8 @@ fn split_over_two_hosts_and_the_trunk_is_bit_identical() {
     assert_eq!(recs.iter().map(|r| r.experts_remote).sum::<u64>(), ra + rb);
     assert!(rt.hosts().iter().all(|h| h.up));
     let _ = std::fs::remove_file(path);
+    // the listener thread outlives the test: take its socket file away here
+    let _ = std::fs::remove_file(sock);
 }
 
 #[test]

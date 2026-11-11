@@ -93,6 +93,8 @@ fn every_transport_returns_the_shared_kernel_bit_for_bit() {
         assert_eq!(h.stats.runs.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
     let _ = std::fs::remove_file(p);
+    // the listener thread outlives the test: take its socket file away here
+    let _ = std::fs::remove_file(sock);
 }
 
 #[test]
