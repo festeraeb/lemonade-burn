@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One measured session of MoE experiment #2 (STAGE ring) on cesarops2: start one engine arm,
+# One measured session of MoE experiment #2 (STAGE ring) on c2: start one engine arm,
 # warm up, run every prompt of prompts.jsonl once (greedy), append one JSON row per completion to
 # $OUT/runs.jsonl and one per session to $OUT/sessions.jsonl. Idempotent: a session whose label
 # is already marked done in sessions.jsonl is skipped.

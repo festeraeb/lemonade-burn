@@ -1,6 +1,6 @@
 //! Page-locked host staging buffers the engine fills in place (cuda runtime only).
 //!
-//! Why this exists, measured 2026-11-03 on cesarops2 GPU2 (Tesla P100, Gen3 x16) with a timer
+//! Why this exists, measured 2026-11-03 on c2 GPU2 (Tesla P100, Gen3 x16) with a timer
 //! probe inside cubecl-server's `write_to_gpu` and cubecl-cuda's `copy_to_device` (raw outputs:
 //! c2 `~/lb-measure/out/probe-b2/`, table in `docs/WORK_LOG.md`): a 5.31 MB `create(Bytes)` of a
 //! fresh `Vec` spent 2.90 ms in `cuMemAllocHost` (a cold page-lock on every call, because the

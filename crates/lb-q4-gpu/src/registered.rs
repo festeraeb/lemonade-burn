@@ -1,7 +1,7 @@
 //! A read-only file mapping page-locked with the driver, so the device DMAs tensor bytes
 //! straight out of the page cache (cuda runtime only).
 //!
-//! Measured 2026-11-03 on cesarops2 GPU2 (Tesla P100, driver 580.178.04,
+//! Measured 2026-11-03 on c2 GPU2 (Tesla P100, driver 580.178.04,
 //! `examples/register_bench.rs`, raw lines in `docs/WORK_LOG.md`): `cuMemHostRegister` with
 //! `CU_MEMHOSTREGISTER_READ_ONLY` on the whole 12.9 GB GGUF mapping succeeds in 0.60 s
 //! (48 ms/GB; both `HOST_REGISTER_SUPPORTED` and `READ_ONLY_HOST_REGISTER_SUPPORTED` are 1

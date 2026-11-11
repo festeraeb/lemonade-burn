@@ -75,7 +75,7 @@ the CPU: 6.4-7.5 ms a token (`issue_ms_per_token`; 38 router dots + the side-str
 
 ### Side finding: NUMA placement of the page-locked GGUF is worth 4x on a two-socket host
 
-cesarops1 (2 sockets, 1070 on node 0) first ran arm (a) at **1.59 tok/s** with a miss waiting
+c1 (2 sockets, 1070 on node 0) first ran arm (a) at **1.59 tok/s** with a miss waiting
 **7.7 ms** (bus time 1.1 ms by `stage_bench`). Ruled out: CPU timeslicing (`nice -10`: no change),
 VRAM pressure (4096 MiB budget: no change), IOMMU (off on both hosts), DRAM bandwidth (1.2 GB/s
 read). The GGUF's page cache was split ~43/57 across the two nodes; DMA reads of node-1 pages by a
@@ -106,7 +106,7 @@ nothing and keeps demand misses in a Least-Stale ring; `b4k` adds the top-4 gues
 ### Exp. #2b: Tesla P100 at Gen3 x16 (c2 GPU2), the link where prefetch could pay
 
 Same model, prompts, 5120 MiB budget, binaries as above; card UUID-pinned
-(GPU-c012cc70-3f06-1718-84e2-073aa275f0af). llama.cpp rebuilt with sm_60 (`/mnt/fast/llama-build-ivb60`).
+(<card UUID>). llama.cpp rebuilt with sm_60 (`/mnt/fast/llama-build-ivb60`).
 Arms a / b4 / b4m / b interleaved 5 rounds; llama.cpp (c) then 5 rounds interleaved with 5 fresh (a)
 sessions (`m5120c-*`), because its build finished after the first batch had started. Data:
 `/mnt/fast/lb-stage/2026-11-08/c2-p100-x16/` (`RESUME.md` beside it). `b4m` = b4 with
@@ -212,24 +212,24 @@ Results (append-only JSONL) on t440 `/mnt/fast/lb-stage/2026-11-08/` (c1/c2 see 
 c2-2060/  runs.jsonl (one row per completion, cumulative /v1/placement), sessions.jsonl (one per
           engine start; "session_done": true marks it finished), logs/server-*.log, logs/imc-*.jsonl,
           run_all.pid
-c1-1070/  the same for cesarops1's GTX 1070
+c1-1070/  the same for c1's GTX 1070
 smoke/    the first single sessions (a, b, b4, c) on the 2060
 run_all-c2-2060.log, run_all-c1-1070.log
 ```
 
-Working copies: cesarops2 `/mnt/ssd/lb-stage/` (bin/, lib/ = nvrtc 12.8, cuda-path/ = libdevice,
+Working copies: c2 `/mnt/ssd/lb-stage/` (bin/, lib/ = nvrtc 12.8, cuda-path/ = libdevice,
 models/ = hard links to the exp. #1 GGUF + tokenizer, scrapes/ = the two placement scrapes,
-llama/ = llama.cpp e14a779 built for Ivy Bridge + sm_61/75 with CUDA 12.8 libs); cesarops1
+llama/ = llama.cpp e14a779 built for Ivy Bridge + sm_61/75 with CUDA 12.8 libs); c1
 `/mnt/models/lb-stage/` (same layout). Binaries built on t440:
 `/data/cargo-target-lbstage/build.sh` (lemonade-burn, cuda) and `build-llama-ivb.sh`.
 
 Resume (each session is skipped when `sessions.jsonl` already marks it done):
 
 ```sh
-# cesarops2, RTX 2060 SUPER (UUID-pinned in env.sh)
-ssh -n cesarops2 'cd /mnt/ssd/lb-stage && OUT=/mnt/t440/fast/lb-stage/2026-11-08/c2-2060 setsid nohup ./run_all.sh >> /mnt/t440/fast/lb-stage/2026-11-08/run_all-c2-2060.log 2>&1 < /dev/null & disown'
-# cesarops1, GTX 1070
-ssh -n cesarops1 'cd /mnt/models/lb-stage && OUT=/mnt/t440/fast/lb-stage/2026-11-08/c1-1070 setsid nohup ./run_all.sh >> /mnt/t440/fast/lb-stage/2026-11-08/run_all-c1-1070.log 2>&1 < /dev/null & disown'
+# c2, RTX 2060 SUPER (UUID-pinned in env.sh)
+ssh -n c2 'cd /mnt/ssd/lb-stage && OUT=/mnt/t440/fast/lb-stage/2026-11-08/c2-2060 setsid nohup ./run_all.sh >> /mnt/t440/fast/lb-stage/2026-11-08/run_all-c2-2060.log 2>&1 < /dev/null & disown'
+# c1, GTX 1070
+ssh -n c1 'cd /mnt/models/lb-stage && OUT=/mnt/t440/fast/lb-stage/2026-11-08/c1-1070 setsid nohup ./run_all.sh >> /mnt/t440/fast/lb-stage/2026-11-08/run_all-c1-1070.log 2>&1 < /dev/null & disown'
 # score (t440)
 python3 bench/stage-ring/score.py /mnt/fast/lb-stage/2026-11-08/c2-2060
 ```

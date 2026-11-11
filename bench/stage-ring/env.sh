@@ -1,6 +1,6 @@
-# common env for lb-stage runs on cesarops2 (RTX 2060 SUPER pinned by UUID)
+# common env for lb-stage runs on c2 (RTX 2060 SUPER pinned by UUID)
 export BASE=/mnt/ssd/lb-stage
-export UUID2060=GPU-de3ce5bc-1a27-10e4-be70-97993d287aed
+export UUID2060=${UUID_RTX2060S:?card UUID}
 export CUDA_VISIBLE_DEVICES=${CARD_UUID:-$UUID2060} LB_CUDA_DEVICE=0
 export LD_LIBRARY_PATH=$BASE/lib:${LD_LIBRARY_PATH:-} CUDA_PATH=$BASE/cuda-path
 export LB_MODEL=$BASE/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf

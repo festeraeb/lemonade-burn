@@ -41,7 +41,7 @@ are recycled only after the sync that proves the repack ran.
 routes and the guess; `la-sim` replays it against the real `Slru` and Belady. It reproduced the engine's prefetch
 numbers (cap 2: covered 18.1 vs 17.0 per token, issued 58.0 vs 57.7) and was used to pick the sweep grid.
 
-## Results (2026-11-09, cesarops4om Tesla P100 AF:00.0, Gen3 x16, NUMA node 1, H2D 8.5-9.6 GB/s measured)
+## Results (2026-11-09, c4 Tesla P100 AF:00.0, Gen3 x16, NUMA node 1, H2D 8.5-9.6 GB/s measured)
 
 LFM2.5-24B-A2B Q4_0 (experts 12.02 GiB, 2.40x the 5120 MiB budget, 4.01x the 3072 MiB one), 5 prompts / 288 decode
 tokens a session, greedy, 8 host threads, process and page cache on the card's node. Arms interleaved, odd rounds
