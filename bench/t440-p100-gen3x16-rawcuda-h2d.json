@@ -1,4 +1,4 @@
-{"host": "t440cesarops", "device": "discrete:1", "gpu": "Wgpu(WgpuDevice { kind: DiscreteGpu(1), backend: Auto })", "expert_bytes": 5308416}
+{"host": "t440", "device": "discrete:1", "gpu": "Wgpu(WgpuDevice { kind: DiscreteGpu(1), backend: Auto })", "expert_bytes": 5308416}
 {"metric": "cpu_expert_ms_all_threads", "value": 3.6247, "note": "threads=48"}
 {"metric": "cpu_expert_ms_1_thread", "value": 16.7258, "note": "threads=1"}
 {"metric": "cpu_q6k_head_ms", "value": 52.9936, "note": "threads=48"}

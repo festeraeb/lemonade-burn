@@ -17,7 +17,7 @@ deltas around 1 are therefore intrinsic to the model's int8 activation rounding 
 float differences flip `round(x*127/max)`); they are not an engine error. The tokenizer
 matches HF on all 4 prompts.
 
-## Speed on cesarops3 (Xeon E3-1265L v3, AVX2, idle, 64-token prompt, 32 generated, 3 reps)
+## Speed on c3 (Xeon E3-1265L v3, AVX2, idle, 64-token prompt, 32 generated, 3 reps)
 
 | runtime | threads | prefill tok/s | decode tok/s | peak RSS |
 |---|---|---|---|---|
@@ -138,7 +138,7 @@ context (q@K^T ~300-420 us, softmax ~270 us for 20 x 520 values). That also make
 slow at long context (12.6 tok/s at 512 tokens, 20 threads). A custom attention op would
 fix it but changes float summation order, so it was left for a separate, signed-off change.
 
-## cesarops3 (Xeon E3-1265L v3, 4 cores / 8 threads, AVX2), same bench command
+## c3 (Xeon E3-1265L v3, 4 cores / 8 threads, AVX2), same bench command
 
 Lemonade on :13305 had Qwen3-14B loaded on its GPU, idle (load average 0.12 before).
 
