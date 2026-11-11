@@ -93,7 +93,19 @@ pub fn pick_cube_device() -> Result<cubecl::Device, String> {
 impl Gpu {
     /// Open the device named by `LB_CUDA_DEVICE` or `LB_WGPU_DEVICE` (see `pick_cube_device`).
     pub fn open() -> Result<Self, String> {
-        let dev = pick_cube_device()?;
+        Self::open_device(pick_cube_device()?)
+    }
+
+    /// Open CUDA device `index` (driver order inside `CUDA_VISIBLE_DEVICES`), whatever
+    /// `LB_CUDA_DEVICE` says: a second card in the same process (work-to-weights, in-box
+    /// expert cards).
+    #[cfg(feature = "cuda")]
+    pub fn open_cuda(index: usize) -> Result<Self, String> {
+        let dev = cubecl::Device::cuda(index).map_err(|e| format!("CUDA device {index}: {e}"))?;
+        Self::open_device(dev)
+    }
+
+    fn open_device(dev: cubecl::Device) -> Result<Self, String> {
         let client = std::panic::catch_unwind(|| dev.client()).map_err(|_| format!("{dev:?}: no client (adapter missing, or its runtime failed to initialise)"))?;
         let props = client.properties();
         let (pmin, pmax) = (props.hardware.plane_size_min, props.hardware.plane_size_max);
@@ -500,6 +512,29 @@ impl Gpu {
     pub fn read_u32(&self, h: &Handle, n: usize) -> Result<Vec<u32>, String> {
         let bytes = self.client.read(vec![h.clone()]).map_err(|e| format!("GPU read failed: {e:?}"))?;
         Ok(u32::from_bytes(&bytes[0])[..n].to_vec())
+    }
+
+    /// Copy a device buffer of f32 to another `Gpu` of the same runtime, **device to device and
+    /// stream ordered on both sides** when the runtime has a transport between its devices
+    /// (cubecl-cuda: NCCL send/recv on the communication streams, the receiving stream waits on
+    /// the device; no host sync). Without one cubecl copies through the host (synchronously):
+    /// [`Gpu::device_transport`] says which.
+    pub fn copy_to(&self, h: &Handle, dst: &Gpu) -> Handle {
+        let mut c = self.client.clone();
+        c.to_client(h.clone(), &dst.client, cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F32))
+    }
+
+    /// Whether [`Gpu::copy_to`] goes device to device (cubecl-cuda with NCCL loadable).
+    pub fn device_transport(&self) -> bool {
+        self.client.has_device_transport()
+    }
+
+    /// Wait for this device and recycle the scratch handed out since its last read: the end of
+    /// a token for a card that never reads in the middle of one (in-box expert cards).
+    pub fn sync_recycle(&self) -> Result<(), String> {
+        self.sync()?;
+        self.recycle();
+        Ok(())
     }
 
     /// Wait for everything submitted so far (a timing fence).

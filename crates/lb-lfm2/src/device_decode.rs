@@ -179,7 +179,8 @@ impl Prep {
                     (None, None)
                 }
                 Ffn::Moe { router, bias, .. } => {
-                    if !m.store.layers.contains_key(&li) || m.store.remote.is_some() {
+                    let in_box = m.store.inbox.as_ref().is_some_and(|ib| ib.card_of(li).is_some());
+                    if (!m.store.layers.contains_key(&li) && !in_box) || m.store.remote.is_some() {
                         host_moe_layers.push(li);
                     }
                     n_moe += 1;
@@ -347,6 +348,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     let mut host_routes: Vec<(usize, Route)> = Vec::new();
     let mut y: Option<Handle> = None;
     let mut dev_moe = 0u64;
+    let mut inbox_layers = 0u64;
     // engine step E2: experts routed on the device and served from the cache's slot bank
     // with a remote tier every MoE layer goes through the host side (`moe_ffn_with`), where the
     // tier is asked first; the device router and the stacked layers are not used
@@ -382,6 +384,23 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             Ffn::Dense { gate, up, down } => {
                 let hh = GpuQ4Mat::launch_gate_up_silu(gpu, mat(m, gate), mat(m, up), &h2, 1);
                 mat(m, down).launch(gpu, &hh, 1)
+            }
+            // work-to-weights inside the box (`inbox.rs`): the layer lives on another card of this
+            // process; the activation goes card to card and the routes, experts and sum run there
+            // with the one-card kernels; nothing is read on the host
+            Ffn::Moe { .. } if !remote_on && lp.moe_index.is_some() && m.store.inbox.as_ref().is_some_and(|ib| ib.card_of(li).is_some()) => {
+                let ib = m.store.inbox.as_ref().expect("checked");
+                let card = ib.card_of(li).expect("checked");
+                let base = lp.moe_index.expect("checked") * k_used;
+                let h2b = gpu.copy_to(&h2, &card.gpu);
+                let (rh, bh) = card.routers.get(&li).expect("router uploaded with the layer");
+                card.gpu.router_topk(&h2b, rh, bh, &card.routes, &card.weights, (n_exp, k_used, e, base, prep.n_slots), knobs.dd_router_seq());
+                let (outs, _) = card.layers[&li].launch_device(&card.gpu, &h2b, 1, &card.routes, prep.n_slots, base, k_used);
+                let yb = card.gpu.weighted_sum(&outs, &card.weights, &card.routes, (k_used, e, base, prep.n_slots));
+                let y = card.gpu.copy_to(&yb, gpu);
+                keep.push(y.clone());
+                inbox_layers += 1;
+                y
             }
             Ffn::Moe { router, bias, gate, up, down } => match (if remote_on { None } else { m.store.layers.get(&li) }, lp.moe_index, &lp.router) {
                 (Some(stack), Some(mi), Some((rh, bh))) => {
@@ -651,8 +670,38 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     };
     let f32s = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
     let logits = f32s(&bytes[0]);
-    let routes: Vec<u32> = bytes[1].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-    let weights = f32s(&bytes[2]);
+    #[allow(unused_mut)]
+    let mut routes: Vec<u32> = bytes[1].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    #[allow(unused_mut)]
+    let mut weights = f32s(&bytes[2]);
+    // in-box cards: their work for this token is done (the read above waited for the last copy
+    // back); fence each once to recycle its scratch, and bring its routes back for the scraper
+    if inbox_layers > 0 {
+        let ib = m.store.inbox.as_ref().expect("in-box layers ran");
+        ib.stats.tokens.fetch_add(1, Ordering::Relaxed);
+        ib.stats.device_layers.fetch_add(inbox_layers, Ordering::Relaxed);
+        for (ci, card) in ib.cards.iter().enumerate() {
+            ib.stats.card_syncs.fetch_add(1, Ordering::Relaxed);
+            if m.scraper.enabled() {
+                let b = match card.gpu.read_raw(vec![(card.routes.clone(), prep.n_slots * 8), (card.weights.clone(), prep.n_slots * 4)]) {
+                    Ok(b) => b,
+                    Err(err) => return abandon(m, cache, &format!("in-box card {} routes read: {err}", card.name)),
+                };
+                let (cr, cw): (Vec<u32>, Vec<f32>) = (b[0].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(), f32s(&b[1]));
+                for (li, lp) in prep.layers.iter().enumerate() {
+                    if let (Some(mi), Some(c)) = (lp.moe_index, ib.layer_card.get(li).copied().flatten()) {
+                        if c == ci {
+                            let b0 = mi * k_used;
+                            routes[2 * b0..2 * (b0 + k_used)].copy_from_slice(&cr[2 * b0..2 * (b0 + k_used)]);
+                            weights[b0..b0 + k_used].copy_from_slice(&cw[b0..b0 + k_used]);
+                        }
+                    }
+                }
+            } else if let Err(err) = card.gpu.sync_recycle() {
+                return abandon(m, cache, &format!("in-box card {} fence: {err}", card.name));
+            }
+        }
+    }
 
     // the scraper, in layer order, device layers from the read-back and host layers as run
     if m.scraper.enabled() {
@@ -668,7 +717,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             m.scraper.record(li, pos0, std::slice::from_ref(&route));
         }
     }
-    m.stats.gpu_hits.fetch_add(dev_moe * k_used as u64, Ordering::Relaxed);
+    m.stats.gpu_hits.fetch_add((dev_moe + inbox_layers) * k_used as u64, Ordering::Relaxed);
     if let Some(d) = cache.dev.as_mut() {
         d.len = total;
     }

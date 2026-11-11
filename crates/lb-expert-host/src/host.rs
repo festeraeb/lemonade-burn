@@ -79,13 +79,55 @@ pub struct GpuBackend {
     resident: std::collections::HashMap<(usize, usize), lb_q4_gpu::GpuExpert>,
     stacks: std::collections::HashMap<usize, lb_q4_gpu::GpuExpertLayer>,
     bytes: usize,
+    /// One routed launch per message for a layer held whole (default); `LB_HOST_LAUNCH=per-expert`
+    /// launches each expert's view separately (the W1 path).
+    stacked_launch: bool,
+    prof: RunProfile,
+}
+
+/// Where a device host's request time goes: queueing the work (upload + launches), the read
+/// (the device running it + the sync), and writing the reply. `LB_HOST_PROFILE=N` prints the
+/// means every N requests on stderr.
+#[cfg(feature = "gpu")]
+#[derive(Default)]
+struct RunProfile {
+    every: u64,
+    n: u64,
+    submit_ns: u64,
+    read_ns: u64,
+    reply_ns: u64,
+}
+
+#[cfg(feature = "gpu")]
+impl RunProfile {
+    fn add(&mut self, submit: std::time::Duration, read: std::time::Duration, reply: std::time::Duration) {
+        if self.every == 0 {
+            return;
+        }
+        self.n += 1;
+        self.submit_ns += submit.as_nanos() as u64;
+        self.read_ns += read.as_nanos() as u64;
+        self.reply_ns += reply.as_nanos() as u64;
+        if self.n == self.every {
+            let us = |ns: u64| ns as f64 / self.n as f64 / 1e3;
+            eprintln!("lb-expert-host profile: {} requests, mean us: submit {:.1} read {:.1} reply {:.1}", self.n, us(self.submit_ns), us(self.read_ns), us(self.reply_ns));
+            *self = Self { every: self.every, ..Self::default() };
+        }
+    }
 }
 
 #[cfg(feature = "gpu")]
 impl GpuBackend {
     /// Open the device named by `LB_CUDA_DEVICE` / `LB_WGPU_DEVICE`.
     pub fn open() -> Result<Self, String> {
-        Ok(Self { gpu: lb_q4_gpu::Gpu::open()?, resident: Default::default(), stacks: Default::default(), bytes: 0 })
+        Ok(Self {
+            gpu: lb_q4_gpu::Gpu::open()?,
+            resident: Default::default(),
+            stacks: Default::default(),
+            bytes: 0,
+            stacked_launch: std::env::var("LB_HOST_LAUNCH").map(|v| v != "per-expert").unwrap_or(true),
+            prof: RunProfile { every: std::env::var("LB_HOST_PROFILE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), ..Default::default() },
+        })
     }
 }
 
@@ -140,6 +182,25 @@ impl Backend for GpuBackend {
 
     fn run(&mut self, model: &ModelExperts, layer: usize, ids: &[u16], groups: &[Vec<u32>], x: &[f32], out: &mut Vec<u8>) -> Result<(), String> {
         let d = model.d;
+        let t0 = Instant::now();
+        // A layer held whole: every expert of the message in ONE routed launch of the stacked
+        // layer (two dispatches, `GpuExpertLayer::launch` with host routes), one upload of the
+        // rows, one read. The per-expert path below costs two-three dispatches and a scratch
+        // set per expert. `LB_HOST_LAUNCH=per-expert` keeps the old path (A/B, W3).
+        if self.stacked_launch {
+            if let Some(stack) = self.stacks.get(&layer) {
+                let m = x.len() / d;
+                let routes: Vec<u32> = ids.iter().zip(groups).flat_map(|(&e, rows)| rows.iter().flat_map(move |&r| [e as u32, r])).collect();
+                let xh = self.gpu.upload_f32(x);
+                let (h, n) = stack.launch(&self.gpu, &xh, m, &routes)?;
+                let t1 = Instant::now();
+                let y = self.gpu.read_all(vec![(h, n)])?;
+                let t2 = Instant::now();
+                wire::put_f32s(out, &y[0]);
+                self.prof.add(t1 - t0, t2 - t1, Instant::now() - t2);
+                return Ok(());
+            }
+        }
         // one upload per distinct row set (a decode token: one upload for the whole message)
         let mut uploaded: std::collections::HashMap<&[u32], lb_q4_gpu::cubecl_server::Handle> = std::collections::HashMap::new();
         let mut launched = Vec::with_capacity(ids.len());
@@ -148,9 +209,13 @@ impl Backend for GpuBackend {
             let xh = uploaded.entry(rows.as_slice()).or_insert_with(|| self.gpu.upload_f32(&gather(x, rows, d))).clone();
             launched.push(ex.launch(&self.gpu, &xh, rows.len()));
         }
-        for y in self.gpu.read_all(launched)? {
+        let t1 = Instant::now();
+        let ys = self.gpu.read_all(launched)?;
+        let t2 = Instant::now();
+        for y in ys {
             wire::put_f32s(out, &y);
         }
+        self.prof.add(t1 - t0, t2 - t1, Instant::now() - t2);
         Ok(())
     }
 }

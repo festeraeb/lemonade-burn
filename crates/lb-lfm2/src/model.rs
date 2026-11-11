@@ -321,6 +321,29 @@ impl Lfm2 {
         Ok(rt)
     }
 
+    /// Work-to-weights inside the box (`inbox.rs`): when the placement file names in-box cards
+    /// (`gpu://N`), open them in this process and upload the whole layers placed on them.
+    /// `Ok(None)` = the placement has no in-box card (use [`Lfm2::attach_remote`]); a
+    /// placement mixing in-box cards and socket hosts is refused. Needs the trunk's device open.
+    #[cfg(feature = "gpu")]
+    pub fn attach_inbox(&mut self, placement: &Path) -> Result<Option<serde_json::Value>, String> {
+        let cfg = &self.w.cfg;
+        let json = std::fs::read_to_string(placement).map_err(|e| format!("placement {}: {e}", placement.display()))?;
+        let map = lb_expert_host::placement::PlacementMap::parse(&json, cfg.n_layer, cfg.n_expert)?;
+        if !crate::inbox::names_inbox(&map) {
+            return Ok(None);
+        }
+        if self.store.gpu.is_none() {
+            return Err("in-box expert cards need the trunk on a device (--gpu)".into());
+        }
+        let n_moe = (0..cfg.n_layer).filter(|&l| cfg.is_moe(l)).count();
+        let trunk = std::env::var("LB_CUDA_DEVICE").ok().and_then(|v| v.trim().parse().ok());
+        let ib = crate::inbox::InBox::build(&self.w, &map, n_moe * cfg.n_expert_used.max(1), trunk)?;
+        let st = ib.status();
+        self.store.inbox = Some(ib);
+        Ok(Some(st))
+    }
+
     /// [`Lfm2::attach_remote`] from placement JSON (no file to reload).
     pub fn attach_remote_json(&mut self, json: &str) -> Result<std::sync::Arc<crate::remote::RemoteTier>, String> {
         let cfg = &self.w.cfg;

@@ -335,6 +335,10 @@ pub struct ExpertStore {
     /// there first; whatever a host does not answer runs on the paths above. `None` = every
     /// expert is this process's own.
     pub remote: Option<std::sync::Arc<crate::remote::RemoteTier>>,
+    /// Work-to-weights inside the box (`inbox.rs`): expert cards of this process holding whole
+    /// MoE layers; the device decode keeps the activation on the device for these.
+    #[cfg(feature = "gpu")]
+    pub inbox: Option<crate::inbox::InBox>,
 }
 
 impl ExpertStore {
@@ -517,6 +521,22 @@ pub fn moe_ffn_with(
     }
     let mut experts: Vec<(usize, Vec<(usize, f32)>)> = by_expert.into_iter().collect();
     experts.sort_by_key(|(e, _)| *e);
+    // an in-box expert card holds this layer whole: every expert runs there (`inbox.rs`)
+    #[cfg(feature = "gpu")]
+    if let Some(ib) = store.inbox.as_ref().filter(|ib| ib.card_of(layer).is_some()) {
+        let outs = ib.run_host_routed(layer, &experts, x, n_embd).unwrap_or_else(|e| panic!("in-box card, layer {layer}: {e}"));
+        let mut out = vec![0f32; m * n_embd];
+        // ascending expert id, as below
+        for ((_, toks), y) in experts.iter().zip(outs) {
+            for (i, (t, wt)) in toks.iter().enumerate() {
+                let o = &mut out[t * n_embd..(t + 1) * n_embd];
+                for (oj, yj) in o.iter_mut().zip(&y[i * n_embd..(i + 1) * n_embd]) {
+                    *oj += wt * yj;
+                }
+            }
+        }
+        return (out, routes);
+    }
     // Work-to-weights: experts the placement puts on hosts are computed there. What comes back
     // is each expert's unweighted output; what a host did not answer stays in `experts` and
     // runs below as if there were no hosts. The sum at the end is over both, ascending id.

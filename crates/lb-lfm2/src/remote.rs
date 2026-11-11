@@ -55,6 +55,14 @@ pub struct RemoteStats {
     pub host_ns: AtomicU64,
     /// Wall time the trunk spent in the remote tier (round trips of one layer overlap).
     pub wall_ns: AtomicU64,
+    /// The same, for one-token (decode) passes only: tokens, hops, wall, wire and host time.
+    pub dec_passes: AtomicU64,
+    pub dec_hops: AtomicU64,
+    pub dec_experts: AtomicU64,
+    pub dec_fallback: AtomicU64,
+    pub dec_wall_ns: AtomicU64,
+    pub dec_net_ns: AtomicU64,
+    pub dec_host_ns: AtomicU64,
 }
 
 /// One forward pass (one token in decode) as the remote tier saw it.
@@ -310,6 +318,16 @@ impl RemoteTier {
     pub fn end_pass(&self, pos0: usize, m: usize) {
         let mut inner = self.inner.lock().unwrap();
         let a = std::mem::take(&mut inner.acc);
+        if m == 1 {
+            let (s, o) = (&self.stats, Ordering::Relaxed);
+            s.dec_passes.fetch_add(1, o);
+            s.dec_hops.fetch_add(a.hops, o);
+            s.dec_experts.fetch_add(a.experts, o);
+            s.dec_fallback.fetch_add(a.fallback, o);
+            s.dec_wall_ns.fetch_add(a.wall_ns, o);
+            s.dec_net_ns.fetch_add(a.net_ns, o);
+            s.dec_host_ns.fetch_add(a.host_ns, o);
+        }
         let rec = PassRecord {
             pos0,
             m,
@@ -548,6 +566,8 @@ impl RemoteTier {
             "round_trip_ms_mean": if hops > 0 { ms(s.rt_ns.load(o) / hops) } else { 0.0 },
             "host_compute_ms_mean": if hops > 0 { ms(s.host_ns.load(o) / hops) } else { 0.0 },
             "wall_ms_total": ms(s.wall_ns.load(o)),
+            "decode": {"tokens": s.dec_passes.load(o), "hops": s.dec_hops.load(o), "experts_remote": s.dec_experts.load(o), "experts_fallback": s.dec_fallback.load(o),
+                "hop_wall_ms": ms(s.dec_wall_ns.load(o)), "hop_net_ms": ms(s.dec_net_ns.load(o)), "host_ms": ms(s.dec_host_ns.load(o))},
             "hosts": self.hosts(),
         })
     }

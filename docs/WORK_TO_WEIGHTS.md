@@ -328,3 +328,172 @@ of one card all-resident. **W3a's 0.80x gate looks out of reach as built**; the 
 wire, is what to attack (keep the router on the card and read only the activation, or put host and trunk
 cards in one process). W3d's gate is the easier one: the one-card spilling E2 token is 32.7 ms at 5120 MiB
 (13.9 ms of it misses), so a 20-25 ms work-to-weights token would be 1.3-1.6x.
+
+## W3: measured on our gear (c4)
+
+Gates written **before** any W3 run (2026-11-11 03:15Z, resumed run; the first W3 agent stopped before
+running anything). c4 only: five P100s freed for this through the fleet manifest (glm53-strata disabled;
+the manifest was not touched by this run). Cards by UUID only (`CUDA_DEVICE_ORDER=PCI_BUS_ID`,
+`CUDA_VISIBLE_DEVICES=GPU-...`): trunk **D8** (x16, NUMA 1, NIC node), first host **AF** (x16, NUMA 1),
+then 86 (x8, NUMA 1), 3B and 3C (x8, NUMA 0). The GGUF's page cache is moved to NUMA 1 first
+(`bench/w2w/numa-load.sh`) and every process is bound to its card's node. Model: c4's local copy
+`/home/cesarops/lb-e2/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf` (same 13,578,190,880 bytes as
+`/mnt/t440/raid0/models/lfm25/`; the E2 runs used it), prompts `/home/cesarops/lb-e2/prompts.jsonl`
+(5 prompts, 288 decode tokens a round, the E2 set). Driver `bench/w2w/w3-session.sh`, client `w2w-drive`.
+
+**P. On-card parity (before any timing).** GPU host on AF holding every expert, device trunk on D8 with
+no experts of its own, `lfm2-check --ab-device --gpu --gpu-dense-mb 900 --w2w-placement`: the old path
+and the device path both with every expert on the host. Gate: greedy sonar sha **062392b8d2b0361a** on
+both arms, teacher-forced top-1 old == device at all 86 positions (the D1 parity gate), 0 fallbacks.
+If it fails: stop, diagnose, no timing.
+
+**Arms** (one server session each; every completion's text sha checked against the one-card shas
+sonar-32 `062392b8d2b0361a`, code-03 `c5d77b6cf1b729f2`, prose-02 `b89a1212137bf00d`, qa-05
+`48fe35aec6ccb119`, forge-04 `d7938eeacde472db`, the lemonade-burn shas of every E2 session):
+* `allres`: D8 alone, every expert resident as stacked layers (`--gpu-budget-mb 14500`), 1 sync a token.
+* `spill`: D8 alone, E2 cache at 5120 MiB of experts (`LB_EXPERT_VRAM_MIB=5120 LB_E2=1`), as E2's gate arm.
+* `w3a`: trunk D8 with no experts, every expert on a GPU host on AF (unix socket, `spin:200`).
+* `w3b2` / `w3b4`: trunk D8, experts as whole layers over AF+86 / AF+86+3B+3C.
+* `w3d`: trunk D8 holds whole MoE layers 2-15 itself (14 layers, about 5,075 MiB of device bytes,
+  <= 5120 MiB), layers 16-39 on a GPU host on AF.
+Rounds: at least 2, each round runs every arm once, odd rounds in the order above, even rounds
+reversed; 5 completions per arm per round. tok/s of a session = decode tokens / decode seconds over its
+5 completions; an arm's figure is the median of its sessions (min-max given).
+
+**Gates** (plan, unchanged): **W3a >= 0.80x allres** (same session block); **W3d >= 1.25x spill**;
+**every completion of every arm gives its one-card sha**; no expert falls back (hosts up throughout).
+W3b has no speed gate in the plan: reported against allres and w3a. Hop ms and hops per token are
+reported against W0's budget (unix socket, busy: 28.8 us a hop, 1.09 ms a token at one host a layer).
+
+**W3c, cross-node wire test (not a speed claim).** t440's P100 is a live seat and is not used. A
+**CPU-backend** host on t440 holds layers 36-39, over RoCE (`spin:200`) and then over 25G TCP; the
+rest as w3a (trunk D8, layers 2-35 on AF). Gate: sha on every completion, the t440 host answers every
+expert placed on it (0 fallbacks), hop ms per token recorded. A CPU expert's arithmetic is not the
+P100's, so a sha difference here would be rounding, not a wire fault: if it happens it is reported, not
+hidden, and the run is repeated with the t440 host's layers checked against a CPU trunk.
+
+**W3e (only if W3a fails and time allows): device-to-device in one process.** When host cards are in
+the trunk's box, the trunk's process opens them itself and keeps the activation on device (expert
+outputs copied card to card, one sync a token), sockets only for other boxes. Same gates as W3a (sha +
+>= 0.80x allres).
+
+**W3 host v2 (written before its run, 03:25Z).** Rounds 1-2 of the arms as built showed the GPU host's
+own time is most of the hop (25 ms of a 29 ms hop per token in w3a). Profile (`LB_HOST_PROFILE`): the W1
+host launched every expert of a message separately (2-3 dispatches and a scratch set each): 135-245 us
+to queue, 600-630 us in the read, per message. v2 runs a message for a layer held whole as **one routed
+launch of the stacked layer** (`GpuExpertLayer::launch` with host routes: two dispatches), one upload,
+one read: 45 us to queue, 270-310 us in the read; on-card parity unchanged (both arms sha
+062392b8d2b0361a, 86/86, the same max logit difference). `LB_HOST_LAUNCH=per-expert` keeps the old path.
+The arms are re-run with the v2 host (labels `w3v2-*`), allres and spill in the same rounds, **same gates**.
+
+### W3 results: P, a, b, d (c4, 2026-11-11 03:05-03:30Z) [measured]
+
+**P, on-card parity: PASS.** GPU host on AF holding all 2,432 experts (12,909 MiB), device trunk on D8,
+`lfm2-check --ab-device`: teacher-forced top-1 old == device **86/86**, max |logit diff| 2.19e-5, 0 route
+differences, 0 fallbacks; greedy sonar sha **062392b8d2b0361a** on both arms, token for token identical.
+CPU trunk (no card) against the same GPU host (`w2w-check`, decode + greedy): top-1 86/86, max |logit
+diff| 2.8e-5, greedy sha **062392b8d2b0361a**; logits are not bit-identical (a P100 expert against the CPU
+reference: rounding, as expected; the harness's bit check reports that arm "FAIL" for that reason only).
+Logs `logs/w3/parity-p1-*.log`, rows `results/w3/parity-cpu-trunk.jsonl`, report `results/w3/parity-p1-ab.json`.
+
+Arms: `results/w3/runs.jsonl` (one row per completion), `results/w3/sessions.jsonl` (VRAM per card, NUMA
+map: the model's pages were on node 1 in every session), summary by `/mnt/fast/w2w/tools/w3-summary.py` (a reporting script kept out of the repo). c4 load 2-10.
+Every completion of every arm gave its one-card sha (60 + 60 completions), **0 experts fell back**.
+
+W1 host (as built; labels `w3-*`, 2 rounds x 5 completions per arm, interleaved):
+
+| arm | cards (VRAM MiB) | tok/s median [min-max] | vs allres | vs spill | hops / token | hop wall ms / token | of it wire ms | of it host compute ms | gate |
+|---|---|---|---|---|---|---|---|---|---|
+| allres | D8 (13,775) | **81.36** [81.18-81.55] | 1.00 | | 0 | 0 | | | (baseline) |
+| spill | D8 (6,337), E2 cache 5120 MiB | **29.81** [29.75-29.88] | 0.37 | 1.00 | 0 | 0 | | | (baseline) |
+| w3a | D8 (697) + AF (12,909) | 15.19 [15.15-15.24] | **0.187** | | 38 | 29.3 | 3.65 | 25.3 | **FAIL** (>= 0.80) |
+| w3b2 | D8 + AF, 86 (6,637 each) | 14.97 [14.82-15.11] | 0.184 | | 38 | 30.3 | 3.69 | 26.3 | no gate |
+| w3b4 | D8 + AF, 86 (3,599), 3B, 3C (3,305) | 14.58 [14.57-14.60] | 0.179 | | 38 | 30.0 | 3.94 | 25.7 | no gate |
+| w3d | D8 (5,855; layers 2-15) + AF (8,205; 16-39) | 16.27 [15.90-16.64] | | **0.546** | 24 | 18.0 | 2.34 | 15.4 | **FAIL** (>= 1.25) |
+
+v2 host (one routed launch per message, see above; labels `w3v2-*`, 2 rounds x 5, allres and spill re-run
+in the same rounds):
+
+| arm | tok/s median [min-max] | vs allres | vs spill | hops / token | hop wall ms / token | wire ms | host compute ms | gate |
+|---|---|---|---|---|---|---|---|---|
+| allres | **81.82** [80.99-82.65] | 1.00 | | 0 | | | | |
+| spill | **30.55** [30.22-30.88] | | 1.00 | 0 | | | | |
+| w3a | 20.68 [19.88-21.48] | **0.253** | | 38 | 15.0 | 3.34 | 11.4 | **FAIL** (>= 0.80) |
+| w3b2 | 22.84 [22.34-23.34] | 0.279 | | 38 | 13.8 | 3.25 | 10.3 | no gate |
+| w3b4 | 21.36 [21.14-21.58] | 0.261 | | 38 | 14.2 | 3.48 | 10.4 | no gate |
+| w3d | 20.54 [20.16-20.92] | | **0.672** | 24 | 9.0 | 2.24 | 6.5 | **FAIL** (>= 1.25) |
+
+"wire ms" is round trip minus the host's own time, over a unix socket with spinning waits: 88 us a hop,
+against W0's 28.8 us echo (the difference is the 8 KB / 32 KB encode, copy and decode at both ends plus
+the scheduler). Hops are one a MoE layer whatever the number of host cards, because whole layers are placed
+per card: w3b spreads the same 38 hops over more cards and changes nothing but VRAM per card.
+
+**Where the w3a token goes** (v2, 48 ms against allres's 12.2 ms): about 15 ms waiting on hosts (11.4 ms of
+it the host's own launch and **read**: one device sync on the host a hop, 270-310 us, `LB_HOST_PROFILE`),
+and about 21 ms more than allres on the trunk side: 38 reads of the activation (one device sync each), the
+CPU router, the CPU weighted sum and 38 uploads. Each hop therefore costs **two device syncs**, one on
+each card, and a device sync on a P100 through CubeCL is 0.15-0.3 ms whatever is read. The wire is not the
+problem (3.3 ms a token). As built, a socket host cannot reach 0.80x: 76 syncs a token is ~15-20 ms of
+waiting before any arithmetic. **W3d** loses for the same reason: the trunk's own 14 layers also go through
+the host-side path once a remote tier is attached (one sync a layer), so 38 syncs a token remain, while the
+E2 spill token pays syncs only on the 15 layers with a miss.
+
+What fixes it is fewer syncs, not a faster wire: (1) **in the same box**, keep the activation on the
+device and move it card to card (W3e / plan X1, below); (2) **across boxes**, a host can only drop its own
+sync if the reply leaves the card without a host read (GPUDirect RDMA from device memory, not built), so a
+remote host stays at ~0.3 ms a hop: it is for the spill case and cold layers, as W0 already said for TCP.
+
+**W3e / X1 arms (gates written before the run, 03:50Z).** In-box cards (`gpu://N` in the placement,
+`crates/lb-lfm2/src/inbox.rs`), server binary `lemonade-burn-server-cuda-rdma-v3`, NCCL 2.21.5 (CUDA 12.4
+build, has sm_60; the c4 system NCCL 2.31/2.32 are CUDA 13 builds without Pascal kernels and hang the first
+copy) from `/mnt/fast/w2w/lib-nccl/`. Parity first (`bench/w2w/w3e-parity.sh`, all 38 layers on AF):
+**PASS**, teacher-forced 86/86, greedy sha 062392b8d2b0361a token for token, 0 fallbacks.
+* `w3e`: trunk D8, all 38 MoE layers on AF. Gate **>= 0.80x allres** (plan W3a / X1 "experts over 2 cards").
+* `w3e2`: AF 2-20, 86 21-39. `w3e4`: AF 2-11, 86 12-21, 3B 22-30, 3C 31-39. Gate (X1) **>= 0.80x allres**.
+* `w3ed`: D8 holds layers 2-15 itself (stacked, 5,075 MiB, the W3d cap), 16-39 on AF. Gate **>= 1.25x spill**.
+Same rounds as before (2 x 5 per arm, interleaved with allres and spill), sha on every completion. Hops per
+token are 38 card-to-card hand-offs (two copies each) by construction (24 for w3ed); the cost per hand-off
+is reported as (token ms - allres token ms) / hand-offs.
+
+### W3e / X1 results: in-box cards, activation card to card (c4, 03:42-03:52Z) [measured]
+
+Labels `w3e-*` in `results/w3/runs.jsonl`, 2 rounds x 5 completions per arm, interleaved, allres and spill
+re-run in the same rounds with the same (v3) server binary. Every completion gave its one-card sha.
+
+| arm | cards (VRAM MiB) | tok/s median [min-max] | vs allres | vs spill | card-to-card hand-offs / token | token ms | added ms / token | us per hand-off | gate |
+|---|---|---|---|---|---|---|---|---|---|
+| allres | D8 (13,775) | **81.92** [81.77-82.07] | 1.00 | | 0 | 12.21 | | | |
+| spill | D8 (6,337) | **30.16** [30.11-30.21] | | 1.00 | 0 | 33.16 | | | |
+| w3e | D8 (699) + AF (12,3xx) | **70.74** [70.37-71.10] | **0.864** | | 38 | 14.14 | 1.93 | 51 | **PASS** (>= 0.80) |
+| w3e2 | D8 + AF, 86 (6,663 each) | **70.14** [69.97-70.30] | **0.856** | | 38 | 14.26 | 2.05 | 54 | **PASS** (>= 0.80) |
+| w3e4 | D8 + AF, 86 (3,627), 3B, 3C (3,333) | **69.11** [68.91-69.32] | **0.844** | | 38 | 14.47 | 2.26 | 59 | **PASS** (>= 0.80) |
+| w3ed | D8 (5,857; layers 2-15) + AF (8,231; 16-39) | **72.50** [72.41-72.59] | 0.885 | **2.40** | 24 | 13.79 | 1.58 | 66 | **PASS** (>= 1.25) |
+
+"us per hand-off" = (token ms - allres token ms) / hand-offs [derived]: one hand-off is two NCCL copies of
+8 KB (h2 out, the summed output back) plus the router/experts/sum on the other card instead of this one;
+51-66 us, i.e. near W0's same-host floor (unix socket 29 us one way-and-back for a bare echo) and well
+under the 0.6-0.8 ms a socket hop costs with its two device syncs. 3B and 3C (x8, NUMA 0, crossing the
+socket interconnect: `nvidia-smi topo` SYS) cost about 8 us more a hand-off than AF/86 (NODE).
+
+So, on c4: **the trunk on one P100 with every expert on other P100s of the same box runs at 0.84-0.86x of
+one card holding everything**, and **a trunk card capped at 5120 MiB of experts with the overflow on a
+second card runs at 2.40x the one-card spilling config** (0.89x all-resident), all at the one-card greedy
+text. The plan's W3a and W3d gates fail with socket hosts and pass with in-box cards.
+
+How it is built (`crates/lb-lfm2/src/inbox.rs`, `crates/lb-lfm2/src/device_decode.rs`,
+`crates/lb-q4-gpu/src/store.rs` `Gpu::open_cuda`, `copy_to`, `sync_recycle`): placement hosts with
+`addr: "gpu://N"` are CUDA devices of the trunk's process holding whole layers; in the device decode such
+a layer copies h2 to its card (cubecl `to_client`, NCCL send/recv on the communication streams, no host
+sync), runs `router_topk`, the stacked experts on the device routes and `weighted_sum` there (the
+one-card kernels), and copies the sum back; the token still has **one** read on the trunk, plus one fence
+per in-box card after it (the card is idle by then) to recycle its scratch. Prefill and declined tokens run
+an in-box layer's experts on its card through per-expert views (one upload and one read per layer pass).
+Parity: device path bit-identical in routes (0 route differences) and the same greedy text; the old path
+and the device path agree to 2.3e-5 as on one card.
+
+Requirements found on the way: **NCCL must have sm_60 kernels.** c4's system NCCL (2.31.2 / 2.32.3,
+CUDA 13 builds) has none (CUDA 13 dropped Pascal): its first send fails with `named symbol not found` and
+cubecl's receive then waits for ever (the hang is cubecl's documented behaviour for a failed send). The
+runs used NCCL 2.21.5+cuda12.4 (the nvidia-nccl-cu12 wheel's library, sm_50-sm_90), placed as
+`/mnt/fast/w2w/lib-nccl/libnccl.so` (cudarc looks for `libnccl.so`, not `libnccl.so.2`). A mixed
+placement (in-box cards and socket hosts together) is refused: not built.

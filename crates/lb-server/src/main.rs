@@ -655,7 +655,20 @@ fn main() -> Result<()> {
         if stage_cfg.on {
             anyhow::bail!("LB_STAGE=1 needs the `gpu` feature");
         }
-        if let Some(p) = &args.w2w_placement {
+        #[cfg(feature = "gpu")]
+        let in_box = match &args.w2w_placement {
+            Some(p) => match model.attach_inbox(p).map_err(|e| anyhow::anyhow!("--w2w-placement {}: {e}", p.display()))? {
+                Some(st) => {
+                    eprintln!("w2w in-box: {st}");
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        #[cfg(not(feature = "gpu"))]
+        let in_box = false;
+        if let Some(p) = args.w2w_placement.as_ref().filter(|_| !in_box) {
             let rt = model.attach_remote(p).map_err(|e| anyhow::anyhow!("--w2w-placement {}: {e}", p.display()))?;
             let up = rt.hosts().iter().filter(|h| h.up).count();
             eprintln!("w2w: {} experts placed on {} host(s), {up} up; placement {} is watched", rt.n_placed(), rt.hosts().len(), p.display());
