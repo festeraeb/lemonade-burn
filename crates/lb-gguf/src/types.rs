@@ -19,6 +19,14 @@ pub enum GgmlType {
     /// i-quant, 256 values in 136 bytes: f16 `d`, u16 `scales_h`, `scales_l[4]`, `qs[128]`; eight
     /// sub-blocks of 32, each with a 6-bit scale (`ls - 32`) times `d`, values from [`IQ4_LEVELS`].
     IQ4XS,
+    /// i-quants on the lattice tables in `iq_grids.rs` (all 256 values a super-block).
+    IQ2XXS,
+    IQ2XS,
+    IQ2S,
+    IQ3XXS,
+    IQ3S,
+    IQ1S,
+    IQ1M,
     /// Any other type id: readable as raw bytes, not dequantizable here.
     Other(u32),
 }
@@ -35,8 +43,15 @@ impl GgmlType {
             12 => GgmlType::Q4K,
             13 => GgmlType::Q5K,
             14 => GgmlType::Q6K,
+            16 => GgmlType::IQ2XXS,
+            17 => GgmlType::IQ2XS,
+            18 => GgmlType::IQ3XXS,
+            19 => GgmlType::IQ1S,
             20 => GgmlType::IQ4NL,
+            21 => GgmlType::IQ3S,
+            22 => GgmlType::IQ2S,
             23 => GgmlType::IQ4XS,
+            29 => GgmlType::IQ1M,
             other => GgmlType::Other(other),
         }
     }
@@ -54,6 +69,13 @@ impl GgmlType {
             GgmlType::Q6K => "Q6_K".into(),
             GgmlType::IQ4NL => "IQ4_NL".into(),
             GgmlType::IQ4XS => "IQ4_XS".into(),
+            GgmlType::IQ2XXS => "IQ2_XXS".into(),
+            GgmlType::IQ2XS => "IQ2_XS".into(),
+            GgmlType::IQ2S => "IQ2_S".into(),
+            GgmlType::IQ3XXS => "IQ3_XXS".into(),
+            GgmlType::IQ3S => "IQ3_S".into(),
+            GgmlType::IQ1S => "IQ1_S".into(),
+            GgmlType::IQ1M => "IQ1_M".into(),
             GgmlType::Other(id) => format!("type#{id}"),
         }
     }
@@ -74,6 +96,20 @@ impl GgmlType {
             GgmlType::Q6K => (256, 210),
             GgmlType::IQ4NL => (32, 18),
             GgmlType::IQ4XS => (256, 136),
+            // d f16 | qs[32] u16
+            GgmlType::IQ2XXS => (256, 66),
+            // d | qs[32] u16 | scales[8]
+            GgmlType::IQ2XS => (256, 74),
+            // d | qs[64] (32 index bytes, 32 sign bytes) | qh[8] | scales[8]
+            GgmlType::IQ2S => (256, 82),
+            // d | qs[96] (64 index bytes, 32 bytes of scale+signs words)
+            GgmlType::IQ3XXS => (256, 98),
+            // d | qs[64] | qh[8] | signs[32] | scales[4]
+            GgmlType::IQ3S => (256, 110),
+            // d | qs[32] | qh[8] u16
+            GgmlType::IQ1S => (256, 50),
+            // qs[32] | qh[16] | scales[8] (the f16 scale is spread over the top nibbles of `scales`)
+            GgmlType::IQ1M => (256, 56),
             GgmlType::Other(_) => return None,
         })
     }
@@ -147,6 +183,19 @@ impl GgmlType {
             GgmlType::IQ4XS => {
                 for (o, b) in dst.chunks_exact_mut(256).zip(src.chunks_exact(136)) {
                     dequant_iq4_xs_block(b, o);
+                }
+            }
+            t @ (GgmlType::IQ2XXS | GgmlType::IQ2XS | GgmlType::IQ2S | GgmlType::IQ3XXS | GgmlType::IQ3S | GgmlType::IQ1S | GgmlType::IQ1M) => {
+                for (o, b) in dst.chunks_exact_mut(256).zip(src.chunks_exact(bb)) {
+                    match t {
+                        GgmlType::IQ2XXS => dequant_iq2_xxs_block(b, o),
+                        GgmlType::IQ2XS => dequant_iq2_xs_block(b, o),
+                        GgmlType::IQ2S => dequant_iq2_s_block(b, o),
+                        GgmlType::IQ3XXS => dequant_iq3_xxs_block(b, o),
+                        GgmlType::IQ3S => dequant_iq3_s_block(b, o),
+                        GgmlType::IQ1S => dequant_iq1_s_block(b, o),
+                        _ => dequant_iq1_m_block(b, o),
+                    }
                 }
             }
             GgmlType::Other(id) => panic!("cannot dequantize ggml type {id}"),
@@ -520,6 +569,177 @@ pub fn dequant_iq4_xs_block(b: &[u8], out: &mut [f32]) {
         for j in 0..16 {
             o[j] = dl * IQ4_LEVELS[(q[j] & 15) as usize] as f32;
             o[j + 16] = dl * IQ4_LEVELS[(q[j] >> 4) as usize] as f32;
+        }
+    }
+}
+
+// ---- lattice i-quants (tables in `iq_grids.rs`) ----
+//
+// Every decoder keeps the reference's float operation order (scale first, then times the grid
+// value, then the sign), so the results are the same f32 bits as llama.cpp's dequantizer; checked on
+// real blocks of our quantised files (`tests/iq_matches_llama.rs`).
+
+use crate::iq_grids::{IQ1S_DELTA, IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+
+#[inline]
+fn u16_at(b: &[u8], i: usize) -> u16 {
+    u16::from_le_bytes([b[i], b[i + 1]])
+}
+
+#[inline]
+fn u32_at(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+
+/// Byte `j` (0..8) of a 64-bit grid entry, or (0..4) of a 32-bit one: the lattice point's coordinate.
+#[inline]
+fn gbyte(g: u64, j: usize) -> u8 {
+    (g >> (8 * j)) as u8
+}
+
+#[inline]
+fn sgn(signs: u8, j: usize) -> f32 {
+    if signs & KMASK_IQ2XS[j] != 0 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
+/// Eight values `dl * grid[j] * sign(j)` of one 64-bit grid entry.
+#[inline]
+fn put8(out: &mut [f32], dl: f32, g: u64, signs: u8) {
+    for j in 0..8 {
+        out[j] = dl * gbyte(g, j) as f32 * sgn(signs, j);
+    }
+}
+
+/// IQ2_XXS: per 32 values, two u32: four 8-bit grid indices, then 4 x 7 sign bits + a 4-bit scale.
+pub fn dequant_iq2_xxs_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    for ib in 0..8 {
+        let idx = u32_at(b, 2 + 8 * ib);
+        let ss = u32_at(b, 2 + 8 * ib + 4);
+        let db = d * (0.5 + (ss >> 28) as f32) * 0.25;
+        for l in 0..4 {
+            let g = IQ2XXS_GRID[(idx >> (8 * l)) as u8 as usize];
+            let signs = KSIGNS_IQ2XS[((ss >> (7 * l)) & 127) as usize];
+            put8(&mut out[32 * ib + 8 * l..], db, g, signs);
+        }
+    }
+}
+
+/// IQ2_XS: per 8 values, one u16: 9-bit grid index + 7 sign bits; per 32 values, two 4-bit scales.
+pub fn dequant_iq2_xs_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    for ib in 0..8 {
+        let sc = b[66 + ib];
+        let db = [d * (0.5 + (sc & 15) as f32) * 0.25, d * (0.5 + (sc >> 4) as f32) * 0.25];
+        for l in 0..4 {
+            let q = u16_at(b, 2 + 2 * (4 * ib + l));
+            let g = IQ2XS_GRID[(q & 511) as usize];
+            let signs = KSIGNS_IQ2XS[(q >> 9) as usize];
+            put8(&mut out[32 * ib + 8 * l..], db[l / 2], g, signs);
+        }
+    }
+}
+
+/// IQ2_S: 10-bit grid indices (8 low bits in `qs`, 2 high bits in `qh`), explicit sign bytes.
+pub fn dequant_iq2_s_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let (qs, signs, qh, scales) = (&b[2..34], &b[34..66], &b[66..74], &b[74..82]);
+    for ib in 0..8 {
+        let sc = scales[ib];
+        let db = [d * (0.5 + (sc & 15) as f32) * 0.25, d * (0.5 + (sc >> 4) as f32) * 0.25];
+        for l in 0..4 {
+            let hi = ((qh[ib] as usize) << (8 - 2 * l)) & 0x300;
+            let g = IQ2S_GRID[qs[4 * ib + l] as usize | hi];
+            put8(&mut out[32 * ib + 8 * l..], db[l / 2], g, signs[4 * ib + l]);
+        }
+    }
+}
+
+/// IQ3_XXS: 8-bit indices into a 4-value grid, a u32 of 4 x 7 sign bits + 4-bit scale per 32.
+pub fn dequant_iq3_xxs_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let qs = &b[2..66];
+    for ib in 0..8 {
+        let ss = u32_at(b, 66 + 4 * ib);
+        let db = d * (0.5 + (ss >> 28) as f32) * 0.5;
+        for l in 0..4 {
+            let signs = KSIGNS_IQ2XS[((ss >> (7 * l)) & 127) as usize];
+            let g1 = IQ3XXS_GRID[qs[8 * ib + 2 * l] as usize] as u64;
+            let g2 = IQ3XXS_GRID[qs[8 * ib + 2 * l + 1] as usize] as u64;
+            let o = &mut out[32 * ib + 8 * l..];
+            for j in 0..4 {
+                o[j] = db * gbyte(g1, j) as f32 * sgn(signs, j);
+                o[j + 4] = db * gbyte(g2, j) as f32 * sgn(signs, j + 4);
+            }
+        }
+    }
+}
+
+/// IQ3_S: 9-bit indices (8 low bits in `qs`, 1 high bit in `qh`) into a 4-value grid, explicit
+/// sign bytes, one 4-bit scale per 32 values (`d * (1 + 2 * s)`).
+pub fn dequant_iq3_s_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let (qs, qh, signs, scales) = (&b[2..66], &b[66..74], &b[74..106], &b[106..110]);
+    for ib in 0..8 {
+        let s4 = if ib % 2 == 0 { scales[ib / 2] & 15 } else { scales[ib / 2] >> 4 };
+        let db = d * (1 + 2 * s4 as i32) as f32;
+        let h = qh[ib] as usize;
+        for l in 0..4 {
+            let g1 = IQ3S_GRID[qs[8 * ib + 2 * l] as usize | ((h << (8 - 2 * l)) & 256)] as u64;
+            let g2 = IQ3S_GRID[qs[8 * ib + 2 * l + 1] as usize | ((h << (7 - 2 * l)) & 256)] as u64;
+            let sg = signs[4 * ib + l];
+            let o = &mut out[32 * ib + 8 * l..];
+            for j in 0..4 {
+                o[j] = db * gbyte(g1, j) as f32 * sgn(sg, j);
+                o[j + 4] = db * gbyte(g2, j) as f32 * sgn(sg, j + 4);
+            }
+        }
+    }
+}
+
+/// IQ1_S: 11-bit indices (8 bits in `qs`, 3 in `qh`) into a {-1, 0, +1} grid, per 32 values a
+/// 3-bit scale and a sign for the +-1/8 offset.
+pub fn dequant_iq1_s_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let qs = &b[2..34];
+    for ib in 0..8 {
+        let h = u16_at(b, 34 + 2 * ib) as usize;
+        let dl = d * (2 * ((h >> 12) & 7) + 1) as f32;
+        let delta = if h & 0x8000 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
+        for l in 0..4 {
+            let g = IQ1S_GRID[qs[4 * ib + l] as usize | (((h >> (3 * l)) & 7) << 8)];
+            for j in 0..8 {
+                out[32 * ib + 8 * l + j] = dl * (gbyte(g, j) as i8 as f32 + delta);
+            }
+        }
+    }
+}
+
+/// IQ1_M: as IQ1_S's grid, a 3-bit scale per 16 values and an offset sign per 8; the block's f16
+/// scale is the top nibbles of the four u16 scale words.
+pub fn dequant_iq1_m_block(b: &[u8], out: &mut [f32]) {
+    let (qs, qh) = (&b[0..32], &b[32..48]);
+    let sc = [u16_at(b, 48), u16_at(b, 50), u16_at(b, 52), u16_at(b, 54)];
+    let bits = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    let d = f16::from_bits(bits).to_f32();
+    for ib in 0..8 {
+        let s = sc[ib / 2] as usize;
+        let dl1 = d * (2 * ((s >> (6 * (ib % 2))) & 7) + 1) as f32;
+        let dl2 = d * (2 * ((s >> (6 * (ib % 2) + 3)) & 7) + 1) as f32;
+        let (h0, h1) = (qh[2 * ib] as usize, qh[2 * ib + 1] as usize);
+        let idx = [qs[4 * ib] as usize | ((h0 << 8) & 0x700), qs[4 * ib + 1] as usize | ((h0 << 4) & 0x700), qs[4 * ib + 2] as usize | ((h1 << 8) & 0x700), qs[4 * ib + 3] as usize | ((h1 << 4) & 0x700)];
+        let dsgn = |m: bool| if m { -IQ1S_DELTA } else { IQ1S_DELTA };
+        let delta = [dsgn(h0 & 0x08 != 0), dsgn(h0 & 0x80 != 0), dsgn(h1 & 0x08 != 0), dsgn(h1 & 0x80 != 0)];
+        for l in 0..4 {
+            let dl = if l < 2 { dl1 } else { dl2 };
+            let g = IQ1S_GRID[idx[l]];
+            for j in 0..8 {
+                out[32 * ib + 8 * l + j] = dl * (gbyte(g, j) as i8 as f32 + delta[l]);
+            }
         }
     }
 }

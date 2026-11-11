@@ -26,6 +26,13 @@ fn type_id(ty: GgmlType) -> u32 {
         GgmlType::Q6K => 14,
         GgmlType::IQ4NL => 20,
         GgmlType::IQ4XS => 23,
+        GgmlType::IQ2XXS => 16,
+        GgmlType::IQ2XS => 17,
+        GgmlType::IQ3XXS => 18,
+        GgmlType::IQ1S => 19,
+        GgmlType::IQ3S => 21,
+        GgmlType::IQ2S => 22,
+        GgmlType::IQ1M => 29,
         GgmlType::Other(id) => id,
     }
 }
