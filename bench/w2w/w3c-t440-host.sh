@@ -8,7 +8,7 @@ IP=${IP:-10.0.10.61}; LAYERS=${LAYERS:-36-39}; LIFE=${LIFE:-3600}; PIDF=$W/run/w
 case ${1:-start} in
   start)
     [ -f "$PIDF" ] && kill -0 "$(cat $PIDF)" 2>/dev/null && { echo "already running"; exit 0; }
-    setsid nohup timeout $LIFE nice -n 5 "$W/bin/lb-expert-host-cpu-rdma" --model "$MODEL" --name hx --hold "$LAYERS:0-63" \
+    setsid nohup timeout $LIFE nice -n 5 "${HOSTBIN:-$W/bin/lb-expert-host-cpu-rdma-v2}" --model "$MODEL" --name hx --hold "$LAYERS:0-63" \
       --listen tcp://$IP:47420 --listen rdma://$IP:47421 --wait spin:200 --threads 8 --stats-s 30 > "$W/logs/w3/w3c-t440-host.log" 2>&1 < /dev/null &
     echo $! > "$PIDF"
     for _ in $(seq 1 120); do grep -q "listening on rdma" "$W/logs/w3/w3c-t440-host.log" && break; sleep 1; done

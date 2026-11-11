@@ -497,3 +497,53 @@ cubecl's receive then waits for ever (the hang is cubecl's documented behaviour 
 runs used NCCL 2.21.5+cuda12.4 (the nvidia-nccl-cu12 wheel's library, sm_50-sm_90), placed as
 `/mnt/fast/w2w/lib-nccl/libnccl.so` (cudarc looks for `libnccl.so`, not `libnccl.so.2`). A mixed
 placement (in-box cards and socket hosts together) is refused: not built.
+
+### W3c results: cross-node wire test (c4 trunk, t440 CPU host), 04:00-04:04Z [measured, a wire test, not a speed claim]
+
+Trunk on D8, layers 2-35 on a v2 GPU host on AF (unix socket), **layers 36-39 on a CPU-backend host on t440**
+(`bench/w2w/w3c-t440-host.sh`, 8 threads, nice 5, t440 load average about 27 from other work; t440's P100 not
+used), reached over t440's 25G port 10.0.10.61, by RoCE v2 (`spin:200`) and by TCP (`block`). Labels
+`w3c2-*`, 2 rounds x 5 per arm, interleaved. Same model file on both nodes (fingerprint
+8f5e6596b72284a3eeec808f0c5656c2), CPU arithmetic fingerprint 3485a00c79570e6d.
+
+| arm | tok/s median [min-max] | hops / token | hop wall ms / token | wire ms / token (all 38 hops) | host compute ms / token | fallback | sha | gate |
+|---|---|---|---|---|---|---|---|---|
+| w3c-rdma | 11.58 [11.40-11.77] | 38 | 49.4 | 4.02 | 45.1 | 0 | all 10 OK | **PASS** |
+| w3c-tcp | 11.40 [10.95-11.85] | 38 | 53.3 | 4.29 | 48.7 | 0 | all 10 OK | **PASS** |
+
+Gate (sha on every completion, the t440 host answers everything placed on it, hop ms recorded): **PASS on
+both transports**. The CPU experts on t440 did not change a single greedy token here (rounding against the
+P100's arithmetic, as expected, but no flip in 20 completions). The token is slow because a loaded CPU
+computes four layers' experts (about 11 ms a layer), not because of the wire. The wire figure is the sum
+over all 38 hops; with the 34 unix hops at the 88 us measured above (3.0 ms), the four cross-node hops cost
+about **250 us each over RoCE and about 320 us over TCP** including encode/decode on a loaded t440
+[derived, not separately measured].
+
+**Fault found and fixed in this step.** The first wire run (labels `w3c-*`, kept in the results) had the
+RoCE host refused at connect: a bare TCP reachability probe of the rendezvous port (from this run) had made
+the RDMA `accept` fail, and `host::serve` ended on the first failed accept, so the listener was gone for
+good while the TCP listener kept working; the trunk then ran those layers locally (9,056 expert fallbacks,
+sha still correct: the fallback path did its job). `serve` now logs a failed accept and keeps listening
+(stops only after 1,000 failures in a row); test `a_bad_client_does_not_take_the_listener_down` (fails on the
+old code, passes on the new). The rerun above used the fixed host.
+
+## W3 / X0 / X1: not run, not verified, open
+
+* **X0's target (socket host w3a >= 0.80x allres) is not met** and cannot be with a sync on each side of
+  every hop: v2 host 0.253x. Removing the host's own sync needs the reply to leave its card without a host
+  read (GPUDirect RDMA from device memory to the NIC): not built, not tried.
+* **Mixed placements** (in-box cards and socket hosts at once) are refused: not built. So a box with both
+  local cards and a far host cannot use the in-box path yet.
+* **Prefill with in-box cards** runs per layer through per-expert views and a read on the card; its speed was
+  not measured (decode tok/s was the gate). Long prompts (X5) not run.
+* **In-box hops are not counted by the server's `/v1/placement`** (`InBox::status` exists, the server does
+  not expose it); hand-offs per token are by construction and the per-hand-off cost is derived from tok/s.
+* Two rounds per arm (the minimum asked); spreads were 0.2-4 %. No third round.
+* **Per-card memory bandwidth was not measured** (X2 needs it). Per-hop latencies measured here are in
+  RESUME.md for X2-X4.
+* The W1 (per-expert) GPU host is still selectable (`LB_HOST_LAUNCH=per-expert`); the staged
+  `lb-expert-host-cuda-rdma` binary is the W1 one, `-v2`/`-v3` are the new ones.
+* NCCL: the run depends on a CUDA 12 NCCL with sm_60 kernels (`/mnt/fast/w2w/lib-nccl/libnccl.so`, a copy
+  of the nvidia-nccl-cu12 2.21.5 wheel's library). With a CUDA 13 NCCL the first copy hangs (cubecl waits on
+  a receive whose send failed); the load log says which NCCL was loaded only through `NCCL_DEBUG=INFO`.
+  A start-up self-test copy with a timeout would turn that hang into a refusal: not built.

@@ -364,10 +364,32 @@ impl Host {
     }
 }
 
-/// Accept connections for ever, one thread each. Returns when the listener fails.
+/// Accept connections for ever, one thread each.
+///
+/// A failed accept is one client's problem, not the listener's: an RDMA listener does its
+/// rendezvous inside `accept`, so a client that connects and says the wrong thing (a port probe,
+/// an old trunk) used to end this loop and leave the host deaf on that address for good (found in
+/// W3: a bare TCP probe of the rendezvous port took the RoCE listener down). The error is logged
+/// and the loop goes on; it returns only after 1000 failures in a row (a listener that is really
+/// broken), with a short pause between them.
 pub fn serve(host: Arc<Host>, mut listener: Box<dyn Listener>) -> std::io::Result<()> {
+    let mut failed_in_a_row = 0u32;
     loop {
-        let conn = listener.accept()?;
+        let conn = match listener.accept() {
+            Ok(c) => {
+                failed_in_a_row = 0;
+                c
+            }
+            Err(e) => {
+                failed_in_a_row += 1;
+                eprintln!("lb-expert-host {}: accept on {} failed ({e}); still listening", host.name, listener.local());
+                if failed_in_a_row >= 1000 {
+                    return Err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+        };
         let h = host.clone();
         std::thread::Builder::new().name(format!("w2w-{}", conn.kind())).spawn(move || {
             let kind = conn.kind();

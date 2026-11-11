@@ -139,3 +139,35 @@ fn a_host_refuses_an_expert_it_does_not_hold() {
     assert!(h.set_held(bad).is_err());
     let _ = std::fs::remove_file(p);
 }
+
+/// A listener whose first accepts fail the way a bad RDMA rendezvous does.
+struct FlakyListener {
+    inner: Box<dyn lb_expert_host::transport::Listener>,
+    fail: u32,
+}
+
+impl lb_expert_host::transport::Listener for FlakyListener {
+    fn accept(&mut self) -> std::io::Result<Box<dyn lb_expert_host::transport::Conn>> {
+        if self.fail > 0 {
+            self.fail -= 1;
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "rendezvous line \"GET / HTTP/1.1\""));
+        }
+        self.inner.accept()
+    }
+    fn local(&self) -> String {
+        self.inner.local()
+    }
+}
+
+#[test]
+fn a_bad_client_does_not_take_the_listener_down() {
+    let (m, p) = model("flaky");
+    let held = HeldSet::parse_spec("1-4:0-7", m.n_layer(), m.n_expert).unwrap();
+    let h = Arc::new(Host::new("f", m, held, Box::new(CpuBackend)).unwrap());
+    let inner = transport::listen("inproc://flaky-f", Wait::Block).unwrap();
+    host::spawn(h, Box::new(FlakyListener { inner, fail: 3 }));
+    // the three failed accepts are behind the listener; the next client is served
+    let c = HostClient::connect("inproc://flaky-f", Wait::Block, Duration::from_secs(5)).unwrap();
+    assert_eq!(c.info.name, "f");
+    let _ = std::fs::remove_file(p);
+}
