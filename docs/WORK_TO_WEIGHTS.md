@@ -870,3 +870,25 @@ What this says, plainly:
 * **Low-precision math is not free in quality.** On this model the f16 path (activations rounded to 11 bits per
   block) costs KLD 1.45e-2 and 8 of 215 top-1; dp4a (int8 activations, llama.cpp's MMVQ scheme) costs 3.3e-2 and
   18 of 215. X7q puts those next to what each weight quant costs.
+
+### X7b: transcode on residency, host and device [measured]
+
+* `lb_gguf` decodes **IQ4_NL and IQ4_XS** (`types.rs`, the 16-level table is part of the format).
+  `lb_q4_gpu::transcode::q4_0_bytes` re-encodes any dequantizable non-Q4_0 matrix to Q4_0 with a per-block scale
+  search (12 candidates down to -20 % of `max/-8`, scored with the f16-rounded scale); it is called by
+  `GpuQ4Mat::upload`, `GpuExpertLayer::upload{,_stacked}` and the dense loader, so an IQ4_XS (or Q4_K, Q8_0, ...)
+  file loads onto the card as Q4_0 and runs on every per-card math. `LB_TRANSCODE=0` turns it off;
+  `LB_TRANSCODE_SIMPLE=1` takes the plain `max/-8` encoder. On 131k random blocks the search lowers the encode
+  SSE vs plain (unit test).
+* **Device form**: `iq4_xs_to_q4_0_kernel` / `Gpu::transcode_iq4_xs_on_device`: raw IQ4_XS super-blocks on the
+  device (34 words each) -> Q4_0 words in the device layout, same scale search. Test
+  `tests/device_transcode_matches_host.rs` on c4-86 (P100, idle, 1 min): **bit-identical to the host transcode** on
+  98,304 blocks (0 scale and 0 quant-word differences; the FMA-contraction caveat did not bite), and
+  **16.0 GB/s of IQ4_XS input = 0.10 ms per 1536x2048 expert matrix** vs 19.3 ms for the host transcode (rayon,
+  c4, NUMA-bound): ~190x. A miss could DMA 4.25 bpw instead of 4.5 and re-encode on arrival for ~0.3 ms an expert.
+* **Not wired:** the expert cache / staging slots (`ExpertSlots`, the E1 cache, the miss path) still take Q4_0
+  bytes only; the device kernel is not yet called by the miss path, so transcoded models run **all-resident**
+  (load-time host transcode). i-quants other than IQ4_NL/IQ4_XS (IQ3_S, IQ2_S, IQ1_S, ... which carry the IQ3_M /
+  IQ2_M / IQ1_S mixes) are **not decoded** by lb-gguf: they need the formats' lattice tables (512-2048 entries), which
+  exist only as data inside llama.cpp / gguf-py; transcribing them is a clean-room call for the operator. Their
+  quality and llama.cpp speed are in X7q.

@@ -1199,3 +1199,100 @@ fn q4_0_gate_up_silu_rows_kernel(
         g += step;
     }
 }
+
+// ---- X7b: transcode on the device (IQ4_XS -> Q4_0 device layout) ----
+
+/// Units per cube for [`iq4_xs_to_q4_0_kernel`].
+pub const TRANSCODE_CUBE: usize = 128;
+
+/// One Q4_0 block (32 values in `v`) encoded the way [`transcode::quantize_q4_0_block_search`]
+/// does on the host (scale searched over 12 candidates, scored with the f16-rounded scale): its
+/// f16 scale bits, and its nibbles written into `q`.
+#[cube]
+fn q4_0_encode_search(v: &Array<f32>, q: &mut Array<u32>) -> u32 {
+    let mut amax = 0.0f32;
+    let mut mx = 0.0f32;
+    for i in 0..32usize {
+        let a = v[i].abs();
+        if a > amax {
+            amax = a;
+            mx = v[i];
+        }
+    }
+    let base = mx / -8.0f32;
+    let mut best_err = 3.0e38f32;
+    let mut best_d = 0.0f32;
+    for k in 0..12u32 {
+        let d = f32::cast_from(half::f16::cast_from(base * (1.0f32 - 0.018f32 * f32::cast_from(k))));
+        let mut id = 0.0f32;
+        if d != 0.0f32 {
+            id = 1.0f32 / d;
+        }
+        let mut err = 0.0f32;
+        for i in 0..32usize {
+            let qi = clamp((v[i] * id + 8.5f32).floor(), 0.0f32, 15.0f32);
+            let e = v[i] - d * (qi - 8.0f32);
+            err += e * e;
+        }
+        if err < best_err {
+            best_err = err;
+            best_d = d;
+        }
+    }
+    let mut id = 0.0f32;
+    if best_d != 0.0f32 {
+        id = 1.0f32 / best_d;
+    }
+    for i in 0..32usize {
+        q[i] = u32::cast_from(clamp((v[i] * id + 8.5f32).floor(), 0.0f32, 15.0f32));
+    }
+    u32::cast_from(u16::reinterpret(half::f16::cast_from(best_d)))
+}
+
+/// IQ4_XS super-blocks already on the device -> Q4_0 in the repacked device layout (`qs`, `sc`;
+/// what `repack_q4_0_into` writes), in one pass. `raw` is the file's bytes as u32 words: a
+/// super-block is 136 bytes = 34 words (d f16 | scales_h u16, scales_l[4], qs[128]). One unit per
+/// PAIR of 32-value blocks (4 pairs a super-block), so each unit owns whole `sc` words. `levels`
+/// holds the 16 IQ4 levels as f32. `n[0]` = number of pairs.
+#[cube(launch)]
+fn iq4_xs_to_q4_0_kernel(raw: &[u32], levels: &[f32], qs: &mut [u32], sc: &mut [u32], n: &[u32]) {
+    let p = CUBE_POS * CUBE_DIM_X as usize + UNIT_POS_X as usize;
+    if p < n[0] as usize {
+        let s = p / 4usize;
+        let w0 = raw[34usize * s];
+        let d = f16_to_f32(w0 & 0xffffu32);
+        let sh = w0 >> 16u32;
+        let sl = raw[34usize * s + 1usize];
+        let mut v = Array::<f32>::new(32usize);
+        let mut q = Array::<u32>::new(32usize);
+        let mut scw = 0u32;
+        for h in 0..2u32 {
+            let ib = (p % 4usize) as u32 * 2u32 + h;
+            let lo = (sl >> (8u32 * (ib / 2u32) + 4u32 * (ib % 2u32))) & 15u32;
+            let ls = lo | (((sh >> (2u32 * ib)) & 3u32) << 4u32);
+            let dl = d * f32::cast_from(ls as i32 - 32i32);
+            let qb = 34usize * s + 2usize + 4usize * ib as usize;
+            for t in 0..4usize {
+                let w = raw[qb + t];
+                for b in 0..4u32 {
+                    let byte = (w >> (8u32 * b)) & 255u32;
+                    let i = 4usize * t + b as usize;
+                    v[i] = dl * levels[(byte & 15u32) as usize];
+                    v[i + 16usize] = dl * levels[(byte >> 4u32) as usize];
+                }
+            }
+            let dbits = q4_0_encode_search(&v, &mut q);
+            scw |= dbits << (16u32 * h);
+            // device word k: nibble j = value 4j + k (j < 4), 16 + 4(j-4) + k (j >= 4)
+            let blk = 2usize * p + h as usize;
+            for k in 0..4usize {
+                let mut wd = 0u32;
+                for j in 0..8usize {
+                    wd |= q[4usize * j + k] << (4u32 * j as u32);
+                }
+                qs[4usize * blk + k] = wd;
+            }
+        }
+        sc[p] = scw;
+    }
+}

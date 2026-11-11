@@ -428,6 +428,33 @@ impl Gpu {
         Some([g, u, d])
     }
 
+    /// X7b on the device: IQ4_XS bytes (`raw`, whole super-blocks, already on the device) ->
+    /// Q4_0 words in the device layout, scale-searched like the host transcode. Returns
+    /// `((qs, n_qs), (sc, n_sc))` as `upload_q4_0` does. `n_super` super-blocks = 8 * n_super
+    /// Q4_0 blocks.
+    pub fn transcode_iq4_xs_on_device(&self, raw: &Handle, n_super: usize) -> ((Handle, usize), (Handle, usize)) {
+        let n_blocks = 8 * n_super;
+        let (n_qs, n_sc) = (n_blocks * 4, n_blocks / 2);
+        let qs = self.client.empty(n_qs * 4);
+        let sc = self.client.empty(n_sc * 4);
+        let levels: Vec<f32> = lb_gguf::types::IQ4_LEVELS.iter().map(|&l| l as f32).collect();
+        let lv = self.upload_f32(&levels);
+        let n = self.const_u32(&[n_sc as u32]);
+        unsafe {
+            crate::iq4_xs_to_q4_0_kernel::launch(
+                &self.client,
+                cube_count(n_sc, crate::TRANSCODE_CUBE),
+                CubeDim::new_1d(crate::TRANSCODE_CUBE as u32),
+                BufferArg::from_raw_parts(raw.clone(), n_super * 34),
+                BufferArg::from_raw_parts(lv, 16),
+                BufferArg::from_raw_parts(qs.clone(), n_qs),
+                BufferArg::from_raw_parts(sc.clone(), n_sc),
+                BufferArg::from_raw_parts(n, 1),
+            );
+        }
+        ((qs, n_qs), (sc, n_sc))
+    }
+
     /// A device buffer holding exactly `words`, shared by every caller asking for the same
     /// words (kernel `dims` and counts). Never freed: there are a few dozen distinct ones.
     pub fn const_u32(&self, words: &[u32]) -> Handle {
