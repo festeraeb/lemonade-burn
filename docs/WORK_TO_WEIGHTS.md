@@ -804,3 +804,69 @@ kernels were f32 only before X7.
   file fits; fraction of measured read bandwidth from bytes read per token (dense + 4 routed experts per MoE layer,
   from the file's tensor sizes). lemonade-burn rows: Q4_0 files only (QAD and from-BF16) per math, and transcoded
   i-quants.
+
+### X7a results (2026-11-11 06:55-08:25Z) [measured]
+
+**Kernel parity** (`cargo test -p lb-q4-gpu --features cuda --test math_variants_match_reference`, logs
+`/mnt/fast/x7/logs/parity-*.log`): **PASS on all four card classes we have**: c4-AF P100 (sm_60, dp4a by
+polyfill), c3 P106-100 (sm_61, native `__dp4a`), c2 RTX 2060 and RTX 2060 SUPER (sm_75). f32m 0 differing bits
+everywhere. f16 and dp4a reproduce the host emulation of their own arithmetic to 4e-8 - 1.7e-7 of the block sum
+(gate 2e-6). Normalised error vs f32: f16 4.6e-4 - 8.0e-4 (gate 5e-3), dp4a 3.4e-3 - 1.4e-2 (gate 3e-2); expert
+FFN f16 7.7e-4, dp4a 1.25e-2; routed layer f16 6.7e-4, dp4a 1.09e-2. The probe picks f16 on sm_60, dp4a on
+sm_61 and sm_75.
+
+**Kernel speed per math** (`examples/rows_bench.rs`, `LB_BENCH_MATHS=f32,f32m,f16,dp4a`, rows 4, median GB/s of
+weight bytes; `results/rowsbench.jsonl`). `big` = one 65536x2048 Q4_0 matrix (75 MB) as a chain of 16 launches,
+the only shape long enough that the ~28 us host cost of a CubeCL launch does not set the time:
+
+| card (cc) | read BW | f32 | f32m | f16 | dp4a | big as % of BW (f32) |
+|---|---|---|---|---|---|---|
+| c4-AF P100 (6.0) | 605 GB/s [measured, X6] | 310 | 311 | **320** | 314 (polyfill) | 51 % |
+| c3 P106-100 (6.1) | 192 GB/s [spec] | 90 | 90 | **10** | 89 | 47 % |
+| c2 RTX 2060 (7.5) | 336 GB/s [spec] | 190 | 190 | 189 | 189 | 57 % |
+| c2 RTX 2060 SUPER (7.5) | 448 GB/s [spec] | 155 | 154 | 154 | 153 | 34 % |
+
+Distinct 24 experts (2 launches an expert, m = 1): 80-116 GB/s on every card in every math except f16 on the
+P106 (8 GB/s); the 2048-wide dense shapes take ~28-30 us a launch whatever their size (launch-bound).
+
+**Model, c4-AF, LFM2.5-24B-A2B QAD-Q4_0, every expert resident** (`lfm2-check --ab-math f32m,f16,dp4a`,
+`results/abmath-c4AF-qad-r1.json`): five E2 prompts teacher-forced (215 positions), greedy 32 tokens x 3 rounds.
+
+| math | exact? | top-1 vs f32 | mean KLD vs f32 | max KLD | max \|dlogit\| | greedy sha | greedy tok/s (3 rounds) | vs f32 |
+|---|---|---|---|---|---|---|---|---|
+| f32 | ref | - | - | - | - | **062392b8d2b0361a** | 87.86 / 88.00 / 88.15 | 1.00x |
+| f32m | **yes** | 215/215 | 0 | 0 | 0 | **062392b8d2b0361a** | 87.70 / 88.13 / 87.44 | 1.00x |
+| f16 | no | 207/215 (96.3 %) | 1.45e-2 | 0.51 | 9.5 | c528679c0df98501 | 88.95 / 90.24 / 91.05 | 1.03x |
+| dp4a (polyfill) | no | 197/215 (91.6 %) | 3.29e-2 | 1.21 | 6.7 | c143d10e73104e67 | 90.41 / 89.17 / 89.91 | 1.02x |
+
+held-out-v1 through `lemonade-burn-server` on c4-AF, one server per math (`LB_Q4_MATH`), same harness as experiment
+#3 (temp 0, reasoning off: the server now honours `chat_template_kwargs.enable_thinking: false` with an empty
+`<think></think>`, the equivalent of llama-server's `--reasoning-budget 0`; `results/heldout-lb.jsonl`, scored
+with `moe-budget-eval/bin/score.py`):
+
+| math | gate (40) | rust | qa | prose | forge (proxy) | items differing from f32 |
+|---|---|---|---|---|---|---|
+| f32 | 35 | 11/15 | 14/15 | 10/10 | 20/20 | - |
+| f16 | 35 | 11/15 | 14/15 | 10/10 | 20/20 | none |
+| dp4a | 35 | 11/15 | 14/15 | 10/10 | 20/20 | rust-04 (now passes), rust-07 (now fails) |
+
+The math does not move the task score (0 net items). Our f32 itself scores 35/40 where experiment #3's llama.cpp
+run of the same file scored 37/40: X7q re-runs llama.cpp on this file with this harness to separate engine from
+harness (the absolute ">= 39/40" in gate 2 was written against that 37-40 and is not met by f32 either).
+
+**X7a gates:** kernel parity PASS (all paths, all cards). Exact paths (f32, f32m): sha **PASS**, max |dlogit| 0.
+f16 quality **FAIL** (96.3 % < 98 %, KLD 1.45e-2 > 1e-3). dp4a quality **FAIL** (91.6 % < 97 %, KLD 3.3e-2 > 3e-3).
+Speed gate (>= 1.10x end to end) **FAIL** for every math on every card measured. Default stays `LB_Q4_MATH=f32`.
+
+What this says, plainly:
+* **The engine can switch math on the fly.** The math is a launch parameter over one resident copy; the probe
+  picks it per card, and `set_q4_math` switches it live with no re-upload. Parity holds on sm_60, sm_61, sm_75.
+* **For Q4_0 today, math is not the bottleneck on any of our cards.** The kernel streams at 34-57 % of the card's
+  bandwidth in every math (bytes in flight per SM, not ALU), and the whole decode is launch-bound: 88 tok/s is
+  11.4 ms a token for ~1.2 GB of weights that HBM2 reads in ~2 ms. f32m (no int-to-float converts) is exactly as
+  fast as f32, which rules out the convert as a limit.
+* **The wrong math on the wrong card is a disaster:** f16 on sm_61 is **8.5-11x slower** (1/64-rate fp16). So the
+  per-card choice is not optional: hardware matching is a must even where it buys nothing.
+* **Low-precision math is not free in quality.** On this model the f16 path (activations rounded to 11 bits per
+  block) costs KLD 1.45e-2 and 8 of 215 top-1; dp4a (int8 activations, llama.cpp's MMVQ scheme) costs 3.3e-2 and
+  18 of 215. X7q puts those next to what each weight quant costs.

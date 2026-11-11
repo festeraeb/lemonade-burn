@@ -296,6 +296,12 @@ struct ChatReq {
     seed: Option<u64>,
     #[serde(default)]
     stop: Option<Value>,
+    /// Template switches. `{"enable_thinking": false}` closes the reasoning block before the
+    /// answer (an empty `<think></think>` after the assistant header), which is what
+    /// llama-server's `--reasoning-budget 0` amounts to for a thinking template (LFM2.5's opens
+    /// `<think>` itself). Absent or true: the prompt is unchanged.
+    #[serde(default)]
+    chat_template_kwargs: Option<Value>,
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -346,7 +352,8 @@ async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatReq>) -> Resp
     if msgs.is_empty() {
         return err(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
-    let prompt = match st.codec.encode_chat(&msgs) {
+    let no_think = req.chat_template_kwargs.as_ref().and_then(|k| k.get("enable_thinking")).and_then(Value::as_bool) == Some(false);
+    let prompt = match st.codec.encode_chat_suffix(&msgs, if no_think { "<think></think>" } else { "" }) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };

@@ -79,7 +79,14 @@ impl TextCodec {
     }
 
     pub fn encode_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        let text = self.render_chat(messages);
+        self.encode_chat_suffix(messages, "")
+    }
+
+    /// `encode_chat` with `suffix` appended after the assistant header (e.g. an empty
+    /// `<think></think>` to answer without reasoning).
+    pub fn encode_chat_suffix(&self, messages: &[ChatMessage], suffix: &str) -> Result<Vec<u32>> {
+        let mut text = self.render_chat(messages);
+        text.push_str(suffix);
         let enc = self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("encode: {e}"))?;
         let mut ids = vec![self.bos];
         ids.extend_from_slice(enc.get_ids());
