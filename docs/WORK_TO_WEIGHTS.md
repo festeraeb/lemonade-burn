@@ -547,3 +547,56 @@ old code, passes on the new). The rerun above used the fixed host.
   of the nvidia-nccl-cu12 2.21.5 wheel's library). With a CUDA 13 NCCL the first copy hangs (cubecl waits on
   a receive whose send failed); the load log says which NCCL was loaded only through `NCCL_DEBUG=INFO`.
   A start-up self-test copy with a timeout would turn that hang into a refusal: not built.
+
+## X6: prefill on Turing, decode on P100 (and the 1G vs 25G hand-off)
+
+Operator, 2026-11-11: "test what you can with the current setup and measure and account for the 1G vs 25G pass-off".
+Gates and expectations written 2026-11-11 ~00:20Z (node clocks), **before** any X6 run. Results:
+`/mnt/fast/w2w/results/x6/*.jsonl` (append-only). Every number below is tagged [measured] or [estimate].
+
+Layouts (operator's idea, not final):
+* **A, prefill on board**: c4 = 4x P100 + RTX 2060 12 GB. The 2060 prefills, a P100 decodes, the state goes card ->
+  host RAM -> card inside the box (no Turing card is P2P with anything). The 2060 is not on c4 today: A is an
+  **estimate** built from the T10's prefill (scaled to the 2060 by spec, stated) and c4's measured H2D/D2H.
+* **B, prefill a hop away**: c1's T10 prefills, a c4 P100 decodes, the state crosses the c1-c4 25G link (TCP today,
+  RoCE once c1's NIC firmware allows). c1 is off limits for this run: B is an **estimate** built from the T10's prefill
+  measured on c2 and the 25G link measured t440 <-> c4 (same NIC model, same DAC, same MTU).
+* **C, today**: T10 on c2 prefills, a c4 P100 decodes, the state crosses 1 GbE. Measured as far as one borrowed seat
+  allows; the hand-off file is really saved on c2, moved, and restored into a P100 server on c4.
+* **P100-only** (the baseline): prefill and decode on the same c4 P100.
+
+Engine: the fleet's shared llama.cpp build (2026-10-27, sm60/61/75/86), scraper off (no NAUTIBURN_SCRAPE_DIR, no
+/etc/nautiburn config on c2/c4). `llama-bench` is not in that build, so prefill and decode are timed by
+`llama-server`'s own per-request timings (`prompt_ms`, `predicted_ms`) with `cache_prompt: false`, the prompt given as
+token ids of exactly N tokens (real text, repeated), 3 repeats per point, median reported. Model LFM2.5-24B-A2B Q4_0
+(13.6 GB), all layers resident (`-ngl 99`), one card per process, UUID pinned, NUMA-bound to the card's node.
+
+What is measured:
+1. Prefill tok/s at N = 512, 2k, 8k, 16k, 32k on the T10 (c2) and on c4-AF, flash attention on and off on each.
+   Decode tok/s for 128 tokens after each prompt (so decode at depth N, not only at depth 0).
+   lemonade-burn's prefill on c4-AF at the same N where its context allows (the gap to llama.cpp).
+2. Hand-off bytes: the slot state file (`POST /slots/0?action=save`) after each N, f16 KV (and q8_0 KV for one N),
+   checked against arithmetic from the model's metadata (attention layers x KV heads x head dim x dtype x N, plus the
+   short-conv state of the conv layers, which does not grow with N).
+3. Transfer time for those bytes on an open connection, sender memory -> receiver memory, 10 repeats: t440 <-> c2
+   1 GbE TCP, c2 <-> c4 1 GbE TCP (layout C's real path), t440 <-> c4 25G TCP, t440 <-> c4 RoCE (ib_write_bw at the
+   same message size). In-box (layout A stand-in): c4 pinned and pageable H2D/D2H on the NIC-side x16 cards, and
+   P100 <-> P100 D2D for reference. Restore time (`action=restore`) into the P100 server.
+4. TTFT per layout = prefill(prefill card) + save + transfer + restore; then decode on the P100. Compared with P100-only.
+
+Gates (written before the run):
+* **X6 gate (plan)**: at N = 8k, (TTFT + 128 decode tokens) of the split layout beats P100-only by **>= 1.2x** end to
+  end. Judged per layout; A and B are judged on estimates and say so.
+* **Bytes gate**: measured slot-file size agrees with the metadata arithmetic within 5 % (plus a fixed header).
+* **Hand-off correctness**: a state saved on the T10 and restored on the P100 continues the same prompt coherently
+  (the first 32 greedy tokens after restore are compared with P100-only's; an exact match is not required across
+  card types, a coherent continuation is, and the match length is reported).
+
+Expectations, written before the run (to be checked, not assumed):
+* LFM2.5-24B-A2B has 40 blocks of which only a minority are attention (GQA, 8 KV heads), the rest short-conv; so the
+  KV is roughly 10x smaller than a dense 24B's and the hand-off is MB to tens of MB even at 16k, not GB.
+* At those sizes 25G (any transport) costs single-digit ms, so A vs B differ by little; 1 GbE costs ~8-9 ms per 1 MB,
+  so C pays tens to hundreds of ms at 8k-16k.
+* The T10 (TU102, 40 TU SMs, tensor cores, 320 GB/s) should prefill Q4_0 faster than a P100 (no tensor cores, no DP4A,
+  732 GB/s), by maybe 1.5-3x; the P100 decodes faster (bandwidth). Whether the split wins at 8k depends on that prefill
+  ratio, since the hand-off is small: the gate is about the T10's prefill speed, not the wire.
