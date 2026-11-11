@@ -26,6 +26,12 @@ mod cubecl_handle {
 pub struct Route {
     pub experts: Vec<usize>,
     pub weights: Vec<f32>,
+    /// Raw router logit of every expert (`x W_r^T`, before the sigmoid and the bias), indexed by
+    /// expert id. Empty when the route came from a device that only reads back the top-k.
+    pub logits: Vec<f32>,
+    /// Runners-up: the experts ranked `k+1 ..= 2k` by the score the router selects on
+    /// (`sigmoid(logit) + bias`), best first. Empty when `logits` is.
+    pub near: Vec<usize>,
 }
 
 /// Sigmoid router with selection bias and top-k weight normalization (see module doc).
@@ -33,22 +39,21 @@ pub struct Route {
 pub fn route_sigmoid(router: &[f32], bias: &[f32], x: &[f32], n_expert: usize, k: usize) -> Route {
     let n_embd = x.len();
     debug_assert_eq!(router.len(), n_expert * n_embd);
-    let probs: Vec<f32> = (0..n_expert)
-        .map(|e| {
-            let logit: f32 = router[e * n_embd..(e + 1) * n_embd].iter().zip(x).map(|(a, b)| a * b).sum();
-            1.0 / (1.0 + (-logit).exp())
-        })
-        .collect();
+    // the logits are kept for the scraper (scores, runners-up); the arithmetic is unchanged
+    let logits: Vec<f32> =
+        (0..n_expert).map(|e| router[e * n_embd..(e + 1) * n_embd].iter().zip(x).map(|(a, b)| a * b).sum()).collect();
+    let probs: Vec<f32> = logits.iter().map(|&logit| 1.0 / (1.0 + (-logit).exp())).collect();
     let mut order: Vec<usize> = (0..n_expert).collect();
     // stable sort, descending by biased score; ties keep the lower expert id first
     order.sort_by(|&a, &b| (probs[b] + bias[b]).partial_cmp(&(probs[a] + bias[a])).unwrap_or(std::cmp::Ordering::Equal));
     let experts: Vec<usize> = order[..k].to_vec();
+    let near: Vec<usize> = order[k..(2 * k).min(n_expert)].to_vec();
     let mut weights: Vec<f32> = experts.iter().map(|&e| probs[e]).collect();
     let sum: f32 = weights.iter().sum::<f32>().max(6.103515625e-5);
     for w in &mut weights {
         *w /= sum;
     }
-    Route { experts, weights }
+    Route { experts, weights, logits, near }
 }
 
 /// Where an expert's weights live for execution.
@@ -809,17 +814,39 @@ pub fn read_scrape_dir(dir: &std::path::Path) -> std::io::Result<Vec<Scrape>> {
     Ok(out)
 }
 
-// ---- NautiBurn routing scrape (schema_version 1) ----
+// ---- NautiBurn routing scrape (schema_version 2; 1 when no v2 field is present) ----
+//
+// v2 adds optional per-row fields, so a v1 reader that ignores unknown fields still reads the
+// ids, and a v1 file still parses here:
+//   weights      each fired expert's weight in the expert sum (normalised), aligned with expert_ids
+//   scores       each fired expert's raw router logit (before sigmoid and bias)
+//   near_ids     runners-up, ranks k+1..2k by the selection score (sigmoid(logit) + bias)
+//   near_scores  their raw router logits
+// and file-level `score_kind` ("logit"), `gating` ("sigmoid") and `near_k`.
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Activation {
     pub layer: u32,
     pub token_pos: u32,
     pub expert_ids: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scores: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_ids: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_scores: Option<Vec<f32>>,
+}
+
+impl Activation {
+    fn has_v2(&self) -> bool {
+        self.weights.is_some() || self.scores.is_some() || self.near_ids.is_some()
+    }
 }
 
 /// One scrape file, the format NautiBurn's consumer ingests
-/// (`run-<epoch>-<seq>.json`, `schema_version: 1`).
+/// (`run-<epoch>-<seq>.json`, `schema_version` 1 or 2).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Scrape {
     pub schema_version: u32,
@@ -830,6 +857,12 @@ pub struct Scrape {
     pub phase: String,
     pub n_tokens: u32,
     pub dtype: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gating: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_k: Option<u32>,
     pub token_ids: Vec<u32>,
     pub activations: Vec<Activation>,
 }
@@ -844,6 +877,9 @@ pub struct Scraper {
     class_id: Mutex<String>,
     seq: AtomicU64,
     pending: Mutex<Vec<Activation>>,
+    /// 2 (default): ids plus weights, logit scores and runners-up; 1: ids only, for an ingest
+    /// that does not read v2 yet (`NAUTIBURN_SCRAPE_SCHEMA=1`).
+    schema: std::sync::atomic::AtomicU32,
 }
 
 impl Scraper {
@@ -856,7 +892,24 @@ impl Scraper {
     }
 
     pub fn new(dir: Option<PathBuf>, model_id: String, class_id: String) -> Self {
-        Self { dir: Mutex::new(dir), model_id: Mutex::new(model_id), class_id: Mutex::new(class_id), seq: AtomicU64::new(0), pending: Mutex::new(Vec::new()) }
+        let schema = if std::env::var("NAUTIBURN_SCRAPE_SCHEMA").is_ok_and(|v| v.trim() == "1") { 1 } else { 2 };
+        Self {
+            dir: Mutex::new(dir),
+            model_id: Mutex::new(model_id),
+            class_id: Mutex::new(class_id),
+            seq: AtomicU64::new(0),
+            pending: Mutex::new(Vec::new()),
+            schema: std::sync::atomic::AtomicU32::new(schema),
+        }
+    }
+
+    /// Scrape schema written: 1 (ids only) or 2.
+    pub fn schema(&self) -> u32 {
+        self.schema.load(Ordering::Relaxed)
+    }
+
+    pub fn set_schema(&self, v: u32) {
+        self.schema.store(if v == 1 { 1 } else { 2 }, Ordering::Relaxed);
     }
 
     pub fn enabled(&self) -> bool {
@@ -893,13 +946,28 @@ impl Scraper {
         if !self.enabled() {
             return;
         }
+        let v2 = self.schema() >= 2;
         let mut p = self.pending.lock().unwrap();
         for (i, r) in routes.iter().enumerate() {
-            p.push(Activation {
+            let mut a = Activation {
                 layer: layer as u32,
                 token_pos: (pos0 + i) as u32,
                 expert_ids: r.experts.iter().map(|&e| e as u32).collect(),
-            });
+                ..Default::default()
+            };
+            if v2 {
+                if r.weights.len() == r.experts.len() {
+                    a.weights = Some(r.weights.clone());
+                }
+                if !r.logits.is_empty() && r.experts.iter().chain(&r.near).all(|&e| e < r.logits.len()) {
+                    a.scores = Some(r.experts.iter().map(|&e| r.logits[e]).collect());
+                    if !r.near.is_empty() {
+                        a.near_ids = Some(r.near.iter().map(|&e| e as u32).collect());
+                        a.near_scores = Some(r.near.iter().map(|&e| r.logits[e]).collect());
+                    }
+                }
+            }
+            p.push(a);
         }
     }
 
@@ -917,8 +985,13 @@ impl Scraper {
         }
         let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let v2 = acts.iter().any(Activation::has_v2);
+        let near_k = acts.iter().filter_map(|a| a.near_ids.as_ref().map(|n| n.len() as u32)).max();
         let s = Scrape {
-            schema_version: 1,
+            schema_version: if v2 { 2 } else { 1 },
+            score_kind: v2.then(|| "logit".to_string()),
+            gating: v2.then(|| "sigmoid".to_string()),
+            near_k,
             model_id: self.model_id(),
             request_id: format!("lb-lfm2-{epoch}-{seq}"),
             class_id: self.class_id(),
@@ -956,6 +1029,46 @@ mod tests {
         assert!((r.weights[0] - p2 / sum).abs() < 1e-6);
         assert!((r.weights[1] - p1 / sum).abs() < 1e-6);
         assert!((r.weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        // raw logits kept for the scraper; the runner-up is ranked by the biased score too
+        assert_eq!(r.logits, vec![1.0, 2.0, -5.0]);
+        assert_eq!(r.near, vec![0]);
+    }
+
+    #[test]
+    fn scrape_v2_carries_weights_scores_and_runners_up_and_v1_still_parses() {
+        let dir = std::env::temp_dir().join(format!("lb-scrape-v2-test-{}", std::process::id()));
+        let s = Scraper::new(Some(dir.clone()), "m".into(), "c".into());
+        s.set_schema(2);
+        // 6 experts, k = 2: logits chosen so the plain logit order differs from the biased one
+        let router = [0.5f32, 3.0, -1.0, 2.0, 1.0, -2.0];
+        let bias = [0.0f32, 0.0, 0.0, 0.0, 0.0, 2.0];
+        let r = route_sigmoid(&router, &bias, &[1.0], 6, 2);
+        assert_eq!(r.experts, vec![5, 1]); // bias pulls expert 5 in
+        assert_eq!(r.near, vec![3, 4]);
+        s.record(7, 0, std::slice::from_ref(&r));
+        let path = s.flush("decode", &[42]).unwrap().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let sc: Scrape = serde_json::from_str(&text).unwrap();
+        assert_eq!(sc.schema_version, 2);
+        assert_eq!(sc.score_kind.as_deref(), Some("logit"));
+        assert_eq!(sc.near_k, Some(2));
+        let a = &sc.activations[0];
+        assert_eq!(a.expert_ids, vec![5, 1]);
+        assert_eq!(a.scores.as_deref(), Some(&[-2.0f32, 3.0][..]));
+        assert_eq!(a.near_ids.as_deref(), Some(&[3u32, 4][..]));
+        assert_eq!(a.near_scores.as_deref(), Some(&[2.0f32, 1.0][..]));
+        assert_eq!(a.weights.as_deref(), Some(&r.weights[..]));
+        // schema 1: the same route writes a plain v1 file
+        s.set_schema(1);
+        s.record(7, 0, std::slice::from_ref(&r));
+        let p1 = s.flush("decode", &[42]).unwrap().unwrap();
+        let t1 = std::fs::read_to_string(&p1).unwrap();
+        assert!(t1.contains("\"schema_version\":1") && !t1.contains("near_ids") && !t1.contains("score_kind"));
+        // a v1 file as older engines wrote it parses into the v2 struct
+        let v1 = r#"{"schema_version":1,"model_id":"m","request_id":"r","class_id":"c","source":"scrape","phase":"decode","n_tokens":1,"dtype":"gguf","token_ids":[],"activations":[{"layer":2,"token_pos":0,"expert_ids":[1,2]}]}"#;
+        let old: Scrape = serde_json::from_str(v1).unwrap();
+        assert!(old.activations[0].scores.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1007,15 +1120,18 @@ mod tests {
     fn scrape_round_trips_through_histogram() {
         let s = Scraper::new(None, "m".into(), "c".into());
         // recording is off with no directory: nothing pends, nothing costs
-        s.record(3, 10, &[Route { experts: vec![1, 2], weights: vec![0.5, 0.5] }]);
+        s.record(3, 10, &[Route { experts: vec![1, 2], weights: vec![0.5, 0.5], logits: vec![], near: vec![] }]);
         assert!(s.take().is_empty());
         s.set_dir(Some(std::path::PathBuf::from("/nonexistent-for-this-test")));
         assert!(s.enabled());
-        s.record(3, 10, &[Route { experts: vec![1, 2], weights: vec![0.5, 0.5] }]);
+        s.record(3, 10, &[Route { experts: vec![1, 2], weights: vec![0.5, 0.5], logits: vec![], near: vec![] }]);
         let acts = s.take();
         assert_eq!(acts[0].token_pos, 10);
         let sc = Scrape {
             schema_version: 1,
+            score_kind: None,
+            gating: None,
+            near_k: None,
             model_id: "m".into(),
             request_id: "r".into(),
             class_id: "c".into(),

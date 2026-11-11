@@ -663,7 +663,13 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                 host.next().expect("peeked").1
             } else {
                 let b = mi * k_used;
-                Route { experts: (0..k_used).map(|i| routes[2 * (b + i)] as usize).collect(), weights: weights[b..b + k_used].to_vec() }
+                // the device reads back the top-k only: no logits, so no scores or runners-up
+                Route {
+                    experts: (0..k_used).map(|i| routes[2 * (b + i)] as usize).collect(),
+                    weights: weights[b..b + k_used].to_vec(),
+                    logits: Vec::new(),
+                    near: Vec::new(),
+                }
             };
             m.scraper.record(li, pos0, std::slice::from_ref(&route));
         }

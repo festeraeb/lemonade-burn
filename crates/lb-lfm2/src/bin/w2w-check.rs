@@ -255,6 +255,12 @@ fn main() -> Result<()> {
     let ref_text = text(&reference.greedy_tokens);
     let ref_sha = sha16(&ref_text);
     let ref_local_calls = model.stats.cpu_calls.load(std::sync::atomic::Ordering::Relaxed);
+    // with NAUTIBURN_SCRAPE_DIR set, the reference arm's routes go to one scrape file (the
+    // scraper records in every arm; only the reference is written)
+    let ref_ids: Vec<u32> = greedy.iter().chain(&reference.greedy_tokens).copied().collect();
+    if let Some(p) = model.scraper.flush("decode", &ref_ids)? {
+        eprintln!("w2w-check: reference routes scraped to {}", p.display());
+    }
     eprintln!(
         "w2w-check: reference (one process): prefill {:.1}s, decode {:.1}s ({} positions), greedy {:.1}s ({} tokens) sha {ref_sha}{} {ref_text:?}",
         reference.secs[0],
