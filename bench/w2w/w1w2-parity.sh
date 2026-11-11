@@ -13,7 +13,7 @@ W=${W:-/mnt/fast/w2w}; BIN=${BIN:-$W/target/release}; RUN=$W/run; LOG=$W/logs
 MODEL=${MODEL:-/mnt/raid0/models/lfm25/LFM2.5-24B-A2B-QAD-Q4_0.gguf}
 TOK=${TOK:-/mnt/raid0/models/lfm25/tokenizer.json}
 OUT=${OUT:-$W/results/w2w-parity.jsonl}
-RDMA_IP=${RDMA_IP:-10.0.10.61}; P=${PORT_BASE:-47410}
+RDMA_IP=${RDMA_IP:?set RDMA_IP to the host address}; P=${PORT_BASE:-47410}
 NICE=${NICE:-10}
 mkdir -p "$RUN" "$LOG"
 rm -f "$RUN"/*.sock "$RUN"/*.pid

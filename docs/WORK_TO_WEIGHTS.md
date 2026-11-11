@@ -152,7 +152,7 @@ c4's page cache beside its serving seats).
 
   ```json
   { "version": 1,
-    "hosts": { "a": { "addr": "rdma://10.0.10.204:7411", "wait": "spin:200", "deadline_ms": 50 },
+    "hosts": { "a": { "addr": "rdma://c4-25g:7411", "wait": "spin:200", "deadline_ms": 50 },
                "b": { "addr": "unix:///run/w2w-b.sock" } },
     "default": "local",
     "layers": { "*": "a", "2-9": "local", "12": { "0-31": "a", "32-63": "b", "7": "local" } } }
@@ -283,7 +283,7 @@ A host on a named card (UUID pin through the environment, as the engine benches 
 CUDA_VISIBLE_DEVICES=GPU-<uuid> LB_CUDA_DEVICE=0 \
   lb-expert-host-cuda-rdma --model /mnt/t440/raid0/models/lfm25/LFM2.5-24B-A2B-QAD-Q4_0.gguf \
   --placement /mnt/t440/fast/w2w/run/w3a.json --name h1 --backend gpu \
-  --listen unix:///tmp/w2w-h1.sock --listen rdma://10.0.10.204:7411 --wait spin:200
+  --listen unix:///tmp/w2w-h1.sock --listen rdma://c4-25g:7411 --wait spin:200
 ```
 
 The trunk on a named card, no experts of its own (dense weights and head only):
@@ -337,8 +337,8 @@ the manifest was not touched by this run). Cards by UUID only (`CUDA_DEVICE_ORDE
 `CUDA_VISIBLE_DEVICES=GPU-...`): trunk **D8** (x16, NUMA 1, NIC node), first host **AF** (x16, NUMA 1),
 then 86 (x8, NUMA 1), 3B and 3C (x8, NUMA 0). The GGUF's page cache is moved to NUMA 1 first
 (`bench/w2w/numa-load.sh`) and every process is bound to its card's node. Model: c4's local copy
-`/home/cesarops/lb-e2/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf` (same 13,578,190,880 bytes as
-`/mnt/t440/raid0/models/lfm25/`; the E2 runs used it), prompts `/home/cesarops/lb-e2/prompts.jsonl`
+`$HOME/lb-e2/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf` (same 13,578,190,880 bytes as
+`/mnt/t440/raid0/models/lfm25/`; the E2 runs used it), prompts `$HOME/lb-e2/prompts.jsonl`
 (5 prompts, 288 decode tokens a round, the E2 set). Driver `bench/w2w/w3-session.sh`, client `w2w-drive`.
 
 **P. On-card parity (before any timing).** GPU host on AF holding every expert, device trunk on D8 with
@@ -502,7 +502,7 @@ placement (in-box cards and socket hosts together) is refused: not built.
 
 Trunk on D8, layers 2-35 on a v2 GPU host on AF (unix socket), **layers 36-39 on a CPU-backend host on t440**
 (`bench/w2w/w3c-t440-host.sh`, 8 threads, nice 5, t440 load average about 27 from other work; t440's P100 not
-used), reached over t440's 25G port 10.0.10.61, by RoCE v2 (`spin:200`) and by TCP (`block`). Labels
+used), reached over the 25G link, by RoCE v2 (`spin:200`) and by TCP (`block`). Labels
 `w3c2-*`, 2 rounds x 5 per arm, interleaved. Same model file on both nodes (fingerprint
 8f5e6596b72284a3eeec808f0c5656c2), CPU arithmetic fingerprint 3485a00c79570e6d.
 

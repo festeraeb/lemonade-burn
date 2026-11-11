@@ -1,8 +1,8 @@
 # Environment for engine E3 (look-ahead) runs. Shares the E2 working copy (model, libs, scrapes) on c4;
 # only the binary is ours. The card is named by UUID; index, bus and NUMA node are read at run time.
-export BASE=${BASE:-/home/cesarops/lb-e2}
-export E3BIN=${E3BIN:-/home/cesarops/lb-e3/bin/lemonade-burn-server-e3}
-export CARD_UUID=${CARD_UUID:-GPU-fd9b03e5-aed9-cbca-a57b-efc90d61addd}
+export BASE=${BASE:-$HOME/lb-e2}
+export E3BIN=${E3BIN:-$HOME/lb-e3/bin/lemonade-burn-server-e3}
+export CARD_UUID=${CARD_UUID:?set CARD_UUID to the card UUID}
 export CUDA_VISIBLE_DEVICES=$CARD_UUID LB_CUDA_DEVICE=0
 export LD_LIBRARY_PATH=$BASE/lib:${LD_LIBRARY_PATH:-} CUDA_PATH=$BASE/cuda-path
 export LB_MODEL=$BASE/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf

@@ -4,7 +4,7 @@
 # usage (on t440): w3c-t440-host.sh start|stop
 set -u
 W=/mnt/fast/w2w; MODEL=/mnt/raid0/models/lfm25/LFM2.5-24B-A2B-QAD-Q4_0.gguf
-IP=${IP:-10.0.10.61}; LAYERS=${LAYERS:-36-39}; LIFE=${LIFE:-3600}; PIDF=$W/run/w3c-t440-host.pid
+IP=${IP:?set IP to the host address}; LAYERS=${LAYERS:-36-39}; LIFE=${LIFE:-3600}; PIDF=$W/run/w3c-t440-host.pid
 case ${1:-start} in
   start)
     [ -f "$PIDF" ] && kill -0 "$(cat $PIDF)" 2>/dev/null && { echo "already running"; exit 0; }

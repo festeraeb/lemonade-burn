@@ -4,8 +4,8 @@
 //!
 //! ```json
 //! { "version": 1,
-//!   "hosts": { "a": { "addr": "tcp://10.0.10.204:7411", "deadline_ms": 250 },
-//!              "b": { "addr": "rdma://10.0.10.61:7412", "wait": "busy" } },
+//!   "hosts": { "a": { "addr": "tcp://c4-25g:7411", "deadline_ms": 250 },
+//!              "b": { "addr": "rdma://t440-25g:7412", "wait": "busy" } },
 //!   "default": "local",
 //!   "layers": { "*": "a",
 //!               "2-9": "local",

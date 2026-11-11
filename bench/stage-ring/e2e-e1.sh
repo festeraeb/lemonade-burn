@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Engine step E1 (dynamic SLRU expert cache) session on cesarops2: one engine start, warmup, every
+# Engine step E1 (dynamic SLRU expert cache) session on c2: one engine start, warmup, every
 # prompt PASSES times (default 1), one JSON row per completion (with device memory after it) to
 # $OUT/runs.jsonl, one per session to $OUT/sessions.jsonl. Idempotent: finished sessions are skipped.
 # usage: e2e-e1.sh <arm> <round>

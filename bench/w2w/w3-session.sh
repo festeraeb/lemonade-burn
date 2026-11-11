@@ -11,12 +11,12 @@
 #   w3c-rdma / w3c-tcp   as w3a, but layers 36-39 on a CPU host on t440 (started separately): a wire test
 set -u
 ARM=$1; ROUND=$2
-W=${W:-/mnt/t440/fast/w2w}; BASE=${BASE:-/home/cesarops/lb-e2}; BIN=$W/bin
+W=${W:-/mnt/t440/fast/w2w}; BASE=${BASE:-$HOME/lb-e2}; BIN=$W/bin
 OUT=${OUT:-$W/results/w3}; LOGS=${LOGS:-$W/logs/w3}; PASSES=${PASSES:-1}; TW=${TW:-spin:200}
 MODEL=$BASE/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf
 export LD_LIBRARY_PATH=$BASE/lib:${LD_LIBRARY_PATH:-} CUDA_PATH=$BASE/cuda-path CUDA_DEVICE_ORDER=PCI_BUS_ID
 unset NAUTIBURN_SCRAPE_DIR
-declare -A U=( [3B]=GPU-72784f3e-9536-8d2b-cc49-3081a131de54 [3C]=GPU-c012cc70-3f06-1718-84e2-073aa275f0af [86]=GPU-0c4b4f5d-5f54-46db-be25-f6ffdf75ac79 [AF]=GPU-fd9b03e5-aed9-cbca-a57b-efc90d61addd [D8]=GPU-2d66f961-cba7-717f-1bd7-a04fff1fc8ab )
+declare -A U=( [3B]=${UUID_C4_3B:?card UUID} [3C]=${UUID_P100_3C:?card UUID} [86]=${UUID_C4_86:?card UUID} [AF]=${UUID_C4_AF:?card UUID} [D8]=${UUID_C4_D8:?card UUID} )
 TRUNK=${TRUNK:-D8}
 node_of() { local b; b=$(nvidia-smi --id="${U[$1]}" --query-gpu=pci.bus_id --format=csv,noheader | tr 'A-Z' 'a-z' | sed 's/^0000\(....:\)/\1/'); cat /sys/bus/pci/devices/$b/numa_node; }
 used_of() { nvidia-smi --id="${U[$1]}" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' '; }
@@ -61,8 +61,8 @@ for h in "${HOSTS[@]}"; do
   LJ="$LJ\"$layers\":\"$name\","
 done
 case $ARM in
-  w3c-rdma) HJ="$HJ\"hx\":{\"addr\":\"rdma://10.0.10.61:47421\",\"wait\":\"spin:200\",\"deadline_ms\":30000},"; LJ="$LJ\"36-39\":\"hx\",";;
-  w3c-tcp)  HJ="$HJ\"hx\":{\"addr\":\"tcp://10.0.10.61:47420\",\"wait\":\"block\",\"deadline_ms\":30000},"; LJ="$LJ\"36-39\":\"hx\",";;
+  w3c-rdma) HJ="$HJ\"hx\":{\"addr\":\"rdma://${T440_25G:?host address}:47421\",\"wait\":\"spin:200\",\"deadline_ms\":30000},"; LJ="$LJ\"36-39\":\"hx\",";;
+  w3c-tcp)  HJ="$HJ\"hx\":{\"addr\":\"tcp://${T440_25G:?host address}:47420\",\"wait\":\"block\",\"deadline_ms\":30000},"; LJ="$LJ\"36-39\":\"hx\",";;
 esac
 VIS=${U[$TRUNK]}; i=1
 for h in "${INBOX[@]}"; do

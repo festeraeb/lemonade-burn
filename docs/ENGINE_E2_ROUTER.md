@@ -40,8 +40,8 @@ Interleaved rounds, 5 per arm. e1 = the E1 binary (commit 1969bb7), e2 = this st
 guess, c = llama.cpp e14a779 `-cmoe --moe-cache-mib 5120` (AVX2 build). Hit rate and misses are decode-only
 after the warmup; llama.cpp's are its own counters (whole process, batches of <= 8 tokens).
 
-**Card, probed** (`probe/card.txt`, `probe/stage_bench.jsonl`): cesarops4om Tesla P100, UUID
-GPU-2d66f961-cba7-717f-1bd7-a04fff1fc8ab, nvidia-smi index 4, D8:00.0, Gen3 x16 at both ends, NUMA node 1, Xeon
+**Card, probed** (`probe/card.txt`, `probe/stage_bench.jsonl`): c4 Tesla P100, UUID
+<card UUID>, nvidia-smi index 4, D8:00.0, Gen3 x16 at both ends, NUMA node 1, Xeon
 Gold 6148, measured H2D 8.4-9.7 GB/s (0.55-0.63 ms per 5.31 MB expert). Page cache and process bound to
 node 1: `numa_maps` shows the whole GGUF on N1 in every session (`logs/numa-*.txt`, `logs/numastat-*.txt`).
 The c4 host is not the c2 host: c2's E1 numbers are not comparable and are not used here.

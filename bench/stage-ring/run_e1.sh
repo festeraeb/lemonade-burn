@@ -3,8 +3,8 @@
 # budget sweep for the sha check. Resumable: finished sessions are skipped. usage: CARD=2060|p100 run_e1.sh
 cd /mnt/ssd/lb-stage
 case ${CARD:?CARD} in
-  2060) export CARD_UUID=GPU-de3ce5bc-1a27-10e4-be70-97993d287aed ;;
-  p100) export CARD_UUID=GPU-c012cc70-3f06-1718-84e2-073aa275f0af ;;
+  2060) export CARD_UUID=${UUID_RTX2060S:?card UUID} ;;
+  p100) export CARD_UUID=${UUID_P100_3C:?card UUID} ;;
 esac
 export OUT=/mnt/t440/fast/lb-stage/2026-11-08/e1-cache/$CARD
 mkdir -p $OUT; echo $$ > $OUT/run_e1.pid
