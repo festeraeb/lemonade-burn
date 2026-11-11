@@ -897,10 +897,8 @@ What this says, plainly:
   c4, NUMA-bound): ~190x. A miss could DMA 4.25 bpw instead of 4.5 and re-encode on arrival for ~0.3 ms an expert.
 * **Not wired:** the expert cache / staging slots (`ExpertSlots`, the E1 cache, the miss path) still take Q4_0
   bytes only; the device kernel is not yet called by the miss path, so transcoded models run **all-resident**
-  (load-time host transcode). i-quants other than IQ4_NL/IQ4_XS (IQ3_S, IQ2_S, IQ1_S, ... which carry the IQ3_M /
-  IQ2_M / IQ1_S mixes) are **not decoded** by lb-gguf: they need the formats' lattice tables (512-2048 entries), which
-  exist only as data inside llama.cpp / gguf-py; transcribing them is a clean-room call for the operator. Their
-  quality and llama.cpp speed are in X7q.
+  (load-time host transcode). The lattice i-quants (IQ3_S, IQ2_S, IQ1_S, ...) were added after the operator's OK
+  to take their tables from llama.cpp: see "X7 follow-up" below.
 
 ### X7q results: what each quant costs, per card (2026-11-11 07:35-09:30Z) [measured]
 
@@ -1010,10 +1008,43 @@ IQ1_S is not usable on this model. So **hardware matching is a must** (pick the 
 * lemonade-burn speed on sm_61 end to end (the P106 has 6 GB; the model needs ~14 GB resident): kernel timing only.
 * The device transcode is not called by the load or miss path; the expert cache / staging slots take Q4_0 only, so
   transcoded models run all-resident. No spill config with a transcoded model was run.
-* IQ3_S / IQ2_S / IQ1_S decoding in lb-gguf (needs the formats' lattice tables; clean-room call for the operator), so
-  lemonade-burn ran only the IQ4_XS file; IQ3_M / IQ2_M / IQ1_S are llama.cpp-only rows.
-* No Q8_0 GPU kernel in lemonade-burn (the forge seed `q8_0_matvec_gpu` is still a stub).
+* (Done in the follow-up: lattice i-quant decoding, lemonade-burn rows for IQ3_M / IQ2_M / IQ1_S, a Q8_0 GPU kernel.)
 * Q8_0 decode speed (25.5 GB fits no single card here); BF16 KLD base (48 GB).
 * held-out-v1 is n = 40 gated: differences under ~4 items are noise.
 * c4-D8 was in use by other agents (strata-poly, then engine-bench's Vulkan llama-server) for the whole run: every
   c4 number is from c4-AF (plus one idle-c4-86 minute for the device transcode test).
+
+### X7 follow-up (operator OK 2026-11-11): lattice i-quants, lemonade-burn rows for IQ3_M / IQ2_M / IQ1_S, Q8_0 kernel [measured]
+
+* **Tables**: the i-quant lattice tables were copied as data from llama.cpp (`ggml-common.h` @ e14a779, MIT) into
+  `crates/lb-gguf/src/iq_grids.rs` (generated, header names the source; notice in `THIRD_PARTY.md`). The decoders for
+  IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M are our code (`types.rs`).
+* **Bit-exact vs llama.cpp** (`results/iq-bitexact.jsonl`): `bench/x7/iqref.c` links llama.cpp's ggml-base and dumps its
+  own `to_float` of the same bytes; `examples/iq_check.rs` compares bits. **0 of 12.6 M values differ**, on real blocks of
+  our IQ3_M / IQ2_M / IQ1_S files (IQ3_S, IQ2_S, IQ1_S, IQ2_XXS, and the Q2_K / Q4_K / Q5_K tensors in the mixes) and on
+  BF16 rows quantised by ggml to every i-quant (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_XS, IQ4_NL).
+  Every such type now transcodes on residency.
+
+The stored-format files run through lemonade-burn (transcoded to Q4_0 at load, all-resident, c4-AF P100, f32 math,
+greedy 32 tokens x 3), next to llama.cpp running them natively (X7q). KLD is llama-perplexity's, vs Q8_0, on the X7q
+text, of exactly the weights each path holds (`examples/transcode_gguf.rs` writes the engine's transcoded weights):
+
+| stored file | VRAM native / transcoded | KLD native | KLD transcoded to Q4_0 | llama.cpp native tok/s | lemonade-burn tok/s | held-out llama.cpp native / lemonade-burn |
+|---|---|---|---|---|---|---|
+| IQ4_XS | 12.8 / 13.6 GB | 0.120 | 0.208 (plain; 0.235 search) | 90.5 | 88.0 | 31 / 35 (search encoder) |
+| IQ3_M | 10.5 / 13.6 GB | 0.186 | **0.445** | 75.7 | 87.6 | 31 / **21** |
+| IQ2_M | 7.9 / 13.7 GB | 0.359 | 0.438 | 80.7 | 93.5 | 25 / 28 |
+| IQ1_S | 4.9 / 13.7 GB | 1.801 | 1.959 | 114.3 | 92.8 | 9 / 12 (31 of 60 answers degenerate) |
+
+* lemonade-burn on a transcoded IQ3_M / IQ2_M decodes 1.16x llama.cpp's native kernels on the same P100 - **at 1.3-1.7x
+  the VRAM**, so the plan's equal-VRAM gate still cannot pass, and the quality falls: IQ3_M -> Q4_0 more than doubles the
+  KLD (0.186 -> 0.445, worse than IQ2_M native) and loses 10 held-out items. The IQ2_M / IQ1_S rows decode ~6 % faster
+  than the IQ3_M / Q4_0 ones because their Q5_K head is transcoded to Q4_0 (the engine has a Q6_K head kernel only).
+  IQ1_S remains unusable on any path.
+* **Q8_0 GPU kernel** (`q8_0_matvec_rows_kernel`, `GpuQ8Mat`; the old forge seed `q8_0_matvec_gpu` now passes its tests
+  on a c4 P100, max |gpu-cpu| 2.9e-4 at 2048x2048). Same weights as Q4_0 vs Q8_0 (`rows_bench LB_BENCH_Q8=1`, c4 P100):
+  75 MB matrix 0.334 ms (427 GB/s, 71 % of the P100's read bandwidth) vs Q4_0 0.261 ms (290 GB/s): 1.28x the time for
+  1.89x the bytes; an expert-sized matrix ~0.026 ms in both (launch-bound). With IQ4_XS -> Q8_0 keeping the native
+  quality (KLD 0.121 vs 0.120), **a Q8_0 expert costs VRAM, not time, in this engine**. Not run end to end: Q8_0 is not
+  in the expert layer / device decode yet, and the all-Q8_0 model (25 GB) fits no single card here; the use is hot experts
+  on a card with spare VRAM, compact formats elsewhere.
