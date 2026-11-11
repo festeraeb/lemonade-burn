@@ -155,8 +155,8 @@ impl DenseStore {
     /// Q4_0 matrices instead of all 106.)
     fn saving_per_byte(ty: lb_gguf::GgmlType) -> f64 {
         match ty {
-            lb_gguf::GgmlType::Q4_0 => 0.70,
             lb_gguf::GgmlType::Q6K => 0.16,
+            t if as_q4(t) => 0.70,
             _ => 0.0,
         }
     }
@@ -191,7 +191,7 @@ impl DenseStore {
             if self.conv.contains_key(&in_proj.start) {
                 continue;
             }
-            if in_proj.ty != lb_gguf::GgmlType::Q4_0 || out_proj.ty != lb_gguf::GgmlType::Q4_0 {
+            if !as_q4(in_proj.ty) || !as_q4(out_proj.ty) {
                 continue;
             }
             let Operator::Conv { conv, .. } = &w.layers[l].op else { continue };
@@ -225,7 +225,8 @@ impl DenseStore {
                 continue;
             }
             match m.ty {
-                lb_gguf::GgmlType::Q4_0 => {
+                // Q4_0, or transcoded to Q4_0 as it becomes resident (X7b)
+                t if t != lb_gguf::GgmlType::Q6K && as_q4(t) => {
                     let g = lb_q4_gpu::GpuQ4Mat::upload(gpu, w.mat(m))?;
                     self.bytes += g.bytes_on_device();
                     self.resident.insert(m.start, g);
@@ -248,7 +249,8 @@ impl DenseStore {
     fn device_bytes(m: &MatRef) -> usize {
         match m.ty {
             lb_gguf::GgmlType::Q6K => m.rows * (m.cols / 256) * 320,
-            _ => m.len,
+            // everything else is resident as Q4_0 (transcoded if it was not)
+            _ => m.rows * (m.cols / 32) * 18,
         }
     }
 
@@ -262,12 +264,19 @@ impl DenseStore {
     pub fn candidate_bytes(w: &Weights) -> usize {
         let mats: usize = Self::candidates(w)
             .iter()
-            .filter(|m| matches!(m.ty, lb_gguf::GgmlType::Q4_0 | lb_gguf::GgmlType::Q6K))
+            .filter(|m| m.ty == lb_gguf::GgmlType::Q6K || as_q4(m.ty))
             .map(|m| Self::device_bytes(m))
             .sum();
         let convs: usize = Self::conv_layers(w).iter().map(|(_, a, b)| a.len + b.len).sum();
         mats + convs
     }
+}
+
+/// Whether a dense matrix of type `ty` runs on the device as Q4_0: it is Q4_0, or (X7b) any other
+/// dequantizable type with whole Q4_0 blocks, transcoded when it becomes resident
+/// (`lb_q4_gpu::transcode`; `LB_TRANSCODE=0` turns that off).
+fn as_q4(ty: lb_gguf::GgmlType) -> bool {
+    ty == lb_gguf::GgmlType::Q4_0 || (ty.block().is_some() && !matches!(ty, lb_gguf::GgmlType::F32 | lb_gguf::GgmlType::F16) && std::env::var("LB_TRANSCODE").map(|v| v != "0").unwrap_or(true))
 }
 
 #[cfg(test)]

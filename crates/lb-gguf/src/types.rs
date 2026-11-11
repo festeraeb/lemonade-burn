@@ -13,6 +13,12 @@ pub enum GgmlType {
     Q4K,
     Q5K,
     Q6K,
+    /// i-quant, 32 values: f16 `d`, 16 nibble bytes indexing the non-linear 16-level table
+    /// [`IQ4_LEVELS`] (low nibble = value j, high = value j + 16).
+    IQ4NL,
+    /// i-quant, 256 values in 136 bytes: f16 `d`, u16 `scales_h`, `scales_l[4]`, `qs[128]`; eight
+    /// sub-blocks of 32, each with a 6-bit scale (`ls - 32`) times `d`, values from [`IQ4_LEVELS`].
+    IQ4XS,
     /// Any other type id: readable as raw bytes, not dequantizable here.
     Other(u32),
 }
@@ -29,6 +35,8 @@ impl GgmlType {
             12 => GgmlType::Q4K,
             13 => GgmlType::Q5K,
             14 => GgmlType::Q6K,
+            20 => GgmlType::IQ4NL,
+            23 => GgmlType::IQ4XS,
             other => GgmlType::Other(other),
         }
     }
@@ -44,6 +52,8 @@ impl GgmlType {
             GgmlType::Q4K => "Q4_K".into(),
             GgmlType::Q5K => "Q5_K".into(),
             GgmlType::Q6K => "Q6_K".into(),
+            GgmlType::IQ4NL => "IQ4_NL".into(),
+            GgmlType::IQ4XS => "IQ4_XS".into(),
             GgmlType::Other(id) => format!("type#{id}"),
         }
     }
@@ -62,6 +72,8 @@ impl GgmlType {
             GgmlType::Q4K => (256, 144),
             GgmlType::Q5K => (256, 176),
             GgmlType::Q6K => (256, 210),
+            GgmlType::IQ4NL => (32, 18),
+            GgmlType::IQ4XS => (256, 136),
             GgmlType::Other(_) => return None,
         })
     }
@@ -125,6 +137,16 @@ impl GgmlType {
             GgmlType::Q6K => {
                 for (o, b) in dst.chunks_exact_mut(256).zip(src.chunks_exact(210)) {
                     dequant_q6_k_block(b, o);
+                }
+            }
+            GgmlType::IQ4NL => {
+                for (o, b) in dst.chunks_exact_mut(32).zip(src.chunks_exact(18)) {
+                    dequant_iq4_nl_block(b, o);
+                }
+            }
+            GgmlType::IQ4XS => {
+                for (o, b) in dst.chunks_exact_mut(256).zip(src.chunks_exact(136)) {
+                    dequant_iq4_xs_block(b, o);
                 }
             }
             GgmlType::Other(id) => panic!("cannot dequantize ggml type {id}"),
@@ -464,6 +486,40 @@ mod kquant_tests {
             let mut out = vec![f32::NAN; 256];
             ty.dequant_row(&src, &mut out);
             assert!(out.iter().all(|v| v.is_finite()), "{} produced a non-finite value", ty.name());
+        }
+    }
+}
+
+/// The 16 levels of the IQ4 formats (IQ4_NL, IQ4_XS), part of the GGUF format definition: a
+/// nibble `n` decodes to `IQ4_LEVELS[n] * scale`. Non-uniform (denser near zero), which is what
+/// buys IQ4 its quality over Q4_0 at the same 4 bits.
+pub const IQ4_LEVELS: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+
+/// IQ4_NL block: f16 `d`, then 16 bytes; byte j's low nibble is value j, high nibble value j + 16.
+pub fn dequant_iq4_nl_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    for j in 0..16 {
+        out[j] = d * IQ4_LEVELS[(b[2 + j] & 15) as usize] as f32;
+        out[j + 16] = d * IQ4_LEVELS[(b[2 + j] >> 4) as usize] as f32;
+    }
+}
+
+/// IQ4_XS super-block (256 values, 136 bytes): `d` f16 @0, `scales_h` u16 @2, `scales_l[4]` @4,
+/// `qs[128]` @8. Sub-block `ib` (32 values) has the 6-bit scale
+/// `ls = (scales_l[ib/2] >> 4*(ib%2)) & 15 | ((scales_h >> 2*ib) & 3) << 4`, multiplier
+/// `d * (ls - 32)`, and its 16 bytes at `qs[16*ib..]` laid out as an IQ4_NL block's.
+pub fn dequant_iq4_xs_block(b: &[u8], out: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let sh = u16::from_le_bytes([b[2], b[3]]) as u32;
+    for ib in 0..8 {
+        let lo = (b[4 + ib / 2] >> (4 * (ib % 2))) as u32 & 15;
+        let ls = lo | (((sh >> (2 * ib)) & 3) << 4);
+        let dl = d * (ls as i32 - 32) as f32;
+        let q = &b[8 + 16 * ib..8 + 16 * ib + 16];
+        let o = &mut out[32 * ib..32 * ib + 32];
+        for j in 0..16 {
+            o[j] = dl * IQ4_LEVELS[(q[j] & 15) as usize] as f32;
+            o[j + 16] = dl * IQ4_LEVELS[(q[j] >> 4) as usize] as f32;
         }
     }
 }

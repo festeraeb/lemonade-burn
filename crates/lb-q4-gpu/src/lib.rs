@@ -18,8 +18,9 @@
 
 pub mod decode;
 pub mod store;
+pub mod transcode;
 pub use decode::TokenParams;
-pub use store::{pick_cube_device, ExpertSlots, Gpu, SideStream, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat};
+pub use store::{pick_cube_device, ExpertSlots, Gpu, Q4Math, SideStream, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat};
 #[cfg(feature = "cuda")]
 pub mod pinned;
 #[cfg(feature = "cuda")]
@@ -770,8 +771,66 @@ fn q4_0_routed_matvec_kernel(
 // Per row the arithmetic is `q4_row_partial`'s exactly (same blocks per lane, same order), so
 // the outputs are the same numbers; only the reduction is batched.
 
+// ---- X7a: the math a Q4_0 rows kernel runs in, chosen per launch (`#[comptime] math`) ----
+//
+// The weights on the device are the same words whatever the math (the `qs`/`sc` layout above),
+// so the math is a property of the LAUNCH, not of the upload: one resident copy, and the engine
+// can switch per card, per matrix or per token. Only the inner block loop differs.
+//
+//   * `Q4_MATH_F32`  the reference: nibble -> f32 by an int-to-float convert, f32 FMA.
+//   * `Q4_MATH_F32M` the same arithmetic with the convert replaced by a bit trick: nibble `n` is
+//     OR-ed into the mantissa of 2^23 (0x4B000000 | n == 8388608 + n, exactly), and subtracting
+//     8388616 gives `n - 8` exactly. Same values, same FMAs in the same order: bit-identical to
+//     F32. Pascal issues int-to-float converts at a quarter of the FMA rate, so this is the
+//     "is the convert the bottleneck" control, and an exact path in its own right.
+//   * `Q4_MATH_F16`  (for sm_60: fast fp16, no dp4a) two nibbles at a time OR-ed into the
+//     mantissa of half 1024 (0x6400 | n), minus 1032 -> `n - 8` exactly as a half2; the block's
+//     activations are scaled into (-1, 1) by a power of two (exact) and converted to half2;
+//     16 `__hfma2` per row-block into two half2 accumulators, then to f32, times the block
+//     scale and the power of two, accumulated in f32. Not exact: the activations round to 11
+//     bits and the 16 in-block sums round in half.
+//   * `Q4_MATH_DP4A` (for sm_61+: dp4a, slow fp16) the block's activations quantised in the lane
+//     to int8 with one f32 scale (absmax / 127, round to nearest), packed to match the nibble
+//     layout, then 8 `dp4a` per row-block on the raw nibbles (0..15) and the `- 8` folded in as
+//     `- 8 * sum(xq)`: integer-exact in the block, `d_w * d_x * isum` in f32. Not exact: the
+//     activations round to 8 bits. On sm_60 CubeCL lowers `dp4a` to a byte-unpack polyfill
+//     (correct, slow), which is how the path is checked on a P100.
+//
+// Activation scaling/quantisation happens in each lane for the block it owns (one lane = one
+// whole block of 32), once per block and shared by the `r` rows, so no extra launch, buffer or
+// sync is needed and the kernel signature is unchanged.
+pub const Q4_MATH_F32: u32 = 0;
+pub const Q4_MATH_F32M: u32 = 1;
+pub const Q4_MATH_F16: u32 = 2;
+pub const Q4_MATH_DP4A: u32 = 3;
+
+type V2H = Vector<half::f16, Const<2>>;
+type V2F = Vector<f32, Const<2>>;
+type V4I = Vector<i32, Const<4>>;
+
+/// Largest |component| of the block's 8 activation vectors (in-lane, no reduction across lanes).
+#[cube]
+fn block_absmax(xv: &Array<V4F>) -> f32 {
+    let mut m = xv[0usize].abs();
+    #[unroll]
+    for j in 1..8usize {
+        m = max(m, xv[j].abs());
+    }
+    max(max(m.extract(0usize), m.extract(1usize)), max(m.extract(2usize), m.extract(3usize)))
+}
+
+/// Two nibble lanes `j` of words `wa` and `wb` (values `4j + a` and `4j + b` of the block) as one
+/// half2 `(qa - 8, qb - 8)`, exactly: `pair` is `(wa & 0xffff) | (wb << 16)` for j < 4 or
+/// `(wa >> 16) | (wb & 0xffff0000)` for j >= 4, `s` = 4 * (j % 4).
+#[cube]
+fn nib_pair_h2(pair: u32, s: u32) -> V2H {
+    let t = ((pair >> s) & 0x000f_000fu32) | 0x6400_6400u32;
+    V2H::reinterpret(t) - V2H::new(half::f16::new(1032.0f32))
+}
+
 /// `r` row partials of one plane's lane: rows `0..r` start at global blocks `gb0 + i * bpr`, the
 /// activation row at vector `x4_0` (in `xs` when `xshared`). Written into `acc[0..r]`.
+/// `math` is one of the `Q4_MATH_*` constants (see above).
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn q4_rows_acc(
@@ -787,6 +846,33 @@ fn q4_rows_acc(
     acc: &mut Array<f32>,
     #[comptime] r: usize,
     #[comptime] xshared: bool,
+    #[comptime] math: u32,
+) {
+    if comptime!(math == Q4_MATH_F16 || math == Q4_MATH_DP4A) {
+        q4_rows_acc_lowp(qs, sc, x, xs, gb0, bpr, x4_0, lane, width, acc, r, xshared, math);
+    } else {
+        q4_rows_acc_f32(qs, sc, x, xs, gb0, bpr, x4_0, lane, width, acc, r, xshared, math);
+    }
+}
+
+/// F32 and F32M (see the X7a notes): identical arithmetic, the dequant differs in how `n - 8`
+/// is made.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn q4_rows_acc_f32(
+    qs: &[V4U],
+    sc: &[u32],
+    x: &[V4F],
+    xs: &Shared<[V4F]>,
+    gb0: usize,
+    bpr: usize,
+    x4_0: usize,
+    lane: usize,
+    width: usize,
+    acc: &mut Array<f32>,
+    #[comptime] r: usize,
+    #[comptime] xshared: bool,
+    #[comptime] math: u32,
 ) {
     let mut accv = Array::<V4F>::new(r);
     #[unroll]
@@ -820,7 +906,12 @@ fn q4_rows_acc(
             #[unroll]
             for j in 0..8u32 {
                 let nib = (q[i] >> V4U::new(4u32 * j)) & V4U::new(15u32);
-                let f = V4F::cast_from(nib) - V4F::new(8.0f32);
+                let mut f = V4F::new(0.0f32);
+                if comptime!(math == Q4_MATH_F32M) {
+                    f = V4F::reinterpret(nib | V4U::new(0x4B00_0000u32)) - V4F::new(8388616.0f32);
+                } else {
+                    f = V4F::cast_from(nib) - V4F::new(8.0f32);
+                }
                 s += f * xv[j as usize];
             }
             accv[i] += V4F::new(f16_to_f32(d[i])) * s;
@@ -831,6 +922,136 @@ fn q4_rows_acc(
     for i in 0..r {
         let a = accv[i];
         acc[i] = a.extract(0usize) + a.extract(1usize) + a.extract(2usize) + a.extract(3usize);
+    }
+}
+
+/// F16 and DP4A (see the X7a notes). Same loads and block walk as the f32 form; per block the
+/// lane first prepares the activations once (power-of-two scale + half2 pairs, or int8 + scale),
+/// then runs each of the `r` rows in the chosen math. Per-row block results go to f32 at once.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn q4_rows_acc_lowp(
+    qs: &[V4U],
+    sc: &[u32],
+    x: &[V4F],
+    xs: &Shared<[V4F]>,
+    gb0: usize,
+    bpr: usize,
+    x4_0: usize,
+    lane: usize,
+    width: usize,
+    acc: &mut Array<f32>,
+    #[comptime] r: usize,
+    #[comptime] xshared: bool,
+    #[comptime] math: u32,
+) {
+    #[unroll]
+    for i in 0..r {
+        acc[i] = 0.0f32;
+    }
+    let mut b = lane;
+    while b < bpr {
+        let mut q = Array::<V4U>::new(r);
+        let mut d = Array::<u32>::new(r);
+        #[unroll]
+        for i in 0..r {
+            let gb = gb0 + i * bpr + b;
+            q[i] = qs[gb];
+            d[i] = (sc[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32;
+        }
+        let mut xv = Array::<V4F>::new(8usize);
+        let xb = x4_0 + b * 8usize;
+        #[unroll]
+        for j in 0..8usize {
+            if xshared {
+                xv[j] = xs[xb + j];
+            } else {
+                xv[j] = x[xb + j];
+            }
+        }
+        let amax = block_absmax(&xv);
+        if comptime!(math == Q4_MATH_F16) {
+            // x / 2^(e+1) with 2^e <= amax < 2^(e+1): every |x| < 1, so a block sum of 32
+            // products (|q - 8| <= 8) stays under 256 in half; multiplying by a power of two is
+            // exact. `ebits` is amax's biased exponent (0 for 0 or a subnormal: scale 2^-126).
+            let ebits = (u32::reinterpret(amax) >> 23u32) & 255u32;
+            let inv = f32::reinterpret((253u32 - ebits) << 23u32);
+            let s_x = f32::reinterpret((ebits + 1u32) << 23u32);
+            // xh[2j] = values (4j, 4j+1), xh[2j+1] = (4j+2, 4j+3), as half2
+            let mut xh = Array::<V2H>::new(16usize);
+            #[unroll]
+            for j in 0..8usize {
+                let v = xv[j] * V4F::new(inv);
+                let mut lo = V2F::new(0.0f32);
+                lo.insert(0usize, v.extract(0usize));
+                lo.insert(1usize, v.extract(1usize));
+                let mut hi = V2F::new(0.0f32);
+                hi.insert(0usize, v.extract(2usize));
+                hi.insert(1usize, v.extract(3usize));
+                xh[2 * j] = V2H::cast_from(lo);
+                xh[2 * j + 1] = V2H::cast_from(hi);
+            }
+            #[unroll]
+            for i in 0..r {
+                let w = q[i];
+                let (w0, w1, w2, w3) = (w.extract(0usize), w.extract(1usize), w.extract(2usize), w.extract(3usize));
+                // values (4j, 4j+1) live in words 0 and 1 at nibble j; (4j+2, 4j+3) in words 2, 3
+                let p01lo = (w0 & 0xffffu32) | (w1 << 16u32);
+                let p01hi = (w0 >> 16u32) | (w1 & 0xffff_0000u32);
+                let p23lo = (w2 & 0xffffu32) | (w3 << 16u32);
+                let p23hi = (w2 >> 16u32) | (w3 & 0xffff_0000u32);
+                let mut a01 = V2H::new(half::f16::new(0.0f32));
+                let mut a23 = V2H::new(half::f16::new(0.0f32));
+                #[unroll]
+                for j in 0..4u32 {
+                    let s = 4u32 * j;
+                    a01 = fma(nib_pair_h2(p01lo, s), xh[2 * j as usize], a01);
+                    a23 = fma(nib_pair_h2(p23lo, s), xh[2 * j as usize + 1usize], a23);
+                    a01 = fma(nib_pair_h2(p01hi, s), xh[2 * (j + 4u32) as usize], a01);
+                    a23 = fma(nib_pair_h2(p23hi, s), xh[2 * (j + 4u32) as usize + 1usize], a23);
+                }
+                let f01 = V2F::cast_from(a01);
+                let f23 = V2F::cast_from(a23);
+                let blk = (f01.extract(0usize) + f01.extract(1usize)) + (f23.extract(0usize) + f23.extract(1usize));
+                acc[i] += f16_to_f32(d[i]) * s_x * blk;
+            }
+        } else {
+            // int8 activations, one f32 scale per block (absmax / 127), round to nearest
+            let mut inv = 0.0f32;
+            if amax > 0.0f32 {
+                inv = 127.0f32 / amax;
+            }
+            let dx = amax / 127.0f32;
+            let mut qx = Array::<V4I>::new(8usize);
+            let mut sq = V4I::new(0i32);
+            #[unroll]
+            for j in 0..8usize {
+                qx[j] = V4I::cast_from((xv[j] * V4F::new(inv)).round());
+                sq += qx[j];
+            }
+            let sumq = sq.extract(0usize) + sq.extract(1usize) + sq.extract(2usize) + sq.extract(3usize);
+            // word k, byte t of the weights: low nibble = value 8t + k, high nibble = 8t + 4 + k,
+            // so the matching activation words are xl[k] = (x[k], x[8+k], x[16+k], x[24+k]) and
+            // xh[k] = (x[4+k], x[12+k], x[20+k], x[28+k]); x[4j + k] is component k of qx[j].
+            let m8 = V4I::new(255i32);
+            let xl = (qx[0usize] & m8) | ((qx[2usize] & m8) << V4I::new(8i32)) | ((qx[4usize] & m8) << V4I::new(16i32)) | (qx[6usize] << V4I::new(24i32));
+            let xh = (qx[1usize] & m8) | ((qx[3usize] & m8) << V4I::new(8i32)) | ((qx[5usize] & m8) << V4I::new(16i32)) | (qx[7usize] << V4I::new(24i32));
+            #[unroll]
+            for i in 0..r {
+                let w = q[i];
+                let mut isum = 0i32;
+                #[unroll]
+                for k in 0..4usize {
+                    let wk = w.extract(k);
+                    let lo = i32::reinterpret(wk & 0x0f0f_0f0fu32);
+                    let hi = i32::reinterpret((wk >> 4u32) & 0x0f0f_0f0fu32);
+                    isum = dp4a(lo, xl.extract(k), isum);
+                    isum = dp4a(hi, xh.extract(k), isum);
+                }
+                acc[i] += f16_to_f32(d[i]) * dx * f32::cast_from(isum - 8i32 * sumq);
+            }
+        }
+        b += width;
     }
 }
 
@@ -873,6 +1094,7 @@ fn q4_0_matvec_rows_kernel(
     #[comptime] xshared: bool,
     #[comptime] xlen: usize,
     #[comptime] routed: bool,
+    #[comptime] math: u32,
 ) {
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
@@ -898,7 +1120,7 @@ fn q4_0_matvec_rows_kernel(
             let e = routes[2usize * (dims[2] as usize + t)] as usize;
             gb0 += e * rows * bpr;
         }
-        q4_rows_acc(qs, sc, x, &xs, gb0, bpr, t * cols / 4usize, lane, width, &mut acc, r, xshared);
+        q4_rows_acc(qs, sc, x, &xs, gb0, bpr, t * cols / 4usize, lane, width, &mut acc, r, xshared, math);
         #[unroll]
         for c in 0..r / 4 {
             let v = plane_sum4(&acc, c);
@@ -931,6 +1153,7 @@ fn q4_0_gate_up_silu_rows_kernel(
     #[comptime] xshared: bool,
     #[comptime] xlen: usize,
     #[comptime] routed: bool,
+    #[comptime] math: u32,
 ) {
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
@@ -959,8 +1182,8 @@ fn q4_0_gate_up_silu_rows_kernel(
             gb0 += routes[2usize * (base + t)] as usize * rows * bpr;
             tok = routes[2usize * (base + t) + 1usize] as usize;
         }
-        q4_rows_acc(gq, gs, x, &xs, gb0, bpr, tok * cols / 4usize, lane, width, &mut ag, r, xshared);
-        q4_rows_acc(uq, us, x, &xs, gb0, bpr, tok * cols / 4usize, lane, width, &mut au, r, xshared);
+        q4_rows_acc(gq, gs, x, &xs, gb0, bpr, tok * cols / 4usize, lane, width, &mut ag, r, xshared, math);
+        q4_rows_acc(uq, us, x, &xs, gb0, bpr, tok * cols / 4usize, lane, width, &mut au, r, xshared, math);
         #[unroll]
         for c in 0..r / 4 {
             let vg = plane_sum4(&ag, c);

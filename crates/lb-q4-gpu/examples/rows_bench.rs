@@ -14,7 +14,7 @@
 //! `LB_BENCH_ROUNDS` (default 3) rounds; card: `LB_WGPU_DEVICE` or `LB_CUDA_DEVICE`.
 use lb_gguf::types::quantize_q4_0;
 use lb_gguf::{GgmlType, QuantMat};
-use lb_q4_gpu::{Gpu, GpuExpert, GpuQ4Mat};
+use lb_q4_gpu::{Gpu, GpuExpert, GpuQ4Mat, Q4Math};
 use std::time::Instant;
 
 struct Rng(u64);
@@ -45,7 +45,7 @@ fn main() -> Result<(), String> {
     let (reps, rounds, chain) = (env("LB_BENCH_REPS", 30), env("LB_BENCH_ROUNDS", 3), env("LB_BENCH_CHAIN", 16));
     let gpu = Gpu::open()?;
     let load = || std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace().next().unwrap_or("").to_string();
-    println!("{{\"device\":{:?},\"cube_dim\":{},\"use_plane\":{},\"plane\":{:?},\"xshared_max_cols\":{}}}", gpu.name, gpu.cube_dim, gpu.use_plane, gpu.plane_size, gpu.xshared_max_cols);
+    println!("{{\"cc\":\"{:?}\",\"device\":{:?},\"cube_dim\":{},\"use_plane\":{},\"plane\":{:?},\"xshared_max_cols\":{}}}", gpu.compute_capability, gpu.name, gpu.cube_dim, gpu.use_plane, gpu.plane_size, gpu.xshared_max_cols);
     let (n_embd, n_ff) = (2048usize, 1536usize);
     let mut rng = Rng(3);
     let mut es = Vec::new();
@@ -54,13 +54,30 @@ fn main() -> Result<(), String> {
         es.push(GpuExpert::upload(&gpu, QuantMat::new(GgmlType::Q4_0, n_ff, n_embd, &g), QuantMat::new(GgmlType::Q4_0, n_ff, n_embd, &u), QuantMat::new(GgmlType::Q4_0, n_embd, n_ff, &d))?);
     }
     let expert_bytes = es[0].bytes_on_device() as f64;
-    let shapes = [("in_proj_6144x2048", 6144usize, 2048usize), ("out_proj_2048x2048", 2048, 2048), ("kv_512x2048", 512, 2048), ("ffn_down_2048x11776", 2048, 11776), ("ffn_up_11776x2048", 11776, 2048)];
+    // `big_65536x2048` (75 MB, X7a): one launch long enough (~120 us at HBM2 rate) that the
+    // per-launch host cost (~28 us through CubeCL on c4) no longer hides the kernel's own rate
+    let mut shapes = vec![("in_proj_6144x2048", 6144usize, 2048usize), ("out_proj_2048x2048", 2048, 2048), ("kv_512x2048", 512, 2048), ("ffn_down_2048x11776", 2048, 11776), ("ffn_up_11776x2048", 11776, 2048)];
+    if std::env::var_os("LB_BENCH_MATHS").is_some() {
+        shapes.push(("big_65536x2048", 65536, 2048));
+    }
     let dense: Vec<(&str, GpuQ4Mat)> = shapes
         .iter()
         .map(|&(n, r, c)| (n, GpuQ4Mat::upload(&gpu, QuantMat::new(GgmlType::Q4_0, r, c, &q4(&mut rng, r, c))).expect("upload")))
         .collect();
     let x: Vec<f32> = (0..11776).map(|_| rng.unit()).collect();
-    let arms: [(&str, usize, bool); 5] = [("rows1", 1, false), ("rows4", 4, false), ("rows8", 8, false), ("rows4_xs", 4, true), ("rows8_xs", 8, true)];
+    // X7a: `LB_BENCH_MATHS=f32,f32m,f16,dp4a` replaces the D2 arms with rows4 (and rows4_xs) per math
+    let maths: Vec<Q4Math> = std::env::var("LB_BENCH_MATHS").ok().map(|v| v.split(',').filter_map(Q4Math::parse).collect()).unwrap_or_default();
+    let mut arms: Vec<(String, usize, bool, Q4Math)> = Vec::new();
+    if maths.is_empty() {
+        for (a, r, xs) in [("rows1", 1, false), ("rows4", 4, false), ("rows8", 8, false), ("rows4_xs", 4, true), ("rows8_xs", 8, true)] {
+            arms.push((a.to_string(), r, xs, Q4Math::F32));
+        }
+    } else {
+        for &m in &maths {
+            arms.push((format!("rows4_{}", m.name()), 4, false, m));
+            arms.push((format!("rows4_xs_{}", m.name()), 4, true, m));
+        }
+    }
     let time = |f: &mut dyn FnMut() -> Result<(), String>| -> Result<f64, String> {
         f()?;
         let mut ts = Vec::with_capacity(reps);
@@ -81,9 +98,11 @@ fn main() -> Result<(), String> {
         }
     }
     for round in 0..rounds {
-        for &(arm, r, xs) in &arms {
+        for (arm, r, xs, math) in &arms {
+            let (arm, r, xs) = (arm.as_str(), *r, *xs);
             gpu.set_q4_rows(r);
             gpu.set_q4_xshared(xs);
+            gpu.set_q4_math(*math);
             let xh = gpu.upload_f32(&x[..n_embd]);
             let ms = time(&mut || {
                 let hs: Vec<_> = es.iter().map(|e| e.launch(&gpu, &xh, 1)).collect();

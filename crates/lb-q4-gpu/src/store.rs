@@ -14,7 +14,7 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 use lb_ternary_gpu::pick_device;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Most free buffers to keep per size. Decode reuses a handful of sizes, so this only caps
@@ -66,6 +66,11 @@ pub struct Gpu {
     /// ... only for matrices up to this many columns (`LB_Q4_XSHARED_MAX_COLS`, default 4096:
     /// 16 KB of shared memory; the 11776-wide dense down would take 46 KB of the 48).
     pub xshared_max_cols: usize,
+    /// X7a: the math the Q4_0 rows kernels run in (`Q4_MATH_*`), per launch, live. Chosen at
+    /// open by [`Q4Math::pick`] from the probed card and `LB_Q4_MATH`; `set_q4_math` switches it.
+    q4_math: AtomicU32,
+    /// CUDA compute capability `(major, minor)` of the card, when the cuda runtime is open.
+    pub compute_capability: Option<(u32, u32)>,
 }
 
 /// `LB_Q4_ROWS`: 4 (default), 8, or 1 for the one-row kernels; anything else is the default.
@@ -88,6 +93,107 @@ pub fn pick_cube_device() -> Result<cubecl::Device, String> {
         return cubecl::Device::cuda(n).map_err(|e| format!("CUDA device {n}: {e} (build lb-q4-gpu with --features cuda; libcuda + libnvrtc on the library path)"));
     }
     Ok(cubecl::Device::Wgpu(pick_device()?))
+}
+
+/// X7a: how a Q4_0 rows kernel does its arithmetic (see the notes at `Q4_MATH_F32` in lib.rs).
+/// The weights on the device are the same whatever the math, so this is a launch-time choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Q4Math {
+    /// Reference: int-to-float dequant, f32 FMA.
+    F32,
+    /// F32 with the dequant done by a mantissa bit trick; bit-identical to F32.
+    F32Magic,
+    /// half2 dequant + `__hfma2` per block, f32 across blocks (Pascal sm_60: fast fp16, no dp4a).
+    F16,
+    /// int8 activations + `dp4a` on the nibbles (sm_61+ / Turing: dp4a; fp16 is slow on sm_61).
+    Dp4a,
+}
+
+impl Q4Math {
+    pub const ALL: [Q4Math; 4] = [Q4Math::F32, Q4Math::F32Magic, Q4Math::F16, Q4Math::Dp4a];
+
+    pub fn code(self) -> u32 {
+        match self {
+            Q4Math::F32 => crate::Q4_MATH_F32,
+            Q4Math::F32Magic => crate::Q4_MATH_F32M,
+            Q4Math::F16 => crate::Q4_MATH_F16,
+            Q4Math::Dp4a => crate::Q4_MATH_DP4A,
+        }
+    }
+
+    pub fn from_code(c: u32) -> Self {
+        match c {
+            crate::Q4_MATH_F32M => Q4Math::F32Magic,
+            crate::Q4_MATH_F16 => Q4Math::F16,
+            crate::Q4_MATH_DP4A => Q4Math::Dp4a,
+            _ => Q4Math::F32,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Q4Math::F32 => "f32",
+            Q4Math::F32Magic => "f32m",
+            Q4Math::F16 => "f16",
+            Q4Math::Dp4a => "dp4a",
+        }
+    }
+
+    /// `f32`, `f32m`, `f16`, `dp4a`; `None` for anything else (including `auto`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "f32" => Some(Q4Math::F32),
+            "f32m" | "magic" => Some(Q4Math::F32Magic),
+            "f16" | "half" => Some(Q4Math::F16),
+            "dp4a" | "int8" => Some(Q4Math::Dp4a),
+            _ => None,
+        }
+    }
+
+    /// Whether the path gives the same f32 bits as the reference (the greedy sha must hold).
+    pub fn exact(self) -> bool {
+        matches!(self, Q4Math::F32 | Q4Math::F32Magic)
+    }
+
+    /// The card's fast math from its compute capability: sm_60 (P100) has 2x-rate fp16 and no
+    /// dp4a -> F16; sm_61 (1070, P106, P40) has dp4a and 1/64-rate fp16 -> Dp4a; sm_62 (Jetson
+    /// TX2) fast fp16, no dp4a -> F16; sm_70+ (Turing, Ampere, ...) dp4a -> Dp4a. Unknown (wgpu,
+    /// no capability) -> F32.
+    pub fn for_card(cc: Option<(u32, u32)>) -> Self {
+        match cc {
+            Some((6, 0)) | Some((6, 2)) => Q4Math::F16,
+            Some((6, _)) => Q4Math::Dp4a,
+            Some((m, _)) if m >= 7 => Q4Math::Dp4a,
+            _ => Q4Math::F32,
+        }
+    }
+
+    /// `LB_Q4_MATH`: unset or `f32` -> the reference (the default: every published sha was made
+    /// with it); `auto` -> [`Q4Math::for_card`]; or `f32m`, `f16`, `dp4a` by name.
+    pub fn pick(cc: Option<(u32, u32)>) -> Self {
+        match std::env::var("LB_Q4_MATH") {
+            Ok(v) if v.trim().eq_ignore_ascii_case("auto") => Self::for_card(cc),
+            Ok(v) => Self::parse(&v).unwrap_or_else(|| {
+                eprintln!("lb-q4-gpu: LB_Q4_MATH={v:?} not understood (f32|f32m|f16|dp4a|auto), using f32");
+                Q4Math::F32
+            }),
+            Err(_) => Q4Math::F32,
+        }
+    }
+}
+
+/// Compute capability of CUDA device `index` (driver order), from the driver.
+#[cfg(feature = "cuda")]
+fn cuda_compute_capability(index: usize) -> Option<(u32, u32)> {
+    use cudarc::driver::{result, sys::CUdevice_attribute::*};
+    // SAFETY: plain read-only driver queries on a valid device ordinal.
+    unsafe {
+        result::init().ok()?;
+        let dev = result::device::get(index as i32).ok()?;
+        let major = result::device::get_attribute(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR).ok()?;
+        let minor = result::device::get_attribute(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR).ok()?;
+        Some((major as u32, minor as u32))
+    }
 }
 
 impl Gpu {
@@ -132,6 +238,14 @@ impl Gpu {
             },
             _ => None,
         };
+        #[cfg(feature = "cuda")]
+        let compute_capability = match &dev {
+            cubecl::Device::Cuda(d) => cuda_compute_capability(d.index),
+            _ => None,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let compute_capability: Option<(u32, u32)> = None;
+        let q4_math = Q4Math::pick(compute_capability);
         Ok(Self {
             client,
             name: format!("{dev:?}"),
@@ -155,7 +269,27 @@ impl Gpu {
             q4_rows: AtomicUsize::new(q4_rows_from_env()),
             q4_xshared: AtomicBool::new(std::env::var("LB_Q4_XSHARED").map(|v| v == "1").unwrap_or(false)),
             xshared_max_cols: std::env::var("LB_Q4_XSHARED_MAX_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
+            q4_math: AtomicU32::new(q4_math.code()),
+            compute_capability,
         })
+    }
+
+    /// The math code the Q4_0 rows kernels are launched with (`Q4_MATH_*`; see [`Q4Math`]).
+    /// Only the rows kernels (`LB_Q4_ROWS` 4 or 8, plane ops) have the variants; the one-row
+    /// kernels are always f32.
+    pub fn q4_math(&self) -> u32 {
+        self.q4_math.load(Ordering::Relaxed)
+    }
+
+    /// The math as an enum.
+    pub fn q4_math_kind(&self) -> Q4Math {
+        Q4Math::from_code(self.q4_math())
+    }
+
+    /// Switch the Q4_0 rows kernels' math, live (the next launch uses it; queued work is not
+    /// affected). The device bytes are the same for every math, so nothing is re-uploaded.
+    pub fn set_q4_math(&self, m: Q4Math) {
+        self.q4_math.store(m.code(), Ordering::Relaxed);
     }
 
     /// Rows per plane the Q4_0 kernels use (1 = the one-row kernels).
@@ -619,17 +753,16 @@ pub struct GpuQ4Mat {
 }
 
 impl GpuQ4Mat {
+    /// Upload `w`; a non-Q4_0 matrix is transcoded to Q4_0 first (X7b, `transcode.rs`).
     pub fn upload(gpu: &Gpu, w: QuantMat<'_>) -> Result<Self, String> {
-        if w.ty != lb_gguf::GgmlType::Q4_0 {
-            return Err(format!("expected Q4_0, got {}", w.ty.name()));
-        }
         if w.cols % 32 != 0 {
             return Err(format!("Q4_0 needs cols % 32 == 0, got {}", w.cols));
         }
+        let bytes = crate::transcode::q4_0_bytes(&w)?;
         let n_blocks = w.rows * (w.cols / 32);
-        let ((qs, n_qs), (sc, n_sc)) = gpu.upload_q4_0(w.bytes, n_blocks);
+        let ((qs, n_qs), (sc, n_sc)) = gpu.upload_q4_0(&bytes, n_blocks);
         let dims = matvec_dims(w.rows, w.cols);
-        Ok(Self { rows: w.rows, cols: w.cols, row_bytes: w.row_bytes(), n_qs, n_sc, qs, sc, dims: gpu.const_u32(&dims) })
+        Ok(Self { rows: w.rows, cols: w.cols, row_bytes: w.cols / 32 * 18, n_qs, n_sc, qs, sc, dims: gpu.const_u32(&dims) })
     }
 
     pub fn bytes_on_device(&self) -> usize {
@@ -664,6 +797,7 @@ impl GpuQ4Mat {
                     xsh,
                     if xsh { self.cols / 4 } else { 1 },
                     false,
+                    gpu.q4_math(),
                 );
             }
             return out;
@@ -751,6 +885,7 @@ impl Gpu {
                 xsh,
                 if xsh { gate.cols / 4 } else { 1 },
                 false,
+                self.q4_math(),
             );
         }
     }
@@ -1103,8 +1238,8 @@ impl GpuExpertLayer {
         let mut n_experts = 0usize;
         for (g, u, d) in experts {
             for m in [&g, &u, &d] {
-                if m.ty != lb_gguf::GgmlType::Q4_0 {
-                    return Err(format!("GpuExpertLayer needs Q4_0, got {}", m.ty.name()));
+                if m.ty != lb_gguf::GgmlType::Q4_0 && !crate::transcode::transcodable(m.ty) {
+                    return Err(format!("GpuExpertLayer needs Q4_0 (or a transcodable type), got {}", m.ty.name()));
                 }
                 if m.cols % 32 != 0 {
                     return Err(format!("Q4_0 needs cols % 32 == 0, got {}", m.cols));
@@ -1123,7 +1258,7 @@ impl GpuExpertLayer {
                 if nb % 2 != 0 {
                     return Err(format!("GpuExpertLayer: {} blocks per expert is odd; concatenated scales would shift", nb));
                 }
-                let (qw, sw) = repack_q4_0(m.bytes, nb);
+                let (qw, sw) = repack_q4_0(&crate::transcode::q4_0_bytes(m)?, nb);
                 q.extend_from_slice(&qw);
                 s.extend_from_slice(&sw);
             }
@@ -1157,8 +1292,8 @@ impl GpuExpertLayer {
             return Err("GpuExpertLayer: no experts".into());
         }
         for m in [&gate, &up, &down] {
-            if m.ty != lb_gguf::GgmlType::Q4_0 {
-                return Err(format!("GpuExpertLayer needs Q4_0, got {}", m.ty.name()));
+            if m.ty != lb_gguf::GgmlType::Q4_0 && !crate::transcode::transcodable(m.ty) {
+                return Err(format!("GpuExpertLayer needs Q4_0 (or a transcodable type), got {}", m.ty.name()));
             }
             if m.cols % 32 != 0 || m.rows % n_experts != 0 {
                 return Err(format!("GpuExpertLayer: [{}, {}] is not {n_experts} Q4_0 experts", m.rows, m.cols));
@@ -1174,7 +1309,7 @@ impl GpuExpertLayer {
             if nb_e % 2 != 0 {
                 return Err(format!("GpuExpertLayer: {nb_e} blocks per expert is odd; concatenated scales would shift"));
             }
-            let ((qs, n_qs), (sc, n_sc)) = gpu.upload_q4_0(m.bytes, n_experts * nb_e);
+            let ((qs, n_qs), (sc, n_sc)) = gpu.upload_q4_0(&crate::transcode::q4_0_bytes(m)?, n_experts * nb_e);
             parts.push((qs, n_qs, sc, n_sc));
         }
         let bytes = parts.iter().map(|p| (p.1 + p.3) * 4).sum();
@@ -1254,6 +1389,7 @@ impl GpuExpertLayer {
                     xsh,
                     if xsh { self.n_embd / 4 } else { 1 },
                     true,
+                    gpu.q4_math(),
                 );
             }
             let n_out = slots * self.n_embd;
@@ -1273,6 +1409,7 @@ impl GpuExpertLayer {
                     false,
                     1,
                     true,
+                    gpu.q4_math(),
                 );
             }
             return (out, n_out);

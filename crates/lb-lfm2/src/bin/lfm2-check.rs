@@ -32,6 +32,14 @@ struct Args {
     /// greedy completion of `--greedy-n` tokens per arm from `--greedy-prompt`.
     #[arg(long, default_value_t = false)]
     ab_device: bool,
+    /// X7a: compare the device decode in each listed Q4_0 math (`f32m,f16,dp4a`) against the f32
+    /// device decode, same process, same upload (the math is a launch parameter): teacher-forced
+    /// top-1 and KLD(f32 || math) per position over `--prompt`s, then a greedy completion of
+    /// `--greedy-n` tokens from `--greedy-prompt` per math (sha + tok/s), `--ab-rounds` times.
+    #[arg(long, value_delimiter = ',')]
+    ab_math: Vec<String>,
+    #[arg(long, default_value_t = 1)]
+    ab_rounds: usize,
     /// Prompt for the greedy part of `--ab-device` (c4_e2e.sh's by default).
     #[arg(long, default_value = "Explain in two sentences why a sonar return from a hard sand bottom differs from one over silt.")]
     greedy_prompt: String,
@@ -193,6 +201,10 @@ fn main() -> Result<()> {
     };
     if args.ab_device {
         return ab_device(&args, &model, &tokenize, codec.as_ref());
+    }
+    #[cfg(feature = "gpu")]
+    if !args.ab_math.is_empty() {
+        return ab_math(&args, &model, &tokenize, codec.as_ref());
     }
     let oracle = args.oracle.clone().context("--oracle is needed unless --ab-device")?;
     let oracle_url = oracle;
@@ -476,6 +488,87 @@ fn ab_device(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u3
     }
     if let Some(rt) = model.store.remote.as_ref() {
         println!("w2w: {}", rt.status());
+    }
+    Ok(())
+}
+
+/// KL(p || q) of the softmaxes of two logit rows (natural log), computed in f64.
+fn kld(p_logits: &[f32], q_logits: &[f32]) -> f64 {
+    let lse = |v: &[f32]| {
+        let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        m + v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln()
+    };
+    let (lp, lq) = (lse(p_logits), lse(q_logits));
+    p_logits.iter().zip(q_logits).map(|(&a, &b)| {
+        let la = a as f64 - lp;
+        la.exp() * (la - (b as f64 - lq))
+    }).sum::<f64>().max(0.0)
+}
+
+/// `--ab-math`: X7a model gates (docs/WORK_TO_WEIGHTS.md "## X7"). The f32 device decode is the
+/// reference arm; each listed math runs on the same upload with `Gpu::set_q4_math`.
+#[cfg(feature = "gpu")]
+fn ab_math(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32>>, codec: Option<&tokenizers::Tokenizer>) -> Result<()> {
+    use lb_q4_gpu::Q4Math;
+    let cfg = model.cfg();
+    let gpu = model.store.gpu.as_ref().context("--ab-math needs --gpu (a device)")?;
+    let maths: Vec<Q4Math> = args.ab_math.iter().map(|s| Q4Math::parse(s).with_context(|| format!("unknown math {s:?}"))).collect::<Result<_>>()?;
+    println!("ab-math: device {} cc {:?}, auto would pick {:?}; q4 rows {}; arms f32 + {:?}", gpu.name, gpu.compute_capability, Q4Math::for_card(gpu.compute_capability), gpu.q4_rows(), maths);
+    let mut report = Vec::new();
+    // teacher-forced: positions, top-1, KLD
+    let mut tf: Vec<(usize, usize, f64, f64, f32)> = vec![(0, 0, 0.0, 0.0, 0.0); maths.len()];
+    for prompt in &args.prompts {
+        let mut ids = tokenize(prompt)?;
+        if args.bos {
+            ids.insert(0, cfg.bos);
+        }
+        gpu.set_q4_math(Q4Math::F32);
+        let base = run_arm(model, &ids, true, false);
+        for (mi, &m) in maths.iter().enumerate() {
+            gpu.set_q4_math(m);
+            let arm = run_arm(model, &ids, true, false);
+            let mut kl_max = 0f64;
+            for i in 0..ids.len() {
+                let k = kld(&base.logits[i], &arm.logits[i]);
+                tf[mi].0 += 1;
+                tf[mi].1 += (base.top1[i] == arm.top1[i]) as usize;
+                tf[mi].2 += k;
+                kl_max = kl_max.max(k);
+                tf[mi].4 = tf[mi].4.max(max_abs_diff(&base.logits[i], &arm.logits[i]));
+            }
+            tf[mi].3 = tf[mi].3.max(kl_max);
+            println!("{:>4} {:?}: {} positions, top-1 so far {}/{}, prompt max KLD {kl_max:.3e}, fallbacks {}", m.name(), &prompt[..prompt.len().min(40)], ids.len(), tf[mi].1, tf[mi].0, arm.dd_fallbacks);
+        }
+    }
+    gpu.set_q4_math(Q4Math::F32);
+    for (mi, &m) in maths.iter().enumerate() {
+        let (n, ok, ksum, kmax, dmax) = tf[mi];
+        let mean = if n > 0 { ksum / n as f64 } else { 0.0 };
+        println!("teacher-forced {:>4} vs f32: top-1 {ok}/{n}, mean KLD {mean:.3e}, max KLD {kmax:.3e}, max |dlogit| {dmax:.3e}", m.name());
+        report.push(json!({"kind": "teacher_forced", "math": m.name(), "exact": m.exact(), "positions": n, "top1_agree": ok, "kld_mean": mean, "kld_max": kmax, "max_abs_logit_diff": dmax}));
+    }
+    // greedy, interleaved rounds: f32 then each math
+    let mut ids = tokenize(&args.greedy_prompt)?;
+    if args.bos {
+        ids.insert(0, cfg.bos);
+    }
+    let text = |v: &[u32]| codec.and_then(|c| c.decode(v, true).ok()).unwrap_or_else(|| format!("{v:?}"));
+    let mut arms = vec![Q4Math::F32];
+    arms.extend(maths.iter().copied().filter(|&m| m != Q4Math::F32));
+    for round in 0..args.ab_rounds {
+        for &m in &arms {
+            gpu.set_q4_math(m);
+            let (g, _, secs, dd) = greedy_arm(model, &ids, args.greedy_n, true, cfg.eos);
+            let sha = sha16(&text(&g));
+            let tps = g.len() as f64 / secs;
+            println!("greedy r{round} {:>4}: {tps:.2} tok/s sha {sha} ({dd} device tokens) {:?}", m.name(), text(&g));
+            report.push(json!({"kind": "greedy", "round": round, "math": m.name(), "exact": m.exact(), "tokens": g.len(), "tok_s": tps, "sha": sha, "device_tokens": dd}));
+        }
+    }
+    gpu.set_q4_math(Q4Math::F32);
+    model.knobs().set_device_decode(false);
+    if let Some(p) = &args.report {
+        std::fs::write(p, serde_json::to_string_pretty(&json!({"model": args.model, "device": gpu.name, "cc": gpu.compute_capability, "rows": report}))?)?;
     }
     Ok(())
 }

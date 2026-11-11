@@ -723,3 +723,84 @@ of the hand-off is ~13 ms (25G) to ~20 ms (1 GbE) at 512 (conv state, headers, s
   engine path.
 * lemonade-burn prefill at 8k+ not run (OOM at 2k with experts resident; 55 tok/s otherwise).
 * X4 (look-ahead per tier) and X5 (prefill batched by destination) not run in this session.
+
+## X7: storage format != compute format (per-card math, transcode on residency) and X7q (what each quant costs)
+
+Operator, 2026-11-11: "can our engine switch math or build in a switch for a 1-bit-quanted layer and the P100? The
+i-quants save a lot of space but at what sacrifice? If there isn't a way to switch math on the fly then hardware
+matching is a must." Plan: the work-to-weights plan (X7, X7q, X8). Gates and refinements
+below were written 2026-11-11 ~06:50Z, **before** any X7 run. Branch `opus/x7-format-dispatch-2026-11-11` (off
+`fable/work-to-weights-2026-11-11`). Raw results: `/mnt/fast/x7/results/*.jsonl` (append-only).
+
+Card facts used (llama.cpp source + X6): P100 = sm_60, fast fp16 (2x f32), **no dp4a**; GTX 1070 / P106 = sm_61,
+dp4a, fp16 at 1/64; Turing (2060, 2060 SUPER, T10) = sm_75, dp4a + fp16 + int8 tensor cores. lemonade-burn's Q4_0
+kernels were f32 only before X7.
+
+### X7a design: the math is a launch parameter, the bytes stay the same
+* The Q4_0 rows kernels (`q4_0_matvec_rows_kernel`, `q4_0_gate_up_silu_rows_kernel`; every Q4_0 matvec of the
+  device decode, dense and routed experts) take a `#[comptime] math`. The device words are the same for every math,
+  so a resident matrix is uploaded once and the math is chosen **per launch**: per card at open, live-switchable
+  (`Gpu::set_q4_math`), no re-upload. That is the "switch math on the fly" the operator asked about.
+* Variants (`Q4Math` in `crates/lb-q4-gpu/src/store.rs`, kernel notes at `Q4_MATH_F32` in `lib.rs`):
+  * `f32`  reference (int-to-float dequant, f32 FMA). **Exact** (it is the reference).
+  * `f32m` the same arithmetic with the dequant done by a mantissa bit trick (no int-to-float converts, which Pascal
+    issues at 1/4 rate). **Exact**: must be bit-identical to f32.
+  * `f16`  (P100) half2 dequant by the same trick, block activations scaled into (-1, 1) by a power of two
+    (exact) and rounded to half, 16 `__hfma2` per row-block, f32 across blocks. **Not exact.**
+  * `dp4a` (sm_61 / Turing) block activations quantised to int8 in the lane (absmax/127, round to nearest), 8 `dp4a`
+    per row-block on the raw nibbles, `-8` folded in as `-8 * sum(xq)`. **Not exact.** On sm_60 CubeCL lowers
+    `dp4a` to a byte-unpack polyfill: correct, slow; that is how it is checked on a P100.
+* Knob: `LB_Q4_MATH=f32|f32m|f16|dp4a|auto`. `auto` picks from the probed compute capability (sm_60/62 -> f16,
+  sm_61 and sm_70+ -> dp4a, unknown/wgpu -> f32). **Default stays `f32`** until the quality gates below pass, because
+  every published sha and gate was made with it. Only the rows kernels (`LB_Q4_ROWS` 4 or 8) have variants.
+
+### X7a gates (kernel parity first, then the model)
+1. Kernel parity, `tests/math_variants_match_reference.rs`, model shapes + awkward activations (a zero block, a 900
+   outlier, every 97th channel x100), m = 1 and 3, x staged in shared memory or not, the expert FFN and the routed
+   layer:
+   * f32m bit-identical to f32 (0 differing outputs).
+   * f16 and dp4a vs an exact host emulation of their per-block arithmetic: |gpu - emu| <= 2e-6 * sum|block| + 1e-6
+     per output (only the f32 order across blocks may differ).
+   * normalised error max|gpu - f32| / max|f32|: f16 <= 5e-3, dp4a <= 3e-2 (2x that for two matvecs in series).
+2. Model, LFM2.5-24B-A2B QAD-Q4_0, all experts resident, c4-AF (P100), `lfm2-check --ab-math` (same process, same
+   upload, the f32 device decode as reference): teacher-forced top-1 agreement and KLD(f32 || math) per position on
+   the D-series prompts, then greedy 32 tokens on the sonar prompt.
+   * exact paths (f32, f32m): greedy sha **062392b8d2b0361a** and max |dlogit| = 0.
+   * f16: top-1 >= 98 %, mean KLD <= 1e-3. dp4a: top-1 >= 97 %, mean KLD <= 3e-3 (llama.cpp's own MMVQ quantises
+     activations to q8_1 the same way, so this is the price llama.cpp pays on every card). The greedy sha is
+     reported, not gated, for the non-exact paths (a different sha is expected and is not a failure by itself).
+   * held-out-v1 (60 items, 40 gated) through our server for the chosen per-card math: >= 39/40 (the Q4_0 reference
+     scored 37-40/40 across runs; the gate is "no drop beyond 1 item").
+3. Speed, same card, same session, arms interleaved: `examples/rows_bench.rs` per math (distinct 24 experts, dense
+   shapes, as GB/s of weight bytes) and end-to-end decode tok/s (5 rounds, median). Reported as a fraction of the
+   card's measured read bandwidth (P100 605 GB/s read, X6). Gate for making a math the default on a card class:
+   >= 1.10x end to end over f32 with gate 2 passed. The dp4a path is timed on sm_61 (c3 P106-100) and sm_75 (c2 T10 /
+   2060 / 2060 SUPER), freed for this run by the operator; on the P100 it is a correctness run only.
+
+### X7b design and gate refinement: transcode on residency
+* lb-gguf reads IQ4_XS (then IQ3/IQ2/IQ1 if time allows). An expert/dense matrix whose storage type the card has no
+  kernel for is re-encoded **when it becomes resident**: host-side first (state which), into the card's fast
+  format. In this engine that format is Q4_0 (the only quant with the per-card math variants); Q8_0 needs its own
+  kernel (not in the engine before X7).
+* Refinement of the plan's gate ("IQ model with hot experts transcoded decodes >= 1.3x the same model without
+  transcoding at equal VRAM"): lemonade-burn has no native i-quant GPU kernel, so "without transcoding" is measured
+  as (a) llama.cpp running the same IQ GGUF natively on the same P100 (its MMVQ i-quant kernels, emulated dp4a on
+  sm_60) and (b) for spill configs, the same experts kept compact on the host and run on the CPU. Equal VRAM: IQ4_XS
+  (4.25 bpw) -> Q4_0 (4.5 bpw) is within 6 %, so all-resident vs all-resident is "equal VRAM"; for IQ2/IQ1 the Q4_0
+  form is ~2-3x larger and the comparison is at an equal expert budget in MiB.
+* Quality gate for a transcode: KLD(IQ native || IQ transcoded) on the X7q text, and the transcoded model's KLD vs
+  Q8_0 must be within 10 % of the native IQ's KLD vs Q8_0 (requantising adds error; this says how much).
+
+### X7q method (the "at what sacrifice" table)
+* Source: LiquidAI's **BF16** GGUF of LFM2.5-24B-A2B (not the QAD Q4_0: requantising a quant compounds error).
+  Quants by `llama-quantize` (llama.cpp e14a779, built for this run): Q8_0, Q4_K_M, Q4_0, IQ4_XS, IQ3_M, IQ2_M, IQ1_S,
+  i-quants with an imatrix from `llama-imatrix` on a calibration text that shares no origin with held-out-v1. The
+  LiquidAI QAD-Q4_0 (quantisation-aware distilled, the engine's usual file) is a separate row, labelled as such.
+* Quality: KLD vs Q8_0 (BF16 is 48 GB; it fits neither one P100 nor two) with `llama-perplexity --kl-divergence`
+  on the held-out teacher-forcing text (prompt + the Q8_0 model's greedy answer, as experiment #3 built it), Q8_0
+  base logits split over c4-AF + c4-D8; reported: mean KLD, 99th pct KLD, top-1 agreement ("same top"), PPL.
+  held-out-v1 score per quant via llama-server (same settings as experiment #3: temp 0, seed 1, reasoning off).
+* Speed: decode tok/s (llama-bench tg128, 3 reps) per quant on one P100, and on the sm_61 / sm_75 cards where the
+  file fits; fraction of measured read bandwidth from bytes read per token (dense + 4 routed experts per MoE layer,
+  from the file's tensor sizes). lemonade-burn rows: Q4_0 files only (QAD and from-BF16) per math, and transcoded
+  i-quants.
