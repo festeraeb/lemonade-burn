@@ -774,6 +774,78 @@ impl Gpu {
 #[derive(Clone, Copy, Debug)]
 pub struct SideStream(cubecl_environment::stream::StreamId);
 
+/// A Q8_0 matrix resident on the device (X7b follow-up; see `repack_q8_0`). Rows kernel only
+/// (4 rows a plane, f32 math, plane ops needed). Rows are padded to a multiple of 4 with zero
+/// blocks: `launch` writes `[m, rows_pad]`, `matvec` returns `[m, rows]`.
+pub struct GpuQ8Mat {
+    pub rows: usize,
+    pub rows_pad: usize,
+    pub cols: usize,
+    qs: Handle,
+    sc: Handle,
+    n_qs: usize,
+    n_sc: usize,
+    dims: Handle,
+}
+
+impl GpuQ8Mat {
+    /// Upload `w` as Q8_0: a Q8_0 matrix as it is, anything else lb-gguf can dequantize re-encoded
+    /// to Q8_0 (`lb_gguf::types::quantize_q8_0`, the quality-preserving transcode target).
+    pub fn upload(gpu: &Gpu, w: QuantMat<'_>) -> Result<Self, String> {
+        if w.cols % 32 != 0 || !gpu.use_plane {
+            return Err(format!("GpuQ8Mat needs cols % 32 == 0 and plane ops ({}x{})", w.rows, w.cols));
+        }
+        let rows_pad = w.rows.div_ceil(4) * 4;
+        let mut bytes: Vec<u8> = if w.ty == lb_gguf::GgmlType::Q8_0 {
+            w.bytes[..w.rows * w.cols / 32 * 34].to_vec()
+        } else {
+            let mut out = Vec::with_capacity(rows_pad * w.cols / 32 * 34);
+            let mut buf = vec![0f32; w.cols];
+            for r in 0..w.rows {
+                w.dequant_row(r, &mut buf);
+                out.extend_from_slice(&lb_gguf::types::quantize_q8_0(&buf));
+            }
+            out
+        };
+        bytes.resize(rows_pad * w.cols / 32 * 34, 0);
+        let n_blocks = rows_pad * w.cols / 32;
+        let (qs, sc) = crate::repack_q8_0(&bytes, n_blocks);
+        let (n_qs, n_sc) = (qs.len(), sc.len());
+        Ok(Self { rows: w.rows, rows_pad, cols: w.cols, qs: gpu.upload_u32(qs), sc: gpu.upload_u32(sc), n_qs, n_sc, dims: gpu.const_u32(&matvec_dims(rows_pad, w.cols)) })
+    }
+
+    pub fn bytes_on_device(&self) -> usize {
+        (self.n_qs + self.n_sc) * 4
+    }
+
+    /// `out = x @ W^T` for `m` rows of `x`; the output is `[m, rows_pad]`.
+    pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        let n_out = m * self.rows_pad;
+        let out = gpu.scratch(n_out * 4);
+        unsafe {
+            crate::q8_0_matvec_rows_kernel::launch(
+                &gpu.client,
+                cube_count(n_out / 4, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.qs.clone(), self.n_qs / 4),
+                BufferArg::from_raw_parts(self.sc.clone(), self.n_sc),
+                BufferArg::from_raw_parts(x.clone(), m * self.cols / 4),
+                BufferArg::from_raw_parts(self.dims.clone(), 2),
+                BufferArg::from_raw_parts(out.clone(), n_out),
+                4usize,
+            );
+        }
+        out
+    }
+
+    pub fn matvec(&self, gpu: &Gpu, x: &[f32], m: usize) -> Result<Vec<f32>, String> {
+        let xh = gpu.upload_f32(x);
+        let out = self.launch(gpu, &xh, m);
+        let padded = gpu.read_all(vec![(out, m * self.rows_pad)])?.remove(0);
+        Ok(padded.chunks_exact(self.rows_pad).flat_map(|r| r[..self.rows].iter().copied()).collect())
+    }
+}
+
 /// A Q4_0 matrix resident on the device, repacked (see [`repack_q4_0`]).
 pub struct GpuQ4Mat {
     pub rows: usize,

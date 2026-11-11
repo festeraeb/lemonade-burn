@@ -14,7 +14,7 @@
 //! `LB_BENCH_ROUNDS` (default 3) rounds; card: `LB_WGPU_DEVICE` or `LB_CUDA_DEVICE`.
 use lb_gguf::types::quantize_q4_0;
 use lb_gguf::{GgmlType, QuantMat};
-use lb_q4_gpu::{Gpu, GpuExpert, GpuQ4Mat, Q4Math};
+use lb_q4_gpu::{Gpu, GpuExpert, GpuQ4Mat, GpuQ8Mat, Q4Math};
 use std::time::Instant;
 
 struct Rng(u64);
@@ -96,6 +96,28 @@ fn main() -> Result<(), String> {
             let hs: Vec<_> = es.iter().map(|e| e.launch(&gpu, &xh, 1)).collect();
             gpu.read_all(hs)?;
         }
+    }
+    // X7b follow-up, `LB_BENCH_Q8=1`: the same weights as Q4_0 (rows 4, f32) and as Q8_0 (the
+    // transcode target that keeps quality), as chains of `chain` launches with one readback
+    if std::env::var_os("LB_BENCH_Q8").is_some() {
+        gpu.set_q4_rows(4);
+        gpu.set_q4_xshared(false);
+        gpu.set_q4_math(Q4Math::F32);
+        for &(name, r, c) in &[("expert_1536x2048", 1536usize, 2048usize), ("expert_2048x1536", 2048, 1536), ("big_65536x2048", 65536, 2048)] {
+            let wf: Vec<f32> = (0..r * c).map(|_| rng.unit()).collect();
+            let q4b: Vec<u8> = wf.chunks_exact(c).flat_map(|row| quantize_q4_0(row)).collect();
+            let q8b: Vec<u8> = wf.chunks_exact(c).flat_map(|row| lb_gguf::types::quantize_q8_0(row)).collect();
+            let m4 = GpuQ4Mat::upload(&gpu, QuantMat::new(GgmlType::Q4_0, r, c, &q4b))?;
+            let m8 = GpuQ8Mat::upload(&gpu, QuantMat::new(GgmlType::Q8_0, r, c, &q8b))?;
+            let xh = gpu.upload_f32(&x[..c]);
+            for round in 0..rounds {
+                let t4 = time(&mut || { let hs: Vec<_> = (0..chain).map(|_| (m4.launch(&gpu, &xh, 1), r)).collect(); gpu.read_all(hs)?; Ok(()) })? / chain as f64;
+                let t8 = time(&mut || { let hs: Vec<_> = (0..chain).map(|_| (m8.launch(&gpu, &xh, 1), r)).collect(); gpu.read_all(hs)?; Ok(()) })? / chain as f64;
+                println!("{{\"round\":{round},\"arm\":\"q4_0_f32\",\"metric\":\"{name}_chain_ms\",\"value\":{t4:.4},\"gb_s\":{:.1}}}", m4.bytes_on_device() as f64 / 1e9 / (t4 / 1e3));
+                println!("{{\"round\":{round},\"arm\":\"q8_0_f32\",\"metric\":\"{name}_chain_ms\",\"value\":{t8:.4},\"gb_s\":{:.1}}}", m8.bytes_on_device() as f64 / 1e9 / (t8 / 1e3));
+            }
+        }
+        return Ok(());
     }
     for round in 0..rounds {
         for (arm, r, xs, math) in &arms {
