@@ -1,0 +1,38 @@
+[package]
+name = "lb-expert-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Work goes to the weights: an expert host holds (layer, expert) weights and computes them; the trunk sends activations. Wire format, transports (in-process, TCP, unix, RDMA), CPU and device backends."
+
+[features]
+default = []
+# Expert weights resident on a device through lb-q4-gpu (wgpu adapter chosen by LB_WGPU_DEVICE).
+gpu = ["dep:lb-q4-gpu"]
+# The same backend on the cubecl-cuda runtime (LB_CUDA_DEVICE=N).
+cuda = ["gpu", "lb-q4-gpu/cuda"]
+# RoCE / InfiniBand transport (reliable-connected queue pair, send/recv) through csrc/w2w_rdma.c.
+# Needs libibverbs headers at build time and libibverbs.so.1 at run time.
+rdma = ["dep:cc"]
+
+[dependencies]
+lb-gguf.workspace = true
+lb-q4-gpu = { workspace = true, optional = true }
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[[bin]]
+name = "lb-expert-host"
+path = "src/bin/lb-expert-host.rs"
+
+[[bin]]
+name = "lb-hop-bench"
+path = "src/bin/lb-hop-bench.rs"

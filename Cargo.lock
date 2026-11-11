@@ -3869,6 +3869,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-expert-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "clap",
+ "lb-gguf",
+ "lb-q4-gpu",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "lb-expert-predict"
 version = "0.1.0"
 dependencies = [
