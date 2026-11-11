@@ -429,10 +429,16 @@ impl Gpu {
     }
 
     /// X7b on the device: IQ4_XS bytes (`raw`, whole super-blocks, already on the device) ->
-    /// Q4_0 words in the device layout, scale-searched like the host transcode. Returns
+    /// Q4_0 words in the device layout, encoded like the host transcode (plain by default,
+    /// the scale search with `LB_TRANSCODE_SEARCH=1`). Returns
     /// `((qs, n_qs), (sc, n_sc))` as `upload_q4_0` does. `n_super` super-blocks = 8 * n_super
     /// Q4_0 blocks.
     pub fn transcode_iq4_xs_on_device(&self, raw: &Handle, n_super: usize) -> ((Handle, usize), (Handle, usize)) {
+        self.transcode_iq4_xs_on_device_with(raw, n_super, crate::transcode::search_enabled())
+    }
+
+    /// As [`Self::transcode_iq4_xs_on_device`], with the encoder chosen explicitly (`search`).
+    pub fn transcode_iq4_xs_on_device_with(&self, raw: &Handle, n_super: usize, search: bool) -> ((Handle, usize), (Handle, usize)) {
         let n_blocks = 8 * n_super;
         let (n_qs, n_sc) = (n_blocks * 4, n_blocks / 2);
         let qs = self.client.empty(n_qs * 4);
@@ -450,6 +456,7 @@ impl Gpu {
                 BufferArg::from_raw_parts(qs.clone(), n_qs),
                 BufferArg::from_raw_parts(sc.clone(), n_sc),
                 BufferArg::from_raw_parts(n, 1),
+                search,
             );
         }
         ((qs, n_qs), (sc, n_sc))

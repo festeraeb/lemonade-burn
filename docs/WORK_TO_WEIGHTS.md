@@ -839,6 +839,13 @@ P106 (8 GB/s); the 2048-wide dense shapes take ~28-30 us a launch whatever their
 | f16 | no | 207/215 (96.3 %) | 1.45e-2 | 0.51 | 9.5 | c528679c0df98501 | 88.95 / 90.24 / 91.05 | 1.03x |
 | dp4a (polyfill) | no | 197/215 (91.6 %) | 3.29e-2 | 1.21 | 6.7 | c143d10e73104e67 | 90.41 / 89.17 / 89.91 | 1.02x |
 
+The same comparison on a larger sample, the X7q teacher-forcing text (31 prompts, **14,137 positions**,
+`results/abmath-c4AF-qad-kltext.json`): f32m 14137/14137, KLD 0; **f16 top-1 13733/14137 (97.1 %), mean KLD 6.1e-3**
+(max 1.45); **dp4a 13209/14137 (93.4 %), mean KLD 2.0e-2** (max 4.2). For scale (X7q, same text): Q4_0 vs Q8_0 costs
+KLD 0.158, so the f16 math costs ~4 % of one 8->4-bit quant step and dp4a ~13 %. Teacher-forced numbers on the T10
+(sm_75, native `__dp4a`) were identical to the P100's (polyfill) to every printed digit: the arithmetic is the same on
+every card.
+
 held-out-v1 through `lemonade-burn-server` on c4-AF, one server per math (`LB_Q4_MATH`), same harness as experiment
 #3 (temp 0, reasoning off: the server now honours `chat_template_kwargs.enable_thinking: false` with an empty
 `<think></think>`, the equivalent of llama-server's `--reasoning-budget 0`; `results/heldout-lb.jsonl`, scored
@@ -855,7 +862,8 @@ run of the same file scored 37/40: X7q re-runs llama.cpp on this file with this 
 harness (the absolute ">= 39/40" in gate 2 was written against that 37-40 and is not met by f32 either).
 
 **X7a gates:** kernel parity PASS (all paths, all cards). Exact paths (f32, f32m): sha **PASS**, max |dlogit| 0.
-f16 quality **FAIL** (96.3 % < 98 %, KLD 1.45e-2 > 1e-3). dp4a quality **FAIL** (91.6 % < 97 %, KLD 3.3e-2 > 3e-3).
+f16 quality **FAIL** (96.3 % / 97.1 % top-1 < 98 %; KLD 1.45e-2 / 6.1e-3 > 1e-3, 215 / 14,137 positions). dp4a quality
+**FAIL** (91.6 % / 93.4 % < 97 %; KLD 3.3e-2 / 2.0e-2 > 3e-3). held-out-v1 unchanged in every math (35/40).
 Speed gate (>= 1.10x end to end) **FAIL** for every math on every card measured. Default stays `LB_Q4_MATH=f32`.
 
 What this says, plainly:
@@ -874,16 +882,17 @@ What this says, plainly:
 ### X7b: transcode on residency, host and device [measured]
 
 * `lb_gguf` decodes **IQ4_NL and IQ4_XS** (`types.rs`, the 16-level table is part of the format).
-  `lb_q4_gpu::transcode::q4_0_bytes` re-encodes any dequantizable non-Q4_0 matrix to Q4_0 with a per-block scale
-  search (12 candidates down to -20 % of `max/-8`, scored with the f16-rounded scale); it is called by
+  `lb_q4_gpu::transcode::q4_0_bytes` re-encodes any dequantizable non-Q4_0 matrix to Q4_0 (plain `max/-8` encoder by
+  default; `LB_TRANSCODE_SEARCH=1` for a per-block scale search over 12 candidates down to -20 %, scored with the
+  f16-rounded scale, which measured worse on the model, see the X7b results); it is called by
   `GpuQ4Mat::upload`, `GpuExpertLayer::upload{,_stacked}` and the dense loader, so an IQ4_XS (or Q4_K, Q8_0, ...)
-  file loads onto the card as Q4_0 and runs on every per-card math. `LB_TRANSCODE=0` turns it off;
-  `LB_TRANSCODE_SIMPLE=1` takes the plain `max/-8` encoder. On 131k random blocks the search lowers the encode
-  SSE vs plain (unit test).
+  file loads onto the card as Q4_0 and runs on every per-card math. `LB_TRANSCODE=0` turns it off.
+  On 4,096 uniform random blocks the search lowers the encode SSE by 3.3 % vs plain (unit test).
 * **Device form**: `iq4_xs_to_q4_0_kernel` / `Gpu::transcode_iq4_xs_on_device`: raw IQ4_XS super-blocks on the
-  device (34 words each) -> Q4_0 words in the device layout, same scale search. Test
+  device (34 words each) -> Q4_0 words in the device layout, either encoder (comptime `search`). Test
   `tests/device_transcode_matches_host.rs` on c4-86 (P100, idle, 1 min): **bit-identical to the host transcode** on
-  98,304 blocks (0 scale and 0 quant-word differences; the FMA-contraction caveat did not bite), and
+  98,304 blocks, both encoders (0 scale and 0 quant-word differences; the FMA-contraction caveat did not bite;
+  re-run on c4-AF), and
   **16.0 GB/s of IQ4_XS input = 0.10 ms per 1536x2048 expert matrix** vs 19.3 ms for the host transcode (rayon,
   c4, NUMA-bound): ~190x. A miss could DMA 4.25 bpw instead of 4.5 and re-encode on arrival for ~0.3 ms an expert.
 * **Not wired:** the expert cache / staging slots (`ExpertSlots`, the E1 cache, the miss path) still take Q4_0
@@ -892,3 +901,119 @@ What this says, plainly:
   IQ2_M / IQ1_S mixes) are **not decoded** by lb-gguf: they need the formats' lattice tables (512-2048 entries), which
   exist only as data inside llama.cpp / gguf-py; transcribing them is a clean-room call for the operator. Their
   quality and llama.cpp speed are in X7q.
+
+### X7q results: what each quant costs, per card (2026-11-11 07:35-09:30Z) [measured]
+
+Source: LiquidAI's BF16 GGUF of LFM2.5-24B-A2B (sha256 checked against the hub). Quants by `llama-quantize`
+(llama.cpp e14a779, built for this run, static, CUDA sm_60/61/75; an AVX-only copy for c2/c3's CPUs). Q8_0 and Q4_0
+without imatrix; `-imat` rows with an imatrix computed from the Q8_0 on c4-AF over `calib-v1` (186 x 512 tokens,
+origins disjoint from held-out-v1). QAD-Q4_0 = LiquidAI's quantisation-aware-distilled Q4_0 (the engine's usual file),
+not made here. KLD vs Q8_0 by `llama-perplexity --kl-divergence` over the held-out teacher-forcing text (each item's
+prompt + the Q8_0 model's greedy answer, 27 x 512 tokens; Q8_0 base logits on c4-AF with the first 18 layers'
+experts in host RAM). held-out-v1: llama-server, same harness as experiment #3. Decode: `llama-bench` tg128 (3 reps,
+pp512 also recorded) on c4-AF (P100, sm_60, 605 GB/s read [measured]) and c2 T10 (sm_75, 320 GB/s [spec]); c3 P106
+(sm_61, 192 GB/s [spec]) for IQ1_S only (the only file that fits 6 GB). "BW %" = tg128 x weight bytes read per token
+(dense + head + 4 of 64 experts per MoE layer, from the file's tensor sizes) / card bandwidth. Raw:
+`results/x7q.jsonl`, `results/llama-bench.jsonl`, `results/heldout-llama.jsonl`, `logs/kl-*.log`.
+
+| quant | GB | bpw | GB/token | KLD vs Q8_0 (mean / 99 %) | same top | PPL | held-out gate | c2-T10 tg128 (BW %) | c3-p106 tg128 (BW %) | c4-AF tg128 (BW %) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Q8_0 | 25.49 | 8.508 | 2.62 | base | - | - | 36/40 | - | - | - |
+| QAD-Q4_0 | 13.58 | 4.531 | 1.47 | 0.1001 / 0.799 | 87.7 % | 7.529 | 37/40 | 154.8 (71 %) | - | 99.6 (24 %) |
+| Q4_0 | 13.58 | 4.531 | 1.47 | 0.1576 / 1.254 | 84.6 % | 8.080 | 29/40 | 154.9 (71 %) | - | 99.6 (24 %) |
+| Q4_0-imat | 13.62 | 4.545 | 1.47 | 0.1591 / 1.342 | 85.4 % | 8.515 | 30/40 | - | - | 100.0 (24 %) |
+| Q4_K_M-imat | 14.53 | 4.848 | 1.54 | 0.1058 / 0.937 | 87.5 % | 8.381 | 33/40 | 149.9 (72 %) | - | 87.2 (22 %) |
+| IQ4_XS-imat | 12.84 | 4.284 | 1.40 | 0.1203 / 1.018 | 86.8 % | 8.253 | 31/40 | 148.8 (65 %) | - | 90.5 (21 %) |
+| IQ4_XS-imat-tc | 13.58 | 4.531 | 1.47 | 0.2348 / 1.786 | 81.8 % | 8.336 | 35/40 | 154.8 (71 %) | - | 99.7 (24 %) |
+| IQ4_XS-imat-tcs | 13.58 | 4.531 | 1.47 | 0.2079 / 1.731 | 82.8 % | 7.943 | - | - | - | - |
+| IQ4_XS-imat-tc8 | 25.43 | 8.487 | 2.56 | 0.1212 / 0.992 | 86.7 % | 8.330 | - | - | - | - |
+| IQ3_M-imat | 10.52 | 3.512 | 1.19 | 0.1857 / 1.363 | 83.3 % | 8.295 | 31/40 | 117.5 (44 %) | - | 75.7 (15 %) |
+| IQ2_M-imat | 7.88 | 2.63 | 0.92 | 0.3586 / 2.591 | 78.0 % | 8.853 | 25/40 | 127.8 (37 %) | - | 80.7 (12 %) |
+| IQ1_S-imat | 4.93 | 1.646 | 0.65 | 1.8013 / 7.537 | 49.2 % | 33.242 | 9/40 | 159.0 (32 %) | 56.1 (19 %) | 114.3 (12 %) |
+
+`-tc` = the IQ4_XS file re-encoded to Q4_0 by the engine's transcode (scale search), `-tcs` = same with the plain encoder, `-tc8` = re-encoded to Q8_0 (`examples/transcode_gguf.rs`). Q8_0 decode not measured (fits no single card).
+
+Card x format, decode tok/s (llama.cpp tg128; P106 only where the file fits):
+
+| quant | P100 sm_60 tok/s | T10 sm_75 tok/s | P106 sm_61 tok/s | T10 / P100 |
+|---|---|---|---|---|
+| QAD-Q4_0 | 99.6 | 154.8 | - | 1.55x |
+| Q4_0 | 99.6 | 154.9 | - | 1.56x |
+| Q4_0-imat | 100.0 | - | - | - |
+| Q4_K_M-imat | 87.2 | 149.9 | - | 1.72x |
+| IQ4_XS-imat | 90.5 | 148.8 | - | 1.64x |
+| IQ4_XS-imat-tc | 99.7 | 154.8 | - | 1.55x |
+| IQ3_M-imat | 75.7 | 117.5 | - | 1.55x |
+| IQ2_M-imat | 80.7 | 127.8 | - | 1.58x |
+| IQ1_S-imat | 114.3 | 159.0 | 56.1 | 1.39x |
+
+What it says:
+* **Below 4 bits the i-quants buy bytes, not speed, on every card we have.** On the P100 (no dp4a: llama.cpp emulates
+  the int8 dot) IQ3_M decodes at 0.76x Q4_0 and IQ2_M at 0.81x although they read 0.81x and 0.63x the bytes; llama.cpp
+  sits at 12-15 % of HBM2 on them (24 % on Q4_0). On the T10 (native dp4a) the same holds in smaller measure
+  (IQ3_M 0.76x, IQ2_M 0.83x of Q4_0; 37-44 % of bandwidth on them vs 71 % on Q4_0). Only IQ1_S is faster than Q4_0 (P100 1.15x, T10 1.03x)
+  - and IQ1_S destroys the model: KLD 1.80, top-1 agreement 49 %, PPL 33 vs 8, held-out 9/40.
+* **The sacrifice: the 4-bit files span 1.6x in KLD, below 4 bits it climbs fast.** KLD vs Q8_0: QAD-Q4_0 0.100 (the
+  distilled file is the best 4-bit we have), Q4_K_M 0.106, IQ4_XS 0.120, Q4_0 0.158, IQ3_M 0.186, IQ2_M 0.359,
+  IQ1_S 1.80. held-out-v1 is too coarse to rank the 4-bit files (n = 40 gated; the same file through two maths of our
+  engine already moves 2 items: Q8_0 36, QAD 37, Q4_0 29, Q4_K_M 33, IQ4_XS 31), but it does see IQ2_M (25) and
+  IQ1_S (9) fall.
+* **The P100 is the wrong card for llama.cpp's quantised decode:** 24 % of its bandwidth on Q4_0 against the T10's
+  71 %. That is the dp4a gap the operator suspected, measured: the T10 decodes every 4-bit file faster than a
+  P100 (1.56x Q4_0, 1.64x IQ4_XS, 1.72x Q4_K_M) with about half the bandwidth.
+
+### X7b results: transcode on residency, end to end [measured]
+
+IQ4_XS (imatrix) as the stored format, transcoded to Q4_0 when resident:
+
+| path (c4-AF P100 unless named) | VRAM-resident format | tok/s | KLD vs Q8_0 | same top | held-out |
+|---|---|---|---|---|---|
+| llama.cpp, IQ4_XS native | IQ4_XS 12.84 GB | 90.5 | 0.120 | 86.8 % | 31/40 |
+| llama.cpp, IQ4_XS -> Q4_0 transcoded file (scale search, the first default) | Q4_0 13.58 GB | 99.7 (1.10x) | 0.235 | 81.8 % | 35/40 |
+| llama.cpp, IQ4_XS -> Q4_0, plain `max/-8` encoder (**now the default**) | Q4_0 13.58 GB | (= Q4_0 speed) | 0.208 | 82.8 % | - |
+| llama.cpp, IQ4_XS -> Q8_0 (quality only; 25.4 GB, does not fit one P100) | Q8_0 | - | **0.121** | 86.7 % | - |
+| **lemonade-burn, IQ4_XS file, transcoded at load (host), f32 math** | Q4_0 | **88.0** (0.97x of llama.cpp native) | (= the transcoded file) | | 35/40 |
+| lemonade-burn, same, f16 math | Q4_0 | 90.4 | | | |
+| T10: llama.cpp IQ4_XS native / transcoded | | 148.8 / 154.8 (1.04x) | | | |
+
+The scale search (my first default) lowers per-block squared error but measured worse on the model than the plain
+`max/-8` encoder (KLD 0.235 vs 0.208): shrinking the scale clips each block's largest weight, which matters more than
+its squared error says. The plain encoder is now the default (`LB_TRANSCODE_SEARCH=1` for the search), in the host
+and device forms alike; both device forms are bit-identical to their host forms (c4-AF, 98,304 blocks each). The
+lemonade-burn rows above ran with the search encoder (their weights are the `tc` file's).
+
+lemonade-burn load: 118 s to upload 2,432 experts (host transcode included, all c4 cores) vs ~86 s for the Q4_0 file;
+the server, whose rayon pool is capped at `LB_THREADS=8`, took ~11 min for the same transcode;
+`transcode_gguf` on t440: 244 s for the whole file (220 tensors, 12.59 GB IQ4_XS -> 13.33 GB Q4_0). The device kernel
+(0.10 ms an expert matrix) would make the transcode free; it is not wired into the load/miss path yet.
+
+**X7b gates:** speed (transcoded >= 1.3x untranscoded at equal VRAM) **FAIL**: 1.10x in llama.cpp, 0.97x for
+lemonade-burn vs llama.cpp native, 1.04x on the T10. Quality (transcoded KLD within 10 % of native) **FAIL**: +95 %
+(0.235 vs 0.120 with the scale search; +73 % with the plain encoder, 0.208). Re-encoding one 4-bit grid onto another nearly doubles the divergence, and it buys ~10 % speed on
+a P100 because llama.cpp's native IQ4_XS kernel is only ~10 % slower than its Q4_0 one. The quality-preserving target
+is Q8_0 (KLD 0.121 vs native 0.120: +0.7 %, the quality gate passes for it) at 2x the VRAM, for which the engine has no kernel yet; or a native IQ4_XS kernel (a 16-entry table).
+Transcoding the sub-4-bit files to Q4_0 cannot pass at equal VRAM: Q4_0 is 1.7-2.8x larger than IQ2_M/IQ1_S, and
+IQ1_S is already faster than Q4_0 natively.
+
+### X7: answer to the operator's question
+"Can our engine switch math on the fly ... for a 1-bit-quanted layer and the P100?" **Yes, built**: the math is a
+launch parameter over one resident copy, picked per card from the probed compute capability and switchable live, and an
+IQ4_XS (or any lb-gguf-readable) layer can be re-encoded on the device as it becomes resident. **But on our cards the
+switch buys nothing for Q4_0** (every math streams at the same rate; the engine is launch-bound, the kernel
+memory-pattern-bound), **and the wrong math on the wrong card is a 8.5-11x loss** (f16 on sm_61). For the i-quants:
+"at what sacrifice" = the table above; below 4 bits you lose quality fast and gain no speed on P100 or Turing;
+IQ1_S is not usable on this model. So **hardware matching is a must** (pick the math by card, never f16 on sm_61; put
+4-bit files on P100s, Turing for anything int8-heavy), and the 1-bit case is a capacity tool for the slow tiers
+(host RAM, SSD, wire), not a decode format. X8 can take this table as its cost model.
+
+### X7: not run, not verified
+* lemonade-burn speed on sm_61 end to end (the P106 has 6 GB; the model needs ~14 GB resident): kernel timing only.
+* The device transcode is not called by the load or miss path; the expert cache / staging slots take Q4_0 only, so
+  transcoded models run all-resident. No spill config with a transcoded model was run.
+* IQ3_S / IQ2_S / IQ1_S decoding in lb-gguf (needs the formats' lattice tables; clean-room call for the operator), so
+  lemonade-burn ran only the IQ4_XS file; IQ3_M / IQ2_M / IQ1_S are llama.cpp-only rows.
+* No Q8_0 GPU kernel in lemonade-burn (the forge seed `q8_0_matvec_gpu` is still a stub).
+* Q8_0 decode speed (25.5 GB fits no single card here); BF16 KLD base (48 GB).
+* held-out-v1 is n = 40 gated: differences under ~4 items are noise.
+* c4-D8 was in use by other agents (strata-poly, then engine-bench's Vulkan llama-server) for the whole run: every
+  c4 number is from c4-AF (plus one idle-c4-86 minute for the device transcode test).

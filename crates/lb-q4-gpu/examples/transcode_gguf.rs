@@ -84,9 +84,11 @@ fn engine_transcodes(ty: GgmlType, dims: &[usize]) -> bool {
 }
 
 fn main() -> Result<(), String> {
-    let a: Vec<String> = std::env::args().collect();
+    let mut a: Vec<String> = std::env::args().collect();
+    let to_q8 = a.iter().any(|x| x == "--q8");
+    a.retain(|x| x != "--q8");
     if a.len() != 3 {
-        return Err("usage: transcode_gguf <in.gguf> <out.gguf>".into());
+        return Err("usage: transcode_gguf [--q8] <in.gguf> <out.gguf>".into());
     }
     let g = Gguf::open(std::path::Path::new(&a[1])).map_err(|e| e.to_string())?;
     let align = g.alignment;
@@ -100,11 +102,24 @@ fn main() -> Result<(), String> {
         if engine_transcodes(t.ty, &t.dims) {
             let cols = t.dims[0];
             let rows = t.n_elems() / cols;
-            let q = lb_q4_gpu::transcode::q4_0_bytes(&QuantMat::new(t.ty, rows, cols, bytes))?;
+            let m = QuantMat::new(t.ty, rows, cols, bytes);
+            let (ty, q) = if to_q8 {
+                // the plan's other target: Q8_0 (8.5 bpw, ~1e-3 relative); the engine has no Q8_0 kernel
+                // yet, so this is a quality measurement only
+                let mut out = Vec::with_capacity(rows * cols / 32 * 34);
+                let mut buf = vec![0f32; cols];
+                for r in 0..rows {
+                    m.dequant_row(r, &mut buf);
+                    out.extend_from_slice(&lb_gguf::types::quantize_q8_0(&buf));
+                }
+                (GgmlType::Q8_0, out)
+            } else {
+                (GgmlType::Q4_0, lb_q4_gpu::transcode::q4_0_bytes(&m)?.into_owned())
+            };
             n_tc += 1;
             src_b += nb;
             dst_b += q.len();
-            table.push((t.name.clone(), t.dims.clone(), GgmlType::Q4_0, std::borrow::Cow::Owned(q.into_owned())));
+            table.push((t.name.clone(), t.dims.clone(), ty, std::borrow::Cow::Owned(q)));
         } else {
             table.push((t.name.clone(), t.dims.clone(), t.ty, std::borrow::Cow::Borrowed(bytes)));
         }
@@ -145,9 +160,10 @@ fn main() -> Result<(), String> {
     }
     w.flush().map_err(|e| e.to_string())?;
     println!(
-        "{{\"in\":{:?},\"out\":{:?},\"tensors\":{},\"transcoded\":{n_tc},\"src_bytes\":{src_b},\"q4_0_bytes\":{dst_b},\"secs\":{:.1},\"search\":{}}}",
+        "{{\"in\":{:?},\"out\":{:?},\"target\":\"{}\",\"tensors\":{},\"transcoded\":{n_tc},\"src_bytes\":{src_b},\"dst_bytes\":{dst_b},\"secs\":{:.1},\"search\":{}}}",
         a[1],
         a[2],
+        if to_q8 { "Q8_0" } else { "Q4_0" },
         table.len(),
         t0.elapsed().as_secs_f64(),
         std::env::var_os("LB_TRANSCODE_SIMPLE").is_none()

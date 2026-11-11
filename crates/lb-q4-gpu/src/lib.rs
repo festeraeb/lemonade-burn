@@ -1208,8 +1208,11 @@ pub const TRANSCODE_CUBE: usize = 128;
 /// One Q4_0 block (32 values in `v`) encoded the way [`transcode::quantize_q4_0_block_search`]
 /// does on the host (scale searched over 12 candidates, scored with the f16-rounded scale): its
 /// f16 scale bits, and its nibbles written into `q`.
+///
+/// `search = false` is the plain encoder instead (`lb_gguf::types::quantize_q4_0`: `d = max / -8`,
+/// quants from the unrounded `d`, `d` stored as f16), the transcode default (see transcode.rs).
 #[cube]
-fn q4_0_encode_search(v: &Array<f32>, q: &mut Array<u32>) -> u32 {
+fn q4_0_encode_search(v: &Array<f32>, q: &mut Array<u32>, #[comptime] search: bool) -> u32 {
     let mut amax = 0.0f32;
     let mut mx = 0.0f32;
     for i in 0..32usize {
@@ -1221,8 +1224,9 @@ fn q4_0_encode_search(v: &Array<f32>, q: &mut Array<u32>) -> u32 {
     }
     let base = mx / -8.0f32;
     let mut best_err = 3.0e38f32;
-    let mut best_d = 0.0f32;
-    for k in 0..12u32 {
+    let mut best_d = base;
+    let n_cand = comptime!(if search { 12u32 } else { 0u32 });
+    for k in 0..n_cand {
         let d = f32::cast_from(half::f16::cast_from(base * (1.0f32 - 0.018f32 * f32::cast_from(k))));
         let mut id = 0.0f32;
         if d != 0.0f32 {
@@ -1255,7 +1259,7 @@ fn q4_0_encode_search(v: &Array<f32>, q: &mut Array<u32>) -> u32 {
 /// PAIR of 32-value blocks (4 pairs a super-block), so each unit owns whole `sc` words. `levels`
 /// holds the 16 IQ4 levels as f32. `n[0]` = number of pairs.
 #[cube(launch)]
-fn iq4_xs_to_q4_0_kernel(raw: &[u32], levels: &[f32], qs: &mut [u32], sc: &mut [u32], n: &[u32]) {
+fn iq4_xs_to_q4_0_kernel(raw: &[u32], levels: &[f32], qs: &mut [u32], sc: &mut [u32], n: &[u32], #[comptime] search: bool) {
     let p = CUBE_POS * CUBE_DIM_X as usize + UNIT_POS_X as usize;
     if p < n[0] as usize {
         let s = p / 4usize;
@@ -1281,7 +1285,7 @@ fn iq4_xs_to_q4_0_kernel(raw: &[u32], levels: &[f32], qs: &mut [u32], sc: &mut [
                     v[i + 16usize] = dl * levels[(byte >> 4u32) as usize];
                 }
             }
-            let dbits = q4_0_encode_search(&v, &mut q);
+            let dbits = q4_0_encode_search(&v, &mut q, search);
             scw |= dbits << (16u32 * h);
             // device word k: nibble j = value 4j + k (j < 4), 16 + 4(j-4) + k (j >= 4)
             let blk = 2usize * p + h as usize;

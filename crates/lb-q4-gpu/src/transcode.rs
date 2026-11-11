@@ -7,10 +7,12 @@
 //! normal upload (repack + DMA). The device form (raw compact bytes DMA'd and re-encoded by a
 //! kernel, like `q4_0_repack_kernel` does for Q4_0) is not built: see docs/WORK_TO_WEIGHTS.md X7.
 //!
-//! Re-quantizing is lossy (a 4-bit grid onto a different 4-bit grid). The Q4_0 encoder here
-//! searches the block scale ([`quantize_q4_0_search`]) instead of taking `max / -8`, which is
-//! what keeps the compounded error small; `LB_TRANSCODE_SIMPLE=1` takes the plain encoder for
-//! the A/B. `LB_TRANSCODE=0` refuses non-Q4_0 uploads (the old behaviour).
+//! Re-quantizing is lossy (a 4-bit grid onto a different 4-bit grid). Default encoder: the plain
+//! `max / -8` (`lb_gguf::types::quantize_q4_0`). `LB_TRANSCODE_SEARCH=1` takes the scale search
+//! ([`quantize_q4_0_search`]), which lowers the squared error per block but measured WORSE on
+//! the model (X7b, IQ4_XS -> Q4_0: KLD vs Q8_0 0.235 searched vs 0.208 plain): shrinking the scale
+//! clips each block's largest weight, and those matter more than their squared error says.
+//! `LB_TRANSCODE=0` refuses non-Q4_0 uploads (the old behaviour).
 
 use half::f16;
 use lb_gguf::{GgmlType, QuantMat};
@@ -20,6 +22,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Nanoseconds spent transcoding and source bytes transcoded, process-wide (for reports).
 pub static TRANSCODE_NS: AtomicU64 = AtomicU64::new(0);
 pub static TRANSCODE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `LB_TRANSCODE_SEARCH=1`: re-encode with the scale search instead of the plain encoder.
+pub fn search_enabled() -> bool {
+    std::env::var("LB_TRANSCODE_SEARCH").map(|v| v == "1").unwrap_or(false)
+}
 
 fn enabled() -> bool {
     std::env::var("LB_TRANSCODE").map(|v| v != "0").unwrap_or(true)
@@ -93,7 +100,7 @@ pub fn q4_0_bytes<'a>(m: &QuantMat<'a>) -> Result<Cow<'a, [u8]>, String> {
     }
     use rayon::prelude::*;
     let t = std::time::Instant::now();
-    let simple = std::env::var_os("LB_TRANSCODE_SIMPLE").is_some();
+    let simple = !search_enabled();
     let rb = m.cols / 32 * 18;
     let mut out = vec![0u8; m.rows * rb];
     out.par_chunks_mut(rb).enumerate().for_each_init(
