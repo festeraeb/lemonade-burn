@@ -3,7 +3,7 @@
 # pinned pool) vs the previous build, on c2 GPU2 beside the live seat: parity tests, the miss
 # breakdown bench, then the same-config on-demand e2e (greedy sha must stay 062392b8d2b0361a).
 set -u
-BASE=/home/cesarops/lb-measure; OUT=$BASE/out/devrepack-b1; mkdir -p $OUT
+BASE=$HOME/lb-measure; OUT=$BASE/out/devrepack-b1; mkdir -p $OUT
 export LD_LIBRARY_PATH=$BASE/lib:${LD_LIBRARY_PATH:-}; export CUDA_PATH=$BASE/cuda-path
 export LB_MODEL=$BASE/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf LB_CUDA_DEVICE=2
 cd $BASE

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -u
-BASE=/home/cesarops/lb-measure; OUT=$BASE/out/pinned-b5; mkdir -p $OUT
+BASE=$HOME/lb-measure; OUT=$BASE/out/pinned-b5; mkdir -p $OUT
 export LD_LIBRARY_PATH=$BASE/lib:${LD_LIBRARY_PATH:-}; export CUDA_PATH=$BASE/cuda-path
 BIN=$BASE/cuda-bin/copy_bench_pinned
 run() { local label=$1; shift

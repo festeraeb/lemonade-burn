@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! lb-hop-bench serve --listen tcp://0.0.0.0:7400 --wait block
-//! lb-hop-bench run --connect tcp://10.0.10.204:7400 --wait block --server-wait block \
+//! lb-hop-bench run --connect tcp://c4-25g:7400 --wait block --server-wait block \
 //!        --label "t440->c4 25G tcp" --out /mnt/fast/w2w/results/w0-hop.jsonl
 //! lb-hop-bench local --out ...      # in-process channel, loopback TCP, unix socket; block and busy
 //! ```

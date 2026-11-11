@@ -3,12 +3,12 @@
 # (placement hosts gpu://N), lfm2-check --ab-device: the old path (host-routed, experts on the in-box cards'
 # views) against the device path (activation card to card, one read a token). Cards back to 0 MiB after.
 set -u
-W=${W:-/mnt/t440/fast/w2w}; BASE=${BASE:-/home/cesarops/lb-e2}; BIN=$W/bin
+W=${W:-/mnt/t440/fast/w2w}; BASE=${BASE:-$HOME/lb-e2}; BIN=$W/bin
 OUT=$W/results/w3; LOGS=$W/logs/w3; RUN=$W/run/w3; mkdir -p "$OUT" "$LOGS" "$RUN"
 MODEL=$BASE/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf; TOK=$BASE/models/tokenizer.json
 export LD_LIBRARY_PATH=$W/lib-nccl:$BASE/lib:${LD_LIBRARY_PATH:-} CUDA_PATH=$BASE/cuda-path CUDA_DEVICE_ORDER=PCI_BUS_ID NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 unset NAUTIBURN_SCRAPE_DIR
-declare -A U=( [3B]=GPU-72784f3e-9536-8d2b-cc49-3081a131de54 [3C]=GPU-c012cc70-3f06-1718-84e2-073aa275f0af [86]=GPU-0c4b4f5d-5f54-46db-be25-f6ffdf75ac79 [AF]=GPU-fd9b03e5-aed9-cbca-a57b-efc90d61addd [D8]=GPU-2d66f961-cba7-717f-1bd7-a04fff1fc8ab )
+declare -A U=( [3B]=${UUID_C4_3B:?card UUID} [3C]=${UUID_P100_3C:?card UUID} [86]=${UUID_C4_86:?card UUID} [AF]=${UUID_C4_AF:?card UUID} [D8]=${UUID_C4_D8:?card UUID} )
 TRUNK=${TRUNK:-D8}; CARDS=${CARDS:-AF}; TAG=${TAG:-e1}; LAYERS=${LAYERS:-"2-39"}
 used_of() { nvidia-smi --id="${U[$1]}" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' '; }
 for c in 3B 3C 86 AF D8; do [ "$(used_of $c)" -lt 64 ] || { echo "card $c busy: stop"; exit 3; }; done

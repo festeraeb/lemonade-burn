@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! lb-expert-host --model m.gguf --placement placement.json --name a --listen tcp://0.0.0.0:7411
-//! lb-expert-host --model m.gguf --hold "2-39:0-63" --name all --listen rdma://10.0.10.204:7411 --wait spin:200
+//! lb-expert-host --model m.gguf --hold "2-39:0-63" --name all --listen rdma://c4-25g:7411 --wait spin:200
 //! ```
 //! With `--placement` the file is watched: when it changes the host loads what it gained,
 //! releases what it lost, and answers for the new set. With `--backend gpu` (features `gpu` or
@@ -35,7 +35,7 @@ struct Args {
     #[arg(long)]
     hold: Option<String>,
     /// Address to listen on; repeatable (`tcp://0.0.0.0:7411`, `unix:///run/x.sock`,
-    /// `rdma://10.0.10.204:7412`).
+    /// `rdma://c4-25g:7412`).
     #[arg(long, required = true)]
     listen: Vec<String>,
     /// How a connection waits for the next request: `block`, `busy` (one core per

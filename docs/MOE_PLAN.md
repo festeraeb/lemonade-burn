@@ -10,7 +10,7 @@ Mixtral 8x7B: 32 layers, 8 experts per layer, top-2 routing, hidden 4096, expert
 14336 (SwiGLU: w1 gate, w3 up, w2 down), about 46.7B total and 12.9B active parameters
 per token (model config / model card).
 
-The fleet has served it with llama.cpp (read-only look at cesarops4om
+The fleet has served it with llama.cpp (read-only look at c4
 `~/nauti-seats/start_mixtral_cpumoe.sh` and `start_mixtral_rpc.sh`): Q4_K_M GGUF split
 across the Tesla T10 (16 GB) and RTX 2060 (12 GB), `--n-cpu-moe 5` (experts of 5 layers on
 CPU), `-fa on`, q8_0 KV, 16k context, NautiBurn MoE scrape enabled
@@ -48,7 +48,7 @@ Each expert is three matrices: `w1`/`w3` [14336 x 4096] and `w2` [4096 x 14336],
 
 A decode token reads 64 expert FFNs (32 layers x top-2), about 6.3 GB at Q4
 **[estimate]**. On c3, the measured DRAM read ceiling is about 11 GB/s ([measured]:
-`kbench` with `KB_STREAM=1` on cesarops3, 11.27 GB/s read sweep, 10.8 GB/s ternary GEMV).
+`kbench` with `KB_STREAM=1` on c3, 11.27 GB/s read sweep, 10.8 GB/s ternary GEMV).
 That bounds CPU-only Q4 Mixtral on c3 at roughly 0.6 s per token **[estimate]**, and in
 practice c3 cannot hold Q4 Mixtral at all (15 GB RAM).
 
