@@ -32,14 +32,14 @@ routings against our static heat plan's 48 %).
   decode's host-MoE branch is switched on with it (`LB_DD_HOST_MOE`). The staging ring stays behind
   `LB_STAGE` and is ignored when the cache is on (no prefetch copies in E1).
 
-## Results (2026-11-08, cesarops2, LFM2.5-24B-A2B Q4_0, 5 prompts / 288 decode tokens a session)
+## Results (2026-11-08, c2, LFM2.5-24B-A2B Q4_0, 5 prompts / 288 decode tokens a session)
 
 Arms interleaved e1 / c / a0 (reversed on even rounds), 5 rounds each, expert budget 5120 MiB in every arm.
 e1 = this cache; c = llama.cpp e14a779 `-cmoe --moe-cache-mib 5120` (sm_60/61/75 build); a0 = the static
 heat plan + on-demand misses (`LB_EXPERT_CACHE=0`, exp. #2's arm a). Hit rate: decode routings served
 without a copy, after the warmup (llama.cpp: its own counter, whole process, batches of <= 8 tokens).
 
-### Tesla P100 Gen3 x16 (c2 GPU2, UUID GPU-c012cc70-...)
+### Tesla P100 Gen3 x16 (c2 GPU2, UUID <card UUID>)
 
 | arm | tok/s median [min-max], 5 rounds | x llama.cpp | hit rate | misses / token | device memory at load / max after any completion |
 |---|---|---|---|---|---|
@@ -55,7 +55,7 @@ All [measured]. e1 token 65.2 ms = 13.6 router-input reads + 37.2 MoE reads (ker
 * **Soak:** one server, 50 passes of the 5 prompts (250 completions): device memory 6439 MiB after pass 0
   and after every later pass (min = max = 6439), one sha per prompt throughout.
 
-### RTX 2060 SUPER Gen2 x4 (c2 GPU1, UUID GPU-de3ce5bc-..., 1.45 GB/s)
+### RTX 2060 SUPER Gen2 x4 (c2 GPU1, UUID <card UUID>, 1.45 GB/s)
 
 | arm | tok/s median [min-max], 5 rounds | x llama.cpp | hit rate | misses / token | device memory at load / max after any completion |
 |---|---|---|---|---|---|

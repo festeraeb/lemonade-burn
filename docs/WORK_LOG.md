@@ -17,7 +17,7 @@ micro-numbers on any GPU host.
 
 ## Measure on c2, not t440 **[changed 2026-11-01 — read this first]**
 
-**Measurement moved to cesarops2.** The operator freed it for exactly this. Everything below
+**Measurement moved to c2.** The operator freed it for exactly this. Everything below
 about t440's noise still explains *why*, but t440 is no longer where you measure.
 
 | | t440 | **c2 (use this)** |
@@ -53,9 +53,9 @@ arithmetic" finding below.
 **Caveat closed.** The hour-gap repeat was owed and has been run (Q3, 14:43, 64 minutes after
 Q1). It moved the bar from 1.05x to **1.1x** — so quote **1.1x**, and remember that the
 2-minute figure flattered the box. Raw runs are kept on c2 at
-`/home/cesarops/lb-measure/out/Q{1,2,3}.out`.
+`$HOME/lb-measure/out/Q{1,2,3}.out`.
 
-Run it there: everything is local to c2 under `/home/cesarops/lb-measure/`
+Run it there: everything is local to c2 under `$HOME/lb-measure/`
 (`bin/lemonade-burn-server`, `models/`, `scrapes/`, `c2_e2e.sh <label> [args...]`). **No NFS in
 the measured path** — the 13.6 GB GGUF and the tokenizer are copied to c2's own disk.
 **No rebuild needed**: a t440-built binary runs as-is (c2 glibc 2.44 > t440's 2.39, and
@@ -517,7 +517,7 @@ Blocker B1 of `~/agentnotes/fable-vs-gemini-engine-compare-2026-11-02.md`: nobod
 cubecl-cuda h2d on our cards (the "~12 GB/s" above is raw `cudaMemcpy`; the 46x loss was wgpu).
 Commit 603512f adds a `cuda` feature (`LB_CUDA_DEVICE=N`, driver order) beside the wgpu path and
 `examples/copy_bench.rs`. Built on t440 with `CUDARC_CUDA_VERSION=12080` (without it cudarc falls
-back to CUDA 13, which dropped Pascal); run on **cesarops2**, load 0.1-0.5, GPU2 = Tesla P100 at
+back to CUDA 13, which dropped Pascal); run on **c2**, load 0.1-0.5, GPU2 = Tesla P100 at
 bus `0000:0D:00.0`, Gen3 x16, driver 580.178.04. Both runtimes were confirmed on that bus by
 `nvidia-smi --query-compute-apps` sampled mid-run (wgpu `discrete:2` happens to be the same card).
 c2 has no CUDA toolkit: `libnvrtc.so.12.8.93`, `libnvrtc-builtins` and `nvvm/libdevice/libdevice.10.bc`
@@ -573,7 +573,7 @@ copies), consistent with "a token is ~145 host syncs" above. Raw outputs: c2
 The 11-03 table above left the ~3x between CubeCL's `create(Bytes)` and raw `cudaMemcpy`
 unexplained. Answered with a timer probe inside cubecl-server 0.11.2 `write_to_gpu` and
 cubecl-cuda 0.11.2 `copy_to_device` (local patch, `bench/cubecl-probe/`, never upstream),
-run on **cesarops2 GPU2** (Tesla P100 at bus `0D:00.0`, Gen3 x16, driver 580.178.04) beside an
+run on **c2 GPU2** (Tesla P100 at bus `0D:00.0`, Gen3 x16, driver 580.178.04) beside an
 idle seat on the same card (0 % util at every start, 5 GB free, which is enough for the blobs).
 Host: Xeon E5-2450 v2 (Ivy Bridge, 2.5 GHz), load 0.1-0.8. Raw per-call lines: c2
 `~/lb-measure/out/probe-b2/`; medians over the 20 timed reps after one warm-up.
@@ -691,7 +691,7 @@ must wait for the card to read empty first.
 Raw outputs on c2: `~/lb-measure/out/repack-*` (host repack), `devrepack-b1/` (parity, miss bench,
 nine e2e runs, `devrepack-ab.log`), `register_bench` lines in `docs` below. Scripts:
 `bench/cubecl-probe/c2_devrepack_ab.sh`; benches `examples/repack_bench.rs`, `miss_bench.rs`,
-`register_bench.rs`. Host: cesarops2 GPU2 (P100, Gen3 x16), beside the live llama-server seat on
+`register_bench.rs`. Host: c2 GPU2 (P100, Gen3 x16), beside the live llama-server seat on
 the same card (so the on-demand config, 602 residents, as in the pool A/B), load 0.05-9 during
 the back-to-back servers; the e2e deltas below are far above the 1.4-2.7 % this box drifts.
 
@@ -786,7 +786,7 @@ pure bus time; and layer-ahead prefetch (stage 5) now has a 0.28 ms miss to hide
 
 ## c4 is the measurement host now; the llama.cpp gap on the same model and card (Fable, 2026-11-04)
 
-**Host change.** c2's P100s went to forge seats, so lemonade-burn measures on **cesarops4om GPU 3**
+**Host change.** c2's P100s went to forge seats, so lemonade-burn measures on **c4 GPU 3**
 (Tesla P100-PCIE-16GB, bus AF:00.0, Gen3 x16; `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3
 LB_CUDA_DEVICE=0`). Everything local under `/mnt/models/lb-measure/` (`models/`, `bin/`, `lib/`
 = CUDA 12.8 nvrtc from c2, `scrapes/`, `c4_e2e.sh`, `c4_llama.sh`). c4 is a shared box: the `kat`
@@ -880,7 +880,7 @@ the parity is proven, with `LB_NO_BATCH_MISS=1` / the live `batch_miss` knob as 
 
 Branch `fable/device-decode-2026-11-07` (off `fable/tunables-2026-11-04`), commits `5fedfe2` (D1
 kernels), `53b4780` (the token loop), `4b76e80` (D2). Spec: `docs/DEVICE_DECODE_PLAN.md`. Test card:
-**cesarops1's GTX 1070** (8 GB, nvidia-smi 0, `LB_WGPU_DEVICE=discrete:0` / `LB_CUDA_DEVICE=0`
+**c1's GTX 1070** (8 GB, nvidia-smi 0, `LB_WGPU_DEVICE=discrete:0` / `LB_CUDA_DEVICE=0`
 with c4's CUDA 12.8 nvrtc in `/mnt/models/lb-dd/lib`), model on c1's local disk
 (`/mnt/models/lfm25/`). No P100 was touched. Everything below is off by default.
 
@@ -1048,7 +1048,7 @@ mostly 22 per-layer round trips becoming cheaper ones. **No tok/s claim comes fr
 
 ## D3 on the P100: device decode 79-82 tok/s, llama.cpp 82.0 in the same session; defaults flipped (2026-11-07, 18:10-18:24Z)
 
-**Card.** c4's Tesla P100 at **AF:00.0**, pinned by UUID (`CUDA_VISIBLE_DEVICES=GPU-fd9b03e5-aed9-cbca-a57b-efc90d61addd`,
+**Card.** c4's Tesla P100 at **AF:00.0**, pinned by UUID (`CUDA_VISIBLE_DEVICES=<card UUID>`,
 `LB_CUDA_DEVICE=0`). **c4's card set has changed since 11-04:** `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3`
 now resolves to the **RTX 2060 at D8:00.0** (PCI order today: 18:00 P100, 3B:00 T10, AF:00 P100, D8:00 2060), so
 `c4_e2e.sh` / `c4_llama.sh`'s default `CUDA_DEV=3` is stale and points at the wrong card. Every run below set

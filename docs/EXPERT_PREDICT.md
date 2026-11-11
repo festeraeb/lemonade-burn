@@ -49,7 +49,7 @@ Also routing concentration (share of routings in the top 8/16/24/32/48/64 expert
 
 ## Run layout (resumable)
 
-Run directory (on t440's /mnt/fast; cesarops2 sees it as `/mnt/t440/fast/...`):
+Run directory (on t440's /mnt/fast; c2 sees it as `/mnt/t440/fast/...`):
 `/mnt/fast/lb-expert-predict/LFM2.5-24B-A2B-QAD-Q4_0/`
 
 ```
@@ -69,14 +69,14 @@ names; the runner skips done chunks. A stand-in layer is done when its summary e
 
 ### Resume commands
 
-Binaries and the model live on cesarops2 under `/mnt/ssd/lb-expert-predict/` (bin/, models/;
+Binaries and the model live on c2 under `/mnt/ssd/lb-expert-predict/` (bin/, models/;
 the GGUF is a copy of t440 `/mnt/raid0/models/lfm25/LFM2.5-24B-A2B-QAD-Q4_0.gguf`).
 
 ```sh
 # capture (skips finished chunks)
-ssh cesarops2 'setsid nohup /mnt/t440/fast/lb-expert-predict/LFM2.5-24B-A2B-QAD-Q4_0/run-capture.sh >/dev/null 2>&1 </dev/null &'
+ssh c2 'setsid nohup /mnt/t440/fast/lb-expert-predict/LFM2.5-24B-A2B-QAD-Q4_0/run-capture.sh >/dev/null 2>&1 </dev/null &'
 # report + stand-in finder (stand-in skips finished layers)
-ssh cesarops2 'setsid nohup /mnt/t440/fast/lb-expert-predict/LFM2.5-24B-A2B-QAD-Q4_0/run-analysis.sh >/dev/null 2>&1 </dev/null &'
+ssh c2 'setsid nohup /mnt/t440/fast/lb-expert-predict/LFM2.5-24B-A2B-QAD-Q4_0/run-analysis.sh >/dev/null 2>&1 </dev/null &'
 ```
 
 On another node: build with
@@ -85,12 +85,12 @@ needed), then run either script with `BIN=`/`BINDIR=`, `MODEL=`, `TOK=` and `RUN
 that node's binaries, a copy of the same GGUF + `tokenizer.json`, and the run directory
 (`/mnt/fast/...` on t440). `THREADS=` caps rayon threads (default 16).
 
-Hardware: cesarops2 CPU (2x E5-2450 v2, AVX only, 16 threads), `nice 5`; ~2.9 decode tok/s
+Hardware: c2 CPU (2x E5-2450 v2, AVX only, 16 threads), `nice 5`; ~2.9 decode tok/s
 with capture, ~1 min per prompt. No GPU is used (the free P100 was offered; the CPU path is
 the one with the hooks and was fast enough). Hit rates and stand-in scores do not depend on
 the hardware.
 
-## Results, LFM2.5-24B-A2B Q4_0 (2026-11-08, cesarops2 CPU)
+## Results, LFM2.5-24B-A2B Q4_0 (2026-11-08, c2 CPU)
 
 Capture: 32 prompts, **7,045 tokens (5,120 decode, 1,925 prefill)**, 38 MoE layers, 64 experts
 top-4: 267,710 token-layer pairs per predictor. Sanity: `mid0` reproduces the engine's set on

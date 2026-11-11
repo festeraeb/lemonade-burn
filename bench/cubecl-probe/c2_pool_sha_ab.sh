@@ -4,7 +4,7 @@
 # needs ~13.7 GB and a free card). `on-demand` misses make every token upload experts through
 # the pool, which is the path the pool exists for.
 set -u
-BASE=/home/cesarops/lb-measure; OUT=$BASE/out/pool-sha-ab; mkdir -p $OUT
+BASE=$HOME/lb-measure; OUT=$BASE/out/pool-sha-ab; mkdir -p $OUT
 export LD_LIBRARY_PATH=$BASE/lib:${LD_LIBRARY_PATH:-}; export CUDA_PATH=$BASE/cuda-path
 ARGS="--gpu --placement-from-scrapes $BASE/scrapes --gpu-budget-mb ${BUDGET:-3200} --gpu-dense-mb ${DENSE:-600} --miss-policy on-demand"
 cd $BASE
