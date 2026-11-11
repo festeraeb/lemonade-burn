@@ -8,7 +8,6 @@
 //! `down(silu(gate(x)) * up(x))`.
 
 use crate::weights::{ExpertMats, Weights};
-use lb_gguf::matvec_f32;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -332,6 +331,10 @@ pub struct ExpertStore {
     /// it and the static residents / ring are not used.
     #[cfg(feature = "gpu")]
     pub cache: Mutex<Option<crate::cache::ExpertCache>>,
+    /// Work-to-weights (`remote.rs`): experts the placement puts on expert hosts are asked for
+    /// there first; whatever a host does not answer runs on the paths above. `None` = every
+    /// expert is this process's own.
+    pub remote: Option<std::sync::Arc<crate::remote::RemoteTier>>,
 }
 
 impl ExpertStore {
@@ -447,19 +450,8 @@ pub fn expert_layers_enabled() -> bool {
 /// Executes an expert FFN for a batch of tokens. One SwiGLU expert:
 /// `down(silu(gate x) * up x)`. `x` is `m` rows of `n_embd`; returns `m` rows of `n_embd`.
 pub fn expert_ffn(w: &Weights, gate: &ExpertMats, up: &ExpertMats, down: &ExpertMats, e: usize, x: &[f32], m: usize) -> Vec<f32> {
-    let n_ff = gate.rows;
-    let n_embd = down.rows;
-    let mut g = vec![0f32; m * n_ff];
-    let mut u = vec![0f32; m * n_ff];
-    matvec_f32(w.mat(&gate.expert(e)), x, m, &mut g);
-    matvec_f32(w.mat(&up.expert(e)), x, m, &mut u);
-    for (gi, ui) in g.iter_mut().zip(&u) {
-        let s = *gi / (1.0 + (-*gi).exp());
-        *gi = s * ui;
-    }
-    let mut out = vec![0f32; m * n_embd];
-    matvec_f32(w.mat(&down.expert(e)), &g, m, &mut out);
-    out
+    // one source for the arithmetic: an expert host's CPU backend calls the same function
+    lb_expert_host::expert::swiglu(w.mat(&gate.expert(e)), w.mat(&up.expert(e)), w.mat(&down.expert(e)), x, m)
 }
 
 /// MoE FFN for `m` tokens: route each token, group tokens by expert, run each expert once
@@ -525,12 +517,41 @@ pub fn moe_ffn_with(
     }
     let mut experts: Vec<(usize, Vec<(usize, f32)>)> = by_expert.into_iter().collect();
     experts.sort_by_key(|(e, _)| *e);
+    // Work-to-weights: experts the placement puts on hosts are computed there. What comes back
+    // is each expert's unweighted output; what a host did not answer stays in `experts` and
+    // runs below as if there were no hosts. The sum at the end is over both, ascending id.
+    let remote_parts: Vec<(usize, Vec<(usize, f32)>, Vec<f32>)> = match store.remote.as_ref() {
+        Some(rt) => rt.serve_layer(layer, &mut experts, x, m),
+        None => Vec::new(),
+    };
+    // ascending expert id: the sum is the same whatever served each expert
+    let sum_parts = |mut parts: Vec<(usize, Vec<(usize, f32)>, Vec<f32>)>| -> Vec<f32> {
+        parts.sort_by_key(|(e, _, _)| *e);
+        let mut out = vec![0f32; m * n_embd];
+        for (_, toks, y) in parts {
+            for (i, (t, wt)) in toks.iter().enumerate() {
+                let o = &mut out[t * n_embd..(t + 1) * n_embd];
+                for (oj, yj) in o.iter_mut().zip(&y[i * n_embd..(i + 1) * n_embd]) {
+                    *oj += wt * yj;
+                }
+            }
+        }
+        out
+    };
+    if experts.is_empty() {
+        // every expert of this layer came from a host
+        return (sum_parts(remote_parts), routes);
+    }
     // the dynamic cache, when on, serves every expert of the layer (`cache.rs`)
     #[cfg(feature = "gpu")]
     if let (Some(gpu), Ok(mut guard)) = (store.gpu.as_ref(), store.cache.lock()) {
         if let Some(cache) = guard.as_mut() {
             match moe_cached(w, gate, up, down, x, m, gpu, cache, layer, stats, &experts) {
-                Ok(out) => return (out, routes),
+                Ok(outs) => {
+                    let mut parts = remote_parts;
+                    parts.extend(experts.into_iter().zip(outs).map(|((e, toks), y)| (e, toks, y)));
+                    return (sum_parts(parts), routes);
+                }
                 Err(e) => panic!("expert cache, layer {layer}: {e}"),
             }
         }
@@ -704,17 +725,8 @@ pub fn moe_ffn_with(
     }
 
     // ascending expert id: the sum is the same whatever served each expert (see above)
-    parts.sort_by_key(|(e, _, _)| *e);
-    let mut out = vec![0f32; m * n_embd];
-    for (_, toks, y) in parts {
-        for (i, (t, wt)) in toks.iter().enumerate() {
-            let o = &mut out[t * n_embd..(t + 1) * n_embd];
-            for (oj, yj) in o.iter_mut().zip(&y[i * n_embd..(i + 1) * n_embd]) {
-                *oj += wt * yj;
-            }
-        }
-    }
-    (out, routes)
+    parts.extend(remote_parts);
+    (sum_parts(parts), routes)
 }
 
 /// One MoE layer through the dynamic cache: plan (hits promoted, misses take SLRU victims), queue
@@ -734,7 +746,7 @@ fn moe_cached(
     layer: usize,
     stats: &PlacementStats,
     experts: &[(usize, Vec<(usize, f32)>)],
-) -> Result<Vec<f32>, String> {
+) -> Result<Vec<Vec<f32>>, String> {
     let n_embd = w.cfg.n_embd;
     let needed: Vec<usize> = experts.iter().map(|(e, _)| *e).collect();
     let t = std::time::Instant::now();
@@ -777,17 +789,9 @@ fn moe_cached(
     if m == 1 {
         stats.stage.moe_read_ns.fetch_add(dt, Ordering::Relaxed);
     }
-    // ascending expert id (the order of `experts`), as `moe_ffn_with`
-    let mut out = vec![0f32; m * n_embd];
-    for ((_, toks), y) in experts.iter().zip(outs) {
-        for (i, (t, wt)) in toks.iter().enumerate() {
-            let o = &mut out[t * n_embd..(t + 1) * n_embd];
-            for (oj, yj) in o.iter_mut().zip(&y[i * n_embd..(i + 1) * n_embd]) {
-                *oj += wt * yj;
-            }
-        }
-    }
-    Ok(out)
+    // one output per expert, in the order of `experts`; the caller weights and sums them (with
+    // any that came from expert hosts) in ascending expert id
+    Ok(outs)
 }
 
 /// Read every `run-*.json` scrape file in `dir` (unreadable files are skipped).

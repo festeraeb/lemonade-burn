@@ -290,6 +290,15 @@ impl HeldSet {
         (0..self.n_layer).flat_map(move |l| (0..self.n_expert).filter(move |&e| self.holds(l, e)).map(move |e| (l, e)))
     }
 
+    /// Drop every layer for which `keep` is false (layers of the model that have no experts).
+    pub fn retain_layers(&mut self, keep: impl Fn(usize) -> bool) {
+        for l in 0..self.n_layer {
+            if !keep(l) {
+                self.bits[l * self.words..(l + 1) * self.words].fill(0);
+            }
+        }
+    }
+
     /// Whether every expert of `layer` is in the set.
     pub fn layer_whole(&self, layer: usize) -> bool {
         (0..self.n_expert).all(|e| self.holds(layer, e))
@@ -344,7 +353,11 @@ mod tests {
         let s = HeldSet::parse_spec("1-2:0-1, 3:69", 4, 70).unwrap();
         assert_eq!(s.iter().collect::<Vec<_>>(), vec![(1, 0), (1, 1), (2, 0), (2, 1), (3, 69)]);
         assert!(!s.holds(0, 0) && !s.holds(4, 0) && !s.holds(3, 70));
-        assert!(HeldSet::parse_spec("*", 2, 5).unwrap().layer_whole(1));
+        let mut all = HeldSet::parse_spec("*", 2, 5).unwrap();
+        assert!(all.layer_whole(1));
+        all.retain_layers(|l| l == 1);
+        assert_eq!(all.iter().count(), 5);
+        assert!(!all.holds(0, 0) && all.layer_whole(1));
         assert!(HeldSet::parse_spec("1", 2, 5).is_err());
         assert_eq!(Wait::parse("spin:200").unwrap(), Wait::Spin(200));
     }

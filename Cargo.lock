@@ -3918,6 +3918,7 @@ dependencies = [
  "burn",
  "burn-flex",
  "clap",
+ "lb-expert-host",
  "lb-gguf",
  "lb-q4-gpu",
  "rayon",

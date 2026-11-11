@@ -15,6 +15,7 @@ cuda = ["gpu", "lb-q4-gpu/cuda"]
 
 [dependencies]
 lb-gguf.workspace = true
+lb-expert-host.workspace = true
 lb-q4-gpu = { workspace = true, optional = true }
 burn.workspace = true
 burn-flex = "=0.22.1"

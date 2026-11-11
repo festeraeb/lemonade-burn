@@ -179,7 +179,7 @@ impl Prep {
                     (None, None)
                 }
                 Ffn::Moe { router, bias, .. } => {
-                    if !m.store.layers.contains_key(&li) {
+                    if !m.store.layers.contains_key(&li) || m.store.remote.is_some() {
                         host_moe_layers.push(li);
                     }
                     n_moe += 1;
@@ -297,7 +297,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     let knobs = m.store.knobs.clone();
     let mut guard = m.dd.lock().expect("device decode state");
     let prep = guard.get_or_insert_with(|| Prep::new(m, gpu));
-    let decision = decide(prep.blocker.as_deref(), prep.host_moe_layers.len(), knobs.dd_host_moe());
+    let decision = decide(prep.blocker.as_deref(), prep.host_moe_layers.len(), knobs.dd_host_moe() || m.store.remote.is_some());
     if let Decision::Fallback(why) = decision {
         if !prep.warned {
             eprintln!("lb-lfm2: device decode declined, the old path runs: {why}");
@@ -348,7 +348,10 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     let mut y: Option<Handle> = None;
     let mut dev_moe = 0u64;
     // engine step E2: experts routed on the device and served from the cache's slot bank
-    let e2 = knobs.e2_device_router() && m.store.cache.lock().expect("expert cache").is_some();
+    // with a remote tier every MoE layer goes through the host side (`moe_ffn_with`), where the
+    // tier is asked first; the device router and the stacked layers are not used
+    let remote_on = m.store.remote.is_some();
+    let e2 = knobs.e2_device_router() && !remote_on && m.store.cache.lock().expect("expert cache").is_some();
     let mut slot_words = vec![0u32; 2 * prep.n_slots];
     let mut guessed: Option<Vec<u32>> = None;
     // a guess job on the worker, to be picked up and issued before the next layer's read
@@ -380,7 +383,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                 let hh = GpuQ4Mat::launch_gate_up_silu(gpu, mat(m, gate), mat(m, up), &h2, 1);
                 mat(m, down).launch(gpu, &hh, 1)
             }
-            Ffn::Moe { router, bias, gate, up, down } => match (m.store.layers.get(&li), lp.moe_index, &lp.router) {
+            Ffn::Moe { router, bias, gate, up, down } => match (if remote_on { None } else { m.store.layers.get(&li) }, lp.moe_index, &lp.router) {
                 (Some(stack), Some(mi), Some((rh, bh))) => {
                     let base = mi * k_used;
                     gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), knobs.dd_router_seq());

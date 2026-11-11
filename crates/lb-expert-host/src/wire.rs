@@ -5,7 +5,7 @@
 //! header   magic u32 "W2W1" | kind u8 | pad [u8; 3] | seq u64                         16 bytes
 //! Hello    (no payload)
 //! HelloOk  fingerprint [u8; 16] | d u32 | n_ff u32 | n_layer u16 | n_expert u16
-//!          | held_words u16 | pad u16 | held [u64; n_layer * held_words] | backend str | name str
+//!          | held_words u16 | pad u16 | held [u64; n_layer * held_words] | arith u64 | backend str | name str
 //! Run      layer u16 | n u16 | m u32 | d u32 | ids [u16; n] (+ pad to 4) | counts [u32; n]
 //!          | rows [u32; sum(counts)] | x [f32; m * d]
 //! RunOk    host_ns u64 | n u16 | pad u16 | d u32 | y [f32; sum(counts) * d]
@@ -87,6 +87,8 @@ pub struct HostInfo {
     /// `held[layer * words + e / 64] >> (e % 64) & 1`.
     pub held_words: u16,
     pub held: Vec<u64>,
+    /// [`crate::expert::arith_fingerprint`] of a CPU backend; 0 for a device backend.
+    pub arith: u64,
     pub backend: String,
     pub name: String,
 }
@@ -246,6 +248,7 @@ pub fn encode_hello_ok(out: &mut Vec<u8>, seq: u64, h: &HostInfo) {
     for w in &h.held {
         out.extend_from_slice(&w.to_le_bytes());
     }
+    out.extend_from_slice(&h.arith.to_le_bytes());
     put_str(out, &h.backend);
     put_str(out, &h.name);
 }
@@ -260,9 +263,10 @@ pub fn decode_hello_ok(frame: &[u8]) -> Result<HostInfo, WireError> {
     for _ in 0..n {
         held.push(r.u64()?);
     }
+    let arith = r.u64()?;
     let (backend, name) = (r.str()?, r.str()?);
     r.end()?;
-    Ok(HostInfo { fingerprint, d, n_ff, n_layer, n_expert, held_words, held, backend, name })
+    Ok(HostInfo { fingerprint, d, n_ff, n_layer, n_expert, held_words, held, arith, backend, name })
 }
 
 /// Encode a `Run`. `groups[i]` are the row indices (into `x`'s `m` rows) of expert `ids[i]`.
@@ -446,7 +450,7 @@ mod tests {
         assert_eq!(decode_run_reply(&out).unwrap(), RunReply::Refused { layer: 7, ids: vec![5, 6] });
         encode_error(&mut out, 9, "no such layer");
         assert_eq!(decode_run_reply(&out).unwrap(), RunReply::Error("no such layer".into()));
-        let info = HostInfo { fingerprint: [7; 16], d: 2048, n_ff: 1536, n_layer: 3, n_expert: 70, held_words: 2, held: vec![1, 0, 0, 32, u64::MAX, 3], backend: "cpu".into(), name: "a".into() };
+        let info = HostInfo { fingerprint: [7; 16], d: 2048, n_ff: 1536, n_layer: 3, n_expert: 70, held_words: 2, held: vec![1, 0, 0, 32, u64::MAX, 3], arith: 99, backend: "cpu".into(), name: "a".into() };
         encode_hello_ok(&mut out, 0, &info);
         let back = decode_hello_ok(&out).unwrap();
         assert_eq!(back, info);

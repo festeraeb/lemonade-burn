@@ -173,6 +173,9 @@ pub struct Host {
     pub stats: HostStats,
     /// Test hook: a host that stops answering (requests are read and dropped).
     pub mute: AtomicBool,
+    /// Test hook: a host that dies: the next request on a connection closes it unanswered,
+    /// which is what a trunk sees when the host process is killed.
+    pub die: AtomicBool,
 }
 
 impl Host {
@@ -186,7 +189,7 @@ impl Host {
         }
         backend.load(&model, &held)?;
         let backend_name = backend.name();
-        Ok(Self { name: name.to_string(), model, held: RwLock::new(held), backend: Mutex::new(backend), backend_name, stats: HostStats::default(), mute: AtomicBool::new(false) })
+        Ok(Self { name: name.to_string(), model, held: RwLock::new(held), backend: Mutex::new(backend), backend_name, stats: HostStats::default(), mute: AtomicBool::new(false), die: AtomicBool::new(false) })
     }
 
     pub fn held(&self) -> HeldSet {
@@ -219,6 +222,7 @@ impl Host {
             n_expert: held.n_expert as u16,
             held_words: held.words as u16,
             held: held.bits.clone(),
+            arith: if self.backend_name == "cpu" { crate::expert::arith_fingerprint() } else { 0 },
             backend: self.backend_name.to_string(),
             name: self.name.clone(),
         }
@@ -283,6 +287,9 @@ impl Host {
         let (mut buf, mut out, mut run) = (Vec::new(), Vec::new(), Run::default());
         loop {
             conn.recv(&mut buf, None)?;
+            if self.die.load(Ordering::Relaxed) {
+                return Err(std::io::ErrorKind::ConnectionAborted.into());
+            }
             if self.mute.load(Ordering::Relaxed) {
                 continue;
             }

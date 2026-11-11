@@ -56,7 +56,10 @@ struct Args {
 fn held_from(placement: &Path, name: &str, m: &ModelExperts) -> Result<HeldSet> {
     let text = std::fs::read_to_string(placement).with_context(|| format!("read {}", placement.display()))?;
     let map = PlacementMap::parse(&text, m.n_layer(), m.n_expert).map_err(|e| anyhow!(e))?;
-    map.held_by(name).map_err(|e| anyhow!(e))
+    let mut held = map.held_by(name).map_err(|e| anyhow!(e))?;
+    // "*" and layer ranges may cover layers that have no experts: those are not held
+    held.retain_layers(|l| m.layers[l].is_some());
+    Ok(held)
 }
 
 fn backend(kind: &str) -> Result<Box<dyn Backend>> {
@@ -80,20 +83,25 @@ fn main() -> Result<()> {
     let model = ModelExperts::open(&args.model)?;
     let held = match (&args.placement, &args.hold) {
         (Some(p), _) => held_from(p, &args.name, &model)?,
-        (None, Some(spec)) => HeldSet::parse_spec(spec, model.n_layer(), model.n_expert).map_err(|e| anyhow!(e))?,
+        (None, Some(spec)) => {
+            let mut h = HeldSet::parse_spec(spec, model.n_layer(), model.n_expert).map_err(|e| anyhow!(e))?;
+            h.retain_layers(|l| model.layers[l].is_some());
+            h
+        }
         (None, None) => bail!("give --placement or --hold"),
     };
     let bytes: usize = held.iter().map(|(l, _)| model.expert_bytes(l)).sum();
     let n_held = held.len();
     let host = Arc::new(Host::new(&args.name, model, held, backend(&args.backend)?).map_err(|e| anyhow!(e))?);
     eprintln!(
-        "lb-expert-host {}: model {} (fingerprint {}), {} experts held ({:.0} MB of file), backend {}, loaded in {:.1}s",
+        "lb-expert-host {}: model {} (fingerprint {}), {} experts held ({:.0} MB of file), backend {} (arith {:016x}), loaded in {:.1}s",
         args.name,
         args.model.display(),
         hex(&host.model.fingerprint),
         n_held,
         bytes as f64 / 1e6,
         host.info().backend,
+        host.info().arith,
         t0.elapsed().as_secs_f32()
     );
     let mut threads = Vec::new();

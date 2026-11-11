@@ -22,3 +22,22 @@ pub fn swiglu(gate: QuantMat<'_>, up: QuantMat<'_>, down: QuantMat<'_>, x: &[f32
     matvec_f32(down, &g, m, &mut out);
     out
 }
+
+/// A fingerprint of this machine's CPU expert arithmetic. Everything in [`swiglu`] is plain
+/// IEEE f32 in a fixed order except `exp`, which comes from the C library and may round the
+/// last bit differently between library versions or CPU-dispatched variants. Two processes with
+/// the same fingerprint computed `silu` identically on a 2^20-point sweep of the range that
+/// matters; a CPU host says its fingerprint in the hello, and a trunk warns when it differs from
+/// its own (the outputs then agree to rounding, not bit for bit).
+pub fn arith_fingerprint() -> u64 {
+    static F: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for i in 0..(1u32 << 20) {
+            let x = -24.0f32 + 48.0 * (i as f32 / (1u32 << 20) as f32);
+            let s = x / (1.0 + (-x).exp());
+            h = (h ^ s.to_bits() as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    })
+}

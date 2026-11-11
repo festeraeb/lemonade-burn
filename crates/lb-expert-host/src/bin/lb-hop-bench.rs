@@ -55,6 +55,8 @@ enum Cmd {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
+    /// Print this machine's CPU expert arithmetic fingerprint (`expert::arith_fingerprint`).
+    Arith,
     /// The same-host transports, client and echo host as two threads of this process.
     Local {
         #[command(flatten)]
@@ -205,6 +207,10 @@ fn main() -> Result<()> {
             let mut c = transport::connect(&connect, w, Duration::from_secs(10)).with_context(|| format!("connect {connect}"))?;
             let st = measure(&mut *c, &shape)?;
             report(&label, c.kind(), &wait, &server_wait, &shape, &st, load, remote_load, out.as_deref())
+        }
+        Cmd::Arith => {
+            println!("{} {:016x}", hostname(), lb_expert_host::expert::arith_fingerprint());
+            Ok(())
         }
         Cmd::Local { shape, out } => {
             let sock = std::env::temp_dir().join(format!("w2w-hop-{}.sock", std::process::id()));

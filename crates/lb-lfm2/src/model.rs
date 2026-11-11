@@ -308,6 +308,28 @@ impl Lfm2 {
         Ok((n_slots, bytes))
     }
 
+    /// Work-to-weights: put a remote tier in front of the local expert paths, from a placement
+    /// file (`lb_expert_host::placement`; the file is re-read when it changes). Experts it places
+    /// on hosts are computed there; a host that is down, late or refuses costs nothing but the
+    /// local path it falls back to. Attach before the first token (the device-resident decode
+    /// decides once which MoE layers run on the host side).
+    pub fn attach_remote(&mut self, placement: &Path) -> Result<std::sync::Arc<crate::remote::RemoteTier>, String> {
+        let cfg = &self.w.cfg;
+        let fp = lb_expert_host::model::fingerprint(&self.w.gguf);
+        let rt = std::sync::Arc::new(crate::remote::RemoteTier::from_file(placement, fp, &(0..cfg.n_layer).map(|l| cfg.is_moe(l)).collect::<Vec<_>>(), cfg.n_expert, cfg.n_embd)?);
+        self.store.remote = Some(rt.clone());
+        Ok(rt)
+    }
+
+    /// [`Lfm2::attach_remote`] from placement JSON (no file to reload).
+    pub fn attach_remote_json(&mut self, json: &str) -> Result<std::sync::Arc<crate::remote::RemoteTier>, String> {
+        let cfg = &self.w.cfg;
+        let fp = lb_expert_host::model::fingerprint(&self.w.gguf);
+        let rt = std::sync::Arc::new(crate::remote::RemoteTier::from_json(json, fp, &(0..cfg.n_layer).map(|l| cfg.is_moe(l)).collect::<Vec<_>>(), cfg.n_expert, cfg.n_embd)?);
+        self.store.remote = Some(rt.clone());
+        Ok(rt)
+    }
+
     /// Upload dense Q4_0 weights to the device, up to `budget_bytes`. Returns how many.
     /// Opens the device if `load_residents` has not already.
     #[cfg(feature = "gpu")]
@@ -621,9 +643,16 @@ impl Lfm2 {
     pub fn forward(&self, tokens: &[u32], cache: &mut Cache, all_logits: bool) -> Tensor<2> {
         self.apply_knobs();
         let mm0 = self.timings.matmul_ns.load(Ordering::Relaxed);
+        let pos0 = cache.len;
+        if let Some(rt) = self.store.remote.as_ref() {
+            rt.begin_pass();
+        }
         let t_fwd = Instant::now();
         let out = self.forward_inner(tokens, cache, all_logits);
         let dt = t_fwd.elapsed().as_nanos() as u64;
+        if let Some(rt) = self.store.remote.as_ref() {
+            rt.end_pass(pos0, tokens.len());
+        }
         let t = &self.timings;
         t.forward_ns.fetch_add(dt, Ordering::Relaxed);
         t.forwards.fetch_add(1, Ordering::Relaxed);

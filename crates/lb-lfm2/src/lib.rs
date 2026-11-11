@@ -8,6 +8,7 @@ pub mod device_decode;
 pub mod knobs;
 pub mod model;
 pub mod moe;
+pub mod remote;
 pub mod stage;
 pub mod weights;
 
