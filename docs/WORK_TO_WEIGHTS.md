@@ -600,3 +600,126 @@ Expectations, written before the run (to be checked, not assumed):
 * The T10 (TU102, 40 TU SMs, tensor cores, 320 GB/s) should prefill Q4_0 faster than a P100 (no tensor cores, no DP4A,
   732 GB/s), by maybe 1.5-3x; the P100 decodes faster (bandwidth). Whether the split wins at 8k depends on that prefill
   ratio, since the hand-off is small: the gate is about the T10's prefill speed, not the wire.
+
+### X6 results (c4 + one borrowed c2 card, 2026-11-11 05:08-05:58Z)
+
+Cards: **c2-T10** (Tesla T10, TU102, 56 SMs, x16, power-capped 150 W, ~1500 MHz under load), borrowed for 7.5 min;
+**c4-AF** (P100, x16, NUMA node of the NIC). Engine: the fleet's shared llama.cpp build, scraper off, one card per
+process, UUID pinned, NUMA-bound. Raw rows: `/mnt/fast/w2w/results/x6/` (`llama.jsonl`, `xfer.jsonl`,
+`roce-raw.txt`, `bwprobe.txt`, `lb.jsonl`, `e2e.json`). One-off drivers (not shipping code): `/mnt/fast/w2w/x6/`.
+
+**1. Prefill tok/s, median of 3 (ub 512) or 2 (other rows) [measured].** FA on, f16 KV unless stated.
+
+| N | T10 ub512 | T10 ub2048 | T10 ub4096 | P100 ub512 | P100 ub2048 | P100 ub4096 | T10 / P100 (best each) |
+|---|---|---|---|---|---|---|---|
+| 512 | **2250** | 1949 | 1980 | **615** | 602 | 602 | 3.7x |
+| 2048 | 2396 | 3753 | **3998** | 626 | 1025 | **1035** | 3.9x |
+| 8192 | 2387 | 3926 | **4222** | 607 | 990 | **1085** | 3.9x |
+| 16384 | 2283 | 3751 | **4107** | 583 | 928 | **1014** | 4.0x |
+| 32768 | 2080 | 3439 | **3687** | 538 | 820 | **889** | 4.1x |
+
+* The ubatch matters as much as the card: the default ub 512 leaves 1.7x (T10) and 1.8x (P100) on the table at 8k.
+  The fleet's seat commands do not set `-ub`.
+* FA off: T10 (ctx 8.7k) 1399 / 2081 / 1817 tok/s at 512 / 2k / 8k, slower than FA on everywhere; P100 the same as FA
+  on at <= 2k (581, 615) and **out of device memory at 8k with a 33k context** (its KQ buffer). FA on is the setting.
+* q8_0 KV at 8k (ub 512): T10 2190 (-8 % vs f16), P100 605 (same). Decode: T10 102 vs 112, P100 77 vs 83.
+* **Decode, 128 tokens after the prompt, tok/s [measured]: T10 111 / 115 / 112 / 107 / 97, P100 82 / 84 / 83 / 81 / 77**
+  at 512 / 2k / 8k / 16k / 32k. **The T10 decodes this model faster than the P100** in llama.cpp (Q4_0: sm_60 has no
+  DP4A, the matvec is not bandwidth-bound there). Our engine's all-resident P100 decode is the same ~82 (W3).
+* **lemonade-burn prefill on c4-AF [measured]**: 63-69 tok/s at ~450 tokens (all experts resident); at 2k the
+  all-resident config (and a 13 GB expert budget) **runs out of device memory** in the prefill (a 94 MB buffer);
+  with a 9 GB budget 55-56 tok/s at ~1970 tokens. So our prefill is **11-19x behind llama.cpp on the same card**;
+  8k not run. Prefill is not our engine's job yet; for X6 llama.cpp is the hardware reference.
+
+**2. Hand-off bytes [measured, matches arithmetic].** Slot file after an N-token prefill (identical sizes on T10 and P100):
+
+| N | f16 KV bytes | arithmetic (10 attn layers x 8 KV heads x 64 x 2 x 2 B = 20,480 B/token) | diff | q8_0 |
+|---|---|---|---|---|
+| 512 | 11,478,824 | 10,485,760 + conv | +4.6 % vs 10,977,280 | |
+| 2048 | 43,452,988 | 41,943,040 + conv | +2.4 % | |
+| 8192 | 169,380,412 | 167,772,160 + conv | +0.7 % | 90,737,212 (10,880 B/token) |
+| 16384 | 337,283,644 | 335,544,320 + conv | +0.4 % | |
+| 32768 | 673,090,108 | 671,088,640 + conv | +0.2 % | |
+
+The remainder is 16 B/token of cell metadata plus 1.0-1.5 MB fixed (the 30 short-conv layers' state, f32, and
+llama.cpp's recurrent "context checkpoints", ~0.9 MiB). **Bytes gate PASS** (within 5 %). **My expectation was wrong**:
+I wrote "MB to tens of MB"; it is **20 KB per token, 169 MB at 8k, 673 MB at 32k**. LFM2.5 has few attention layers,
+but its GQA heads are 8 x 64 in f16, and 10 layers of that is still a dense-7B-sized KV per token.
+
+**3. Transfer of those bytes, memory to memory on an open connection, p50 [measured].**
+
+| path | 11.5 MB (512) | 43 MB (2k) | 169 MB (8k) | 337 MB (16k) | 673 MB (32k) | rate |
+|---|---|---|---|---|---|---|
+| c2 -> c4, 1 GbE TCP (layout C's path) | 98 ms | 370 | **1441** | 2870 | 5726 | 117 MB/s |
+| t440 -> c2, 1 GbE TCP | 98 | 370 | 1450 | 2976 | 5894 | 114-117 MB/s |
+| t440 -> c4, 25G TCP | 4.3 | 17.6 | **61.9** | 113 | 228 | 2.7-3.0 GB/s |
+| t440 -> c4, RoCE v2 write (ib_write_bw, one message at a time) | 3.8 | 14.2 | **55.5** | 110 | 220 | 2912 MiB/s |
+| in-box, pinned D2H (x16) + H2D (x16) [stand-in] | 1.8 | 6.8 | **26.7** | 53 | 106 | 13.1 / 12.3 GB/s |
+| llama.cpp slot save (T10) + restore (P100), file in RAM | 24 | 54 | **187** | 357 | 696 | ~1.8 GB/s + 2.3 GB/s |
+
+* **1 GbE vs 25G: 23x** on the wire (1441 vs 62 ms at 8k). **25G TCP vs RoCE: 6 ms at 8k**, nothing that matters for
+  a bulk hand-off of this size (since c4's `iommu=pt` fix TCP fills the link). RoCE matters for the per-hop latency
+  of W0/W3, not here.
+* On 25G the wire is **smaller than llama.cpp's own save + restore** (56-62 ms vs 187 ms at 8k): the next cost to
+  remove is the file round trip, not the network.
+* A t440 -> c4 1 GbE run (65 MB/s) is in `xfer.jsonl` but **contaminated**: t440's 1 GbE port was serving the
+  restarted c2 seat's model over NFS at the same time. Not used.
+* Host links on c4 [measured, X2 input]: x16 cards (AF, D8) H2D 12.3 / D2H 13.1 GB/s pinned, x8 cards (3B, 3C, 86)
+  6.2 / 6.6; pageable 4.8-5.2 everywhere; wrong-node pinned H2D on AF unchanged (12.3), pageable 4.5. P2P AF->D8
+  10.2 GB/s, AF->86 / AF->3B / 3B->3C 5.2 GB/s (all report peer access).
+* **Per-card memory bandwidth [measured, X2 needed it]**: all five c4 P100s copy kernel 506 GB/s, read kernel 605,
+  cudaMemcpy D2D 538 (spec 732); spread across the five < 0.2 %. T10: copy 338, read 394, D2D 358.
+
+**4. End to end at the gate point and around it.** total = prefill + save + transfer + restore + 128 decode tokens on
+the P100; P100-only = best-config prefill + 128 decode on the same P100. All parts [measured] unless the row says
+[estimate].
+
+| N | P100-only total (prefill) | T10-only total (no split) | C: T10 on c2, 1 GbE (TTFT) | B: 25G TCP / RoCE (TTFT) | A': a 16 GB Turing in c4 (TTFT) | A: RTX 2060 12 GB in c4 [estimate] |
+|---|---|---|---|---|---|---|
+| 512 | 2402 ms (832) | 1385 | 1919 = **1.25x** (349) | 1825 = 1.32x (256) | 1821 = 1.32x | 2029-2086 = 1.15-1.18x |
+| 2048 | 3494 (1978) | 1622 | 2452 = **1.42x** (937) | 2100 = 1.66x (584) | 2083 = 1.68x | 2577-2705 = 1.29-1.36x |
+| **8192** | **9102 (7554)** | **3086** | **5117 = 1.78x** (3569) | **3738 / 3731 = 2.44x** (2189) | 3676 = 2.48x (2127) | **5564-6049 = 1.50-1.64x** |
+| 16384 | 17739 (16151) | 5183 | 8804 = 2.01x (7216) | 6047 = 2.93x (4459) | 5934 = 2.99x | 9971-10969 = 1.62-1.78x |
+| 32768 | 38516 (36851) | 10200 | 16973 = 2.27x (15309) | 11475 = 3.36x (9811) | 11247 = 3.42x | 20460-22681 = 1.70-1.88x |
+
+**X6 gate (>= 1.2x at 8k): PASS for C [measured end to end, real path], B [estimate from parts measured on other
+boxes: the T10's prefill on c2, the 25G link t440 <-> c4], A' [measured parts], A [estimate].** Against the P100's
+*default* ub 512 (15.0 s at 8k), every split is 1.8-4x.
+
+**Hand-off correctness: PASS (by reading).** The T10's saved state, moved to c4 and restored into the P100 server,
+continues the prompt with coherent text at every N (prompt_n after restore = 1: only the hand-off token is
+recomputed). Exact greedy match with the P100's own continuation: 1, 20, 4-33, 2-3, 9-17 of 33 tokens; the P100
+does not match *itself* across ub 512 vs ub 2048 either (33, 20, 4, 2, 9 of 33), so exact match is not a property
+llama.cpp has across batch shapes. Same-card save/restore (P100 -> P100) reproduces 33 of 33 at every N, which
+validates the method.
+
+**Break-even.** The split wins at every measured N, from 512 up, on every link including 1 GbE: the T10 saves
+0.69-1.18 ms per prompt token over the best P100 config (1.18 at 512, 0.69 at 8k, 0.85 at 32k) while the hand-off
+costs 0.20 ms per token over 1 GbE and 0.03 ms over 25G (wire + save + restore). Below 512 not measured; the fixed part
+of the hand-off is ~13 ms (25G) to ~20 ms (1 GbE) at 512 (conv state, headers, slot calls, one RTT), so break-even is
+**~10-30 tokens over 25G and ~20-50 over 1 GbE [estimate]**; at such lengths both cards run far from their prefill rate.
+
+**What the numbers say for the card move (for the operator):**
+* **The 1 GbE hand-off costs 1.4 s at 8k and 5.7 s at 32k; 25G costs 62 / 228 ms.** At 8k that is 1.78x vs 2.44x
+  over P100-only. 25G is worth 1.4 s of TTFT at 8k and 5.5 s at 32k.
+* **TCP on 25G is enough** for the hand-off: RoCE adds 6 ms at 8k. c1's RoCE is not on the critical path for X6.
+* **Layout A as corrected (RTX 2060 12 GB) cannot hold this model** (13.6 GB): its prefill needs a layer split with a
+  P100 (estimated 1.50-1.64x at 8k), or a model that fits 12 GB. A 16 GB Turing (the T10) in c4 would give 2.48x; in
+  c1 over 25G 2.44x: **the hop costs 1 % once it is 25G**. The card's VRAM decides A vs B, not the link.
+* **Not splitting beats every split for one request**: the T10 alone does prefill + 128 tokens in 3.1 s at 8k (B: 3.7 s,
+  C: 5.1 s) because it also decodes faster (111 vs 83 tok/s). The split is a **capacity** play: the scarce Turing
+  card is busy ~2.1 s per 8k request instead of 2.1 s + the whole answer, so one T10 can prefill for several P100
+  decoders (at 500-token answers: ~3 P100s per T10 [estimate]).
+* **Streaming would hide even 1 GbE at T10 speed [estimate, not built]**: the T10 produces KV at 20.5 KB x 4222 tok/s
+  = 87 MB/s, under 1 GbE's 117 MB/s. Sending each ubatch's KV while the next one computes (llama.cpp finalises KV per
+  ubatch) leaves only the last chunk exposed. A 1.5x faster prefill card would outrun 1 GbE again; 25G never.
+
+### X6: not run, not verified
+* Layout A and B hardware: c1 off limits (NIC flash), the 2060 not in c4. Both are compositions of measured parts.
+  The 2060's prefill is **spec-scaled from the T10** (34 vs 56 SMs, 1.1-1.25x clock): 0.60-0.75x the T10.
+* The c2 RTX 2060 / 2060 SUPER were not touched (seats). T10 in c1 would sit in a different slot and CPU: not measured.
+* Restore was timed with the file already in the receiver's RAM; a real pipeline would also write it there
+  (overlappable). No streaming hand-off was built; the "direct pinned copy" row is a D2H + H2D measurement, not an
+  engine path.
+* lemonade-burn prefill at 8k+ not run (OOM at 2k with experts resident; 55 tok/s otherwise).
+* X4 (look-ahead per tier) and X5 (prefill batched by destination) not run in this session.
