@@ -723,3 +723,69 @@ of the hand-off is ~13 ms (25G) to ~20 ms (1 GbE) at 512 (conv state, headers, s
   engine path.
 * lemonade-burn prefill at 8k+ not run (OOM at 2k with experts resident; 55 tok/s otherwise).
 * X4 (look-ahead per tier) and X5 (prefill batched by destination) not run in this session.
+
+## CPU compute vs waiting for the weights (operator question, 2026-11-11)
+
+Question: "our early measurements suggested the wait was cheaper than computing a layer on CPU, maybe we were measuring
+wrong." The 11-01 record (docs/V2_PIPELINE.md): CPU expert 1.088 ms (80 threads, t440, load ~24) / 13.4 ms (1 thread)
+vs an on-demand miss 0.44 ms copy at 12 GB/s + 0.33-0.43 ms GPU expert.
+
+Measured on c4 (2x Xeon Gold 6148, 20 cores/socket, L3 27.5 MB/socket), load1 1.8 at start (13.6 during the CPU
+section's last rows: one ggml 40-thread hot row, 14.2 ms, is an outlier and is ignored). One LFM2.5 expert = gate/up
+1536x2048 + down 2048x1536 Q4_0 = 5,308,416 bytes, m=1. "cold" = 152 distinct experts cycled (807 MB, as a token
+touches them); per-expert time = a 4-expert graph / 4. Tools and raw rows: /mnt/fast/engine-bench/cpuwait/
+(expert_bench.cpp = ggml's own CPU/CUDA backends from the fleet llama.cpp build 59b853f9a, CPU variant skylakex;
+lb-cpu-expert = lb_gguf::matvec_f32, the kernel lb-lfm2 runs for CPU experts, same release flags as the engine;
+membw.c; h2d_bench.cu), results-20261111-060647.jsonl. All [measured] unless tagged.
+
+| memory read bandwidth (2 GiB sum) | 1 thr | 4 | 10 | 20 | 40 |
+|---|---|---|---|---|---|
+| socket 0 threads, socket 0 memory | 12.1 GB/s | 39.2 | 59.2 | **65.7** | 63.0 |
+| socket 0 threads, socket 1 memory (20 thr) | | | | 34.2 | |
+| unbound (both sockets, 40 / 80 thr) | | | | | 114.7 / 122.3 |
+
+Floor for one expert at 65 GB/s: 0.082 ms [derived].
+
+| one expert, cold, per expert (ms) | 1 thr | 4 | 10 | 20 | 40 | unbound 80 | socket 0 cpu + socket 1 mem, 20 thr |
+|---|---|---|---|---|---|---|---|
+| ggml CPU (llama.cpp's kernel, q8 activations, AVX-512) | 1.27 | **0.41** | **0.34** | 0.37 | **0.34** | 1.30 | 0.35 |
+| lemonade-burn lb_gguf (scalar f32 dequant x f32) | 13.39 | 3.45 | 1.69 | 0.96 | 0.62 | 0.68 | 1.00 |
+| ratio lb / ggml | 10.6x | 8.5x | 5.0x | 2.6x | 1.8x | | |
+
+(hot, one layer's 4 experts reused: ggml 1.21 / 0.38 / 0.26 / 0.51 ms at 1/4/10/20 thr; lb 13.4 / 3.6 / 2.0 / 1.3 /
+0.66: the cache barely matters for either.) ggml plateaus at ~15 GB/s effective (0.34 ms): fixed per-op costs (12
+small matmuls and their thread barriers per 4-expert call), not bandwidth: still 4x off the socket's floor. Spreading
+threads across both sockets is the worst case for ggml (1.30 ms at 80 threads).
+
+| the wait (one expert to the card) | x8 slot (c4 3B, node 0) | x16 slot (c4 D8, node 1) |
+|---|---|---|
+| H2D copy, pinned or registered host memory | 0.855 ms (6.2 GB/s) | **0.438 ms (12.1 GB/s)**; from the other socket's memory also 0.438 |
+| H2D copy, pageable | 1.185 ms | 1.081 ms |
+| P100 expert compute, ggml CUDA (4-expert graph / 4) | 0.049 ms | 0.049 ms |
+| P100 expert compute, lemonade-burn kernel | 11-01 kernel 0.33-0.36 ms; today's rows4 device-decode kernel is at llama.cpp parity all-resident (81 vs 82 tok/s), so ~0.05 ms [derived] | same |
+| **miss = copy + compute, ggml kernel** | **0.90 ms** [derived] | **0.49 ms** [derived] |
+| miss = copy + compute, lb kernel (today's) | ~0.90 ms [derived] | ~0.49 ms [derived] |
+
+**Crossover (CPU compute beats the wait when its time is lower):**
+
+| CPU path, threads (node-local) | vs x16 wait 0.49 ms | vs x8 wait 0.90 ms |
+|---|---|---|
+| ggml, 1 thread (1.27) | wait wins | wait wins |
+| ggml, 4 threads (0.41) | **CPU wins 1.2x** | **CPU wins 2.2x** |
+| ggml, 10-40 threads (0.34) | **CPU wins 1.4x** | **CPU wins 2.6x** |
+| lb_gguf, 20 threads (0.96) | wait wins (2.0x) | ~tie |
+| lb_gguf, 40 threads (0.62) | wait wins (1.3x) | CPU wins 1.5x |
+| a CPU kernel at the bandwidth floor (0.08-0.15 ms) [estimate] | CPU 3-6x | CPU 6-11x |
+
+**Verdict: the 11-01 conclusion does not hold as a statement about CPUs; it held only for our CPU kernel.** The copy
+side was measured right (0.44 ms then, 0.438 ms now on x16). The CPU side was lemonade-burn's reference kernel
+(scalar f32 dequant, per-row allocations: 0.4 GB/s a thread), on t440 under load ~24 with 80 threads spanning both
+sockets. With llama.cpp's CPU kernel on one quiet socket, computing a miss on the CPU (0.34-0.41 ms with 4-40
+threads) beats copying it to the P100 and computing it there on both slot widths: 1.2-1.4x on x16, 2.2-2.6x on x8.
+Consequences: (1) lemonade-burn's on-demand miss path was the right choice *given its own CPU kernel*; the lever is
+a real CPU expert kernel (q8-quantized activations, int8/AVX2/AVX-512 dot, one parallel region per layer, threads on
+the card's socket only); (2) the FreeToken / llama.cpp #30966 "compute misses where they live" policy applies to our
+P100s, and more on the x8 slots; (3) these are per-miss costs: CPU misses can also run while the card computes
+the resident experts (Avalon's hosted block), so the comparison is a floor for the CPU side's advantage.
+Not measured here: c2's CPU (AVX only, no AVX2: its ggml numbers would be worse), several misses per layer at once
+on the CPU (thread split across experts), an x4 slot (the 1070 measured 1.1 GB/s in 11-01: the wait would be ~5 ms).
