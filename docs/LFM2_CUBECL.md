@@ -131,7 +131,7 @@ All **[measured]** 2026-10-31 on t440, CPU path (48 threads, f32 activations), m
 
 * Loader: `lb-gguf` tests pass, including the real-file test that matches gguf-py's
   dequantize on Q6_K and F32 rows (7 tests).
-* Q4_0 GPU kernel: `lb-q4-gpu` 5/5 on **cesarops3's Radeon Pro WX 5100** (RADV Vulkan,
+* Q4_0 GPU kernel: `lb-q4-gpu` 5/5 on **c3's Radeon Pro WX 5100** (RADV Vulkan,
   `LB_WGPU_DEVICE=discrete:1`), including a real expert matrix (`blk.2.ffn_gate_exps`,
   expert 0, 1536x2048, two tokens) against the CPU reference.
 * Teacher-forced top-1 agreement with the oracle (per position tables in
@@ -176,7 +176,7 @@ Seeds proven first: the seeded tests compile, and on c3 they fail only on the st
 | LB-Q8GPU | `forge-pool/specs/LB-Q8GPU.json` | `crates/lb-q4-gpu/src/lib.rs` (`q8_0_matvec_gpu`) | `lb_gpu_kernel.sh q8_0_matches_scalar` on c3 |
 | LB-Q6KGPU | `forge-pool/specs/LB-Q6KGPU.json` | `crates/lb-q4-gpu/src/lib.rs` (`q6_k_matvec_gpu`) | `lb_gpu_kernel.sh q6k_matches_scalar` on c3 |
 
-The check script runs the crate's tests on cesarops3's WX 5100 over the NFS view of the
+The check script runs the crate's tests on c3's WX 5100 over the NFS view of the
 verify worktree; t440's GPUs are never touched.
 
 ## 7. Step-2 work (2026-10-31, same day)
@@ -198,7 +198,7 @@ verify worktree; t440's GPUs are never touched.
 
 ## 8. Step-2 results **[measured 2026-10-31]**
 
-Card: **cesarops4's GeForce GTX 1070 (8 GB, wgpu `discrete:2`, Vulkan on NVIDIA)**, which
+Card: **c4's GeForce GTX 1070 (8 GB, wgpu `discrete:2`, Vulkan on NVIDIA)**, which
 also makes this the cross-vendor check (step 0/1 kernels: AMD Polaris; here: NVIDIA
 Pascal). Why not c3's WX 5100: its VRAM is 7.94 of 8 GB taken by the c3 LFM2.5 Lemonade
 seat itself (pid 1304825 holds renderD130), so a resident store there would evict the
@@ -237,7 +237,7 @@ it, untouched). c4 ran at load average 20-25 (forge coders) during all runs; our
   layer). The resident-hit rate (52% with 4 GB; 66.5% shadow with 6 GB) says the
   placement idea holds; the kernel does not yet.
 
-## 9. Serving round trip **[measured 2026-10-31, cesarops4]**
+## 9. Serving round trip **[measured 2026-10-31, c4]**
 
 `lemonade-burn-server --model LFM2.5-24B-A2B-QAD-Q4_0.gguf --placement-from-scrapes
 /mnt/t440/data/lfm2-scrapes --gpu-budget-mb 4000 --gpu` (LB_WGPU_DEVICE=discrete:2),
@@ -261,7 +261,7 @@ their branches are in the repo, tests in `crates/lb-q4-gpu/tests/`), rebuild on 
 `CARGO_TARGET_DIR=~/cargo-target/lb-gpu cargo build --release -p lb-lfm2 -p lb-server
 --features gpu` from the NFS view `/mnt/t440/codebase/repos/lemonade-burn`, and re-measure
 with `/data/lfm2-scrapes/c4-rerun.sh` (GPU vs CPU harness, needs the t440 oracle:
-`llama-server --device none --host 10.44.0.10 --port 18080` on the same GGUF with
+`llama-server --device none --host t440-lan --port 18080` on the same GGUF with
 `CUDA_VISIBLE_DEVICES=`) and `/data/lfm2-scrapes/c4-serve.sh` (served tok/s). Then, in
 `lb_lfm2::moe::moe_ffn` and `lb_q4_gpu::store`, upload the layer's activations once and
 give each layer one output buffer so an expert call is launches only (no per-expert

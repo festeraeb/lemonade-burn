@@ -152,7 +152,7 @@ c4's page cache beside its serving seats).
 
   ```json
   { "version": 1,
-    "hosts": { "a": { "addr": "rdma://10.0.10.204:7411", "wait": "spin:200", "deadline_ms": 50 },
+    "hosts": { "a": { "addr": "rdma://c4-25g:7411", "wait": "spin:200", "deadline_ms": 50 },
                "b": { "addr": "unix:///run/w2w-b.sock" } },
     "default": "local",
     "layers": { "*": "a", "2-9": "local", "12": { "0-31": "a", "32-63": "b", "7": "local" } } }
@@ -283,7 +283,7 @@ A host on a named card (UUID pin through the environment, as the engine benches 
 CUDA_VISIBLE_DEVICES=GPU-<uuid> LB_CUDA_DEVICE=0 \
   lb-expert-host-cuda-rdma --model /mnt/t440/raid0/models/lfm25/LFM2.5-24B-A2B-QAD-Q4_0.gguf \
   --placement /mnt/t440/fast/w2w/run/w3a.json --name h1 --backend gpu \
-  --listen unix:///tmp/w2w-h1.sock --listen rdma://10.0.10.204:7411 --wait spin:200
+  --listen unix:///tmp/w2w-h1.sock --listen rdma://c4-25g:7411 --wait spin:200
 ```
 
 The trunk on a named card, no experts of its own (dense weights and head only):

@@ -1,7 +1,7 @@
 # CubeCL host-to-device write-path probe (2026-11-03)
 
 Where the ~3x between CubeCL's `create(Bytes)` and raw `cudaMemcpy` goes, measured on
-cesarops2 GPU2 (Tesla P100, Gen3 x16). Answer and table: `docs/WORK_LOG.md`, section
+c2 GPU2 (Tesla P100, Gen3 x16). Answer and table: `docs/WORK_LOG.md`, section
 "Probe: where the copy path loses 3x". Raw per-call lines: c2 `~/lb-measure/out/probe-b2/`.
 
 - `cubecl-probe.patch`: timers in cubecl-server 0.11.2 `write_to_gpu` (reserve pinned, host

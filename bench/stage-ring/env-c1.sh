@@ -1,6 +1,6 @@
-# common env for lb-stage runs on cesarops1 (GTX 1070 pinned by UUID)
+# common env for lb-stage runs on c1 (GTX 1070 pinned by UUID)
 export BASE=/mnt/models/lb-stage
-export UUID1070=GPU-ab73312e-a709-96b4-802b-482a1f129686
+export UUID1070=${UUID_GTX1070:?card UUID}
 export CUDA_VISIBLE_DEVICES=${CARD_UUID:-$UUID1070} LB_CUDA_DEVICE=0
 export LD_LIBRARY_PATH=$BASE/lib:${LD_LIBRARY_PATH:-} CUDA_PATH=$BASE/cuda-path
 export LB_MODEL=$BASE/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf
