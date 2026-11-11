@@ -75,6 +75,13 @@ struct Args {
     /// (424 MB on the 24B). 0 = leave the dense side on the CPU.
     #[arg(long, default_value_t = 0)]
     gpu_dense_mb: usize,
+    /// LFM2 only, work-to-weights: a placement file (`lb_expert_host::placement`) naming the
+    /// expert hosts and which `(layer, expert)` each holds. Experts placed on a host are computed
+    /// there; the file is re-read when it changes; a host that is down or late falls back to this
+    /// process's own expert paths. With `--gpu` every MoE layer then runs through the host side of
+    /// the device decode (one read and one upload a layer).
+    #[arg(long, env = "LB_W2W_PLACEMENT")]
+    w2w_placement: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8000)]
@@ -120,6 +127,8 @@ struct AppState {
     threads: usize,
     /// LFM2 only: the live expert-placement counters, shared with the model thread.
     placement: Option<Arc<lb_lfm2::moe::PlacementStats>>,
+    /// LFM2 only, work-to-weights: the remote tier (hosts, hops, fallbacks), when one is attached.
+    w2w: Option<Arc<lb_lfm2::remote::RemoteTier>>,
     /// LFM2 only: the forward-pass time split, shared with the model thread.
     timings: Option<Arc<lb_lfm2::model::Timings>>,
 }
@@ -469,6 +478,10 @@ async fn placement_stats(State(st): State<Arc<AppState>>) -> Json<Value> {
         "gpu_hit_rate": t.hit_rate,
         "gpu_s": t.gpu_s, "cpu_s": t.cpu_s, "on_demand_s": t.on_demand_s
     });
+    // work-to-weights: hops, fallbacks and host state, when a remote tier is attached
+    if let Some(rt) = st.w2w.as_ref() {
+        v["w2w"] = rt.status();
+    }
     // decode hit / miss / prefetch counters per target-layer type (lb-lfm2 `stage.rs`)
     v["stage"] = s.stage.snapshot();
     // Where a forward pass went, so "what is left to optimise" is read off the server
@@ -534,6 +547,7 @@ fn main() -> Result<()> {
     let (jtx, jrx) = std_mpsc::channel::<Job>();
     let default_max_tokens = Arc::new(AtomicUsize::new(args.default_max_tokens));
     type Loaded = (Arc<TextCodec>, usize, String, &'static str, Option<Arc<lb_lfm2::moe::PlacementStats>>, Option<Arc<lb_lfm2::model::Timings>>, LiveTargets);
+    let mut w2w: Option<Arc<lb_lfm2::remote::RemoteTier>> = None;
     let (codec, ctx, model_id, kernel, placement, timings, live): Loaded = if is_gguf {
         let mut model = lb_lfm2::Lfm2::load(&args.model, &dev)?;
         let cfg = model.cfg().clone();
@@ -641,6 +655,12 @@ fn main() -> Result<()> {
         if stage_cfg.on {
             anyhow::bail!("LB_STAGE=1 needs the `gpu` feature");
         }
+        if let Some(p) = &args.w2w_placement {
+            let rt = model.attach_remote(p).map_err(|e| anyhow::anyhow!("--w2w-placement {}: {e}", p.display()))?;
+            let up = rt.hosts().iter().filter(|h| h.up).count();
+            eprintln!("w2w: {} experts placed on {} host(s), {up} up; placement {} is watched", rt.n_placed(), rt.hosts().len(), p.display());
+            w2w = Some(rt);
+        }
         let dir = args.model.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
         let codec = Arc::new(TextCodec::load_with(&dir.join("tokenizer.json"), cfg.bos, ChatStyle::ChatMl, vec![cfg.eos])?);
         let ctx = args.ctx.min(cfg.n_ctx);
@@ -692,6 +712,7 @@ fn main() -> Result<()> {
         threads: rayon::current_num_threads(),
         placement,
         timings,
+        w2w,
     });
     let app = Router::new()
         .route("/health", get(health))

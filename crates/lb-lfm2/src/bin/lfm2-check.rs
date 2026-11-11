@@ -64,6 +64,10 @@ struct Args {
     /// GPU byte budget for resident experts, in MB.
     #[arg(long, default_value_t = 0)]
     gpu_budget_mb: usize,
+    /// Work-to-weights: a placement file naming expert hosts (`lb_expert_host::placement`); the
+    /// experts it places on hosts are computed there for every arm of the run.
+    #[arg(long, env = "LB_W2W_PLACEMENT")]
+    w2w_placement: Option<PathBuf>,
     /// Actually upload the planned residents to the GPU (LB_WGPU_DEVICE) and run them there
     /// (needs the `gpu` feature); without it the placement is only a counted shadow.
     #[arg(long, default_value_t = false)]
@@ -145,6 +149,14 @@ fn main() -> Result<()> {
         #[cfg(not(feature = "gpu"))]
         anyhow::bail!("--gpu-dense-mb needs the gpu feature");
     }
+    let _w2w = match &args.w2w_placement {
+        Some(p) => {
+            let rt = model.attach_remote(p).map_err(|e| anyhow::anyhow!("--w2w-placement {}: {e}", p.display()))?;
+            eprintln!("w2w: {} experts placed on {} host(s); {}", rt.n_placed(), rt.hosts().len(), rt.status());
+            Some(rt)
+        }
+        None => None,
+    };
     eprintln!(
         "loaded {} in {:.1}s: {} layers, {} experts x top-{}, attn layers {:?}",
         args.model.display(),
@@ -256,6 +268,9 @@ fn main() -> Result<()> {
     );
     if let Some(p) = &args.report {
         std::fs::write(p, serde_json::to_string_pretty(&json!({ "model": args.model, "agree": agree, "total": total, "prompts": report }))?)?;
+    }
+    if let Some(rt) = model.store.remote.as_ref() {
+        println!("w2w: {}", rt.status());
     }
     Ok(())
 }
@@ -445,6 +460,9 @@ fn ab_device(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u3
             serde_json::to_string_pretty(&json!({"model": args.model, "agree": agree, "positions": positions, "max_abs_logit_diff": worst, "route_diff": route_diff,
                 "prompts": report, "greedy": {"old": go, "device": gd, "identical": same, "first_diff": first_diff, "step_max_abs_logit_diff": step_worst}}))?,
         )?;
+    }
+    if let Some(rt) = model.store.remote.as_ref() {
+        println!("w2w: {}", rt.status());
     }
     Ok(())
 }

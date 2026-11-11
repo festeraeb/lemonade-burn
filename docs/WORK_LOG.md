@@ -1173,3 +1173,18 @@ Branch `fable/engine-e2-router-2026-11-09`; write-up `docs/ENGINE_E2_ROUTER.md`.
 bound): E1 16.50 tok/s, llama.cpp 17.04, **E2 30.49** (1.85x E1, 1.79x llama.cpp); 2060 SUPER 7.41 / 6.79 / 9.48. Same sha at five
 budgets, flat 50-pass soak. Round trips per token 39, not the plan's <= 4: 15.2 of 38 layers miss at 5120 MiB, and a host-served miss
 needs the host to see that layer's routes. Token 32.7 ms = 12.2 compute + 6.6 syncs + 13.9 misses.
+
+## Work goes to the weights, W0-W2: hop budget, expert host, trunk tier; CPU parity with the one-card sha (Fable, 2026-11-11)
+
+Branch `fable/work-to-weights-2026-11-11`; write-up `docs/WORK_TO_WEIGHTS.md`. No GPU memory used, no seat touched.
+* **W0** (real wire shape, 8,260 B out / 32,800 B back, 10k trips): t440<->c4 RoCE p50 34 us with a spinning wait (gate <= 60:
+  pass), 58-74 us with a sleeping wait (**fail**, 4 of 5 runs); 25G TCP 114-129 us (gate <= 250: pass); 1 GbE 512-619 us; same host
+  29-39 us; same process 10-16 us. Budget for 38 MoE layers, one host: RoCE 1.3 ms a token, 25G TCP 4.75 ms, 1 GbE 20+ ms.
+* **W1** crate `lb-expert-host`: wire, transports (in-process, TCP, unix, RDMA), CPU backend, device backend through lb-q4-gpu
+  (compiled with `cuda`, **not run**), placement as data. A host refuses any expert it does not hold.
+* **W2** `lb-lfm2/src/remote.rs`: one message per host per layer, deadline, mark-down, fall back to the local path, placement file
+  reloaded at run time, hops and hop ms per token logged.
+* **Gates, CPU reference path on t440:** 86/86 positions bit-identical to the one-process path in both wire shapes, and greedy sha
+  `062392b8d2b0361a` (the CPU path gives the one-card sha), with all experts on one host (unix, TCP, RoCE loopback), split over two,
+  split with part on the trunk, one host SIGKILLed mid-decode and mid-greedy, one host SIGSTOPped (deadline). 8 arms, all pass.
+* Not run: anything on a card, a host on another node, the llama.cpp oracle.
