@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # copy_bench with the CubeCL write-path probe, c2 GPU2 (bus 0D:00.0), two passes.
 set -u
-BASE=/home/cesarops/lb-measure; OUT=$BASE/out/probe-b2; mkdir -p $OUT
+BASE=$HOME/lb-measure; OUT=$BASE/out/probe-b2; mkdir -p $OUT
 export LD_LIBRARY_PATH=$BASE/lib:${LD_LIBRARY_PATH:-}; export CUDA_PATH=$BASE/cuda-path
 BIN=$BASE/cuda-bin/copy_bench_probe
 run() { local label=$1; shift

@@ -1,7 +1,7 @@
 # Environment for engine E2 runs. The host is told by the UUID only: index, bus and NUMA node are
 # read from the driver at run time, never assumed.
-export BASE=${BASE:-/home/cesarops/lb-e2}
-export CARD_UUID=${CARD_UUID:-GPU-2d66f961-cba7-717f-1bd7-a04fff1fc8ab}
+export BASE=${BASE:-$HOME/lb-e2}
+export CARD_UUID=${CARD_UUID:?set CARD_UUID to the card UUID}
 export CUDA_VISIBLE_DEVICES=$CARD_UUID LB_CUDA_DEVICE=0
 export LD_LIBRARY_PATH=$BASE/lib:${LD_LIBRARY_PATH:-} CUDA_PATH=$BASE/cuda-path
 export LB_MODEL=$BASE/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf
