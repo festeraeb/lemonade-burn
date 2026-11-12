@@ -29,10 +29,14 @@ several cards in parallel.
   A single card cannot hide its own staging: a wgpu copy and the compute share one queue
   and, more simply, there is nothing else to do; the rolling single-card case stalls
   96-99% of its time **[simulated]**.
-* *Parallel expert processing across cards* does **not** help a single decode stream: the
-  layers of one token are sequential, so at any moment exactly one card computes. Cards
-  add **VRAM** (bigger resident sets, higher hit rate) and **overlap for staging**; they
-  add compute parallelism only with several streams or during prefill (not modelled yet).
+* *Parallel expert processing across cards* is **not modelled**, and so is not credited here.
+  The layers of one token are sequential, but the selected experts *within* a layer read the
+  same activation independently and only meet at the weighted sum (the CPU path already runs
+  them with `into_par_iter`), so spreading one layer's experts over several cards is a
+  possible design. The simulator instead assigns whole layers to one card, so in its numbers
+  exactly one card computes at any moment, and cards add **VRAM** (bigger resident sets,
+  higher hit rate) and **overlap for staging**. Within-layer expert parallelism across cards
+  (and several streams, and prefill) would need a different simulator model.
 * *Prediction* works and is stable: the hot set learned on one set of prompts covers
   62.5% of the expert demand of held-out prompts at k=24/64 per layer, 74.9% at k=32
   **[measured on the traces]** (the coordinator's independent script found 64.8% at
