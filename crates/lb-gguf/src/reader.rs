@@ -113,7 +113,7 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], GgufError> {
-        if self.pos + n > self.buf.len() {
+        if n > self.buf.len() - self.pos {
             return bad(format!("truncated at byte {} (+{n})", self.pos));
         }
         let s = &self.buf[self.pos..self.pos + n];
@@ -133,9 +133,12 @@ impl<'a> Cursor<'a> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn string(&mut self) -> Result<String, GgufError> {
-        let n = self.u64()? as usize;
+        let n = usize::try_from(self.u64()?).or_else(|_| bad("string length overflows usize"))?;
         let s = self.take(n)?;
         Ok(String::from_utf8_lossy(s).into_owned())
+    }
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
     }
     fn value(&mut self, ty: u32) -> Result<MetaValue, GgufError> {
         Ok(match ty {
@@ -150,7 +153,14 @@ impl<'a> Cursor<'a> {
             8 => MetaValue::Str(self.string()?),
             9 => {
                 let et = self.u32()?;
-                let n = self.u64()? as usize;
+                if et == 9 {
+                    return bad("nested metadata arrays are not supported");
+                }
+                let n = usize::try_from(self.u64()?).or_else(|_| bad("array length overflows usize"))?;
+                // Every element takes at least one byte, so a longer array cannot fit.
+                if n > self.remaining() {
+                    return bad(format!("array of {n} elements runs past end of file"));
+                }
                 let mut v = Vec::with_capacity(n.min(1 << 20));
                 for _ in 0..n {
                     v.push(self.value(et)?);
@@ -195,8 +205,12 @@ impl Gguf {
         if !(2..=3).contains(&version) {
             return bad(format!("unsupported GGUF version {version}"));
         }
-        let n_tensors = c.u64()? as usize;
-        let n_kv = c.u64()? as usize;
+        let n_tensors = usize::try_from(c.u64()?).or_else(|_| bad("tensor count overflows usize"))?;
+        let n_kv = usize::try_from(c.u64()?).or_else(|_| bad("metadata count overflows usize"))?;
+        // Each entry needs at least 8 bytes (a string length), so larger counts cannot fit.
+        if n_kv > c.remaining() / 8 || n_tensors > c.remaining() / 8 {
+            return bad("entry count exceeds file size");
+        }
         let mut meta = HashMap::with_capacity(n_kv);
         let mut meta_order = Vec::with_capacity(n_kv);
         for _ in 0..n_kv {
@@ -207,6 +221,9 @@ impl Gguf {
             meta.insert(key, val);
         }
         let alignment = meta.get("general.alignment").and_then(|v| v.as_u64()).unwrap_or(32) as usize;
+        if alignment == 0 || alignment > (1 << 30) {
+            return bad(format!("invalid alignment {alignment}"));
+        }
         let mut tensors = Vec::with_capacity(n_tensors);
         let mut by_name = HashMap::with_capacity(n_tensors);
         for i in 0..n_tensors {
@@ -217,17 +234,30 @@ impl Gguf {
             }
             let mut dims = Vec::with_capacity(nd);
             for _ in 0..nd {
-                dims.push(c.u64()? as usize);
+                dims.push(usize::try_from(c.u64()?).or_else(|_| bad("dimension overflows usize"))?);
+            }
+            if dims.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).is_none() {
+                return bad(format!("{name}: element count overflows"));
             }
             let ty = GgmlType::from_id(c.u32()?);
-            let offset = c.u64()? as usize;
+            if let Some((bv, bb)) = ty.block() {
+                let n: usize = dims.iter().product();
+                if (n / bv).checked_mul(bb).is_none() {
+                    return bad(format!("{name}: byte size overflows"));
+                }
+            }
+            let offset = usize::try_from(c.u64()?).or_else(|_| bad("tensor offset overflows usize"))?;
             by_name.insert(name.clone(), i);
             tensors.push(TensorInfo { name, dims, ty, offset });
         }
-        let data_start = c.pos.div_ceil(alignment) * alignment;
+        let data_start = match c.pos.div_ceil(alignment).checked_mul(alignment) {
+            Some(d) => d,
+            None => return bad("data section start overflows"),
+        };
         for t in &tensors {
             if let Some(nb) = t.n_bytes() {
-                if data_start + t.offset + nb > mmap.len() {
+                let end = data_start.checked_add(t.offset).and_then(|v| v.checked_add(nb));
+                if end.map_or(true, |e| e > mmap.len()) {
                     return bad(format!("{}: data runs past end of file", t.name));
                 }
             }
