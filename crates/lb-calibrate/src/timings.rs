@@ -115,6 +115,22 @@ pub fn parse_bench(text: &str) -> Result<(CardTimings, HostTimings)> {
     Ok((card, hostt))
 }
 
+/// Expert-pool budget per card (MB): the explicit `--budget-mb` value when given, else the
+/// card's free VRAM minus 1 GB of reserve. `lb-gpu-bench` does not emit `vram_free_mb`
+/// (it parses as 0), so a card with no figure is an error here rather than a silent
+/// zero-byte pool that makes every configuration infeasible.
+pub fn budgets_for(cards: &[CardTimings], given: &[f64]) -> Result<Vec<f64>> {
+    cards
+        .iter()
+        .enumerate()
+        .map(|(i, c)| match given.get(i) {
+            Some(&b) => Ok(b),
+            None if c.vram_free_mb > 0.0 => Ok((c.vram_free_mb - 1024.0).max(0.0)),
+            None => bail!("card {} ({}) has no free-VRAM figure (the bench does not record one): pass --budget-mb for it", i, c.name),
+        })
+        .collect()
+}
+
 pub fn load_bench(path: &Path) -> Result<(CardTimings, HostTimings)> {
     parse_bench(&std::fs::read_to_string(path).with_context(|| path.display().to_string())?)
 }
@@ -167,5 +183,12 @@ mod tests {
         assert!(c.conv_layer_ms > c.attn_layer_ms);
         assert!(h.cpu_conv_layer_ms > 0.0 && h.cpu_expert_ms == 1.0);
         assert_eq!(EXPERT_BYTES, 5308416);
+        // the bench has no vram_free_mb: the default budget must be refused, not zero
+        assert_eq!(c.vram_free_mb, 0.0);
+        assert!(budgets_for(&[c.clone()], &[]).is_err());
+        assert_eq!(budgets_for(&[c.clone()], &[4000.0]).unwrap(), vec![4000.0]);
+        let mut known = c;
+        known.vram_free_mb = 8192.0;
+        assert_eq!(budgets_for(&[known], &[]).unwrap(), vec![7168.0]);
     }
 }

@@ -24,7 +24,7 @@ enum Cmd {
         benches: Vec<PathBuf>,
         #[arg(long)]
         scrapes: PathBuf,
-        /// Expert-pool budget per card (MB), same order as --bench; default: that card's free VRAM minus 1024 reserve.
+        /// Expert-pool budget per card (MB), same order as --bench; default: that card's free VRAM minus 1024 reserve, only when the card has a free-VRAM figure (lb-gpu-bench does not record one, so pass this).
         #[arg(long = "budget-mb")]
         budgets: Vec<f64>,
         #[arg(long, default_value_t = 40)]
@@ -88,10 +88,6 @@ fn load_all(benches: &[PathBuf], hyps: &[String]) -> Result<(Vec<CardTimings>, H
     Ok((cards, host.context("at least one --bench")?))
 }
 
-fn budgets_for(cards: &[CardTimings], given: &[f64]) -> Vec<f64> {
-    cards.iter().enumerate().map(|(i, c)| given.get(i).copied().unwrap_or((c.vram_free_mb - 1024.0).max(0.0))).collect()
-}
-
 fn main() -> Result<()> {
     match Args::parse().cmd {
         Cmd::Topology => {
@@ -101,7 +97,7 @@ fn main() -> Result<()> {
         }
         Cmd::Tune { benches, scrapes, budgets, n_layer, n_expert, holdout_every, model, out, hypothetical, top } => {
             let (cards, host) = load_all(&benches, &hypothetical)?;
-            let budgets_mb = budgets_for(&cards, &budgets);
+            let budgets_mb = lb_calibrate::timings::budgets_for(&cards, &budgets)?;
             let trace = Trace::load_dir(&scrapes, n_layer, n_expert)?;
             let (train, test) = trace.split(holdout_every);
             eprintln!("trace: {} requests / {} tokens; train {} tokens, held out {} tokens", trace.requests.len(), trace.n_tokens(), train.n_tokens(), test.n_tokens());
@@ -129,7 +125,7 @@ fn main() -> Result<()> {
         }
         Cmd::Sweep { benches, scrapes, budgets, k, cards: n, n_layer, n_expert, holdout_every, hypothetical, dense, card } => {
             let (mut cards, host) = load_all(&benches, &hypothetical)?;
-            let mut budgets_mb = budgets_for(&cards, &budgets);
+            let mut budgets_mb = lb_calibrate::timings::budgets_for(&cards, &budgets)?;
             if let Some(ci) = card {
                 cards = vec![cards[ci].clone()];
                 budgets_mb = vec![budgets_mb[ci]];
