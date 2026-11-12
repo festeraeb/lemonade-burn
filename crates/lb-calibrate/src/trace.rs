@@ -37,7 +37,9 @@ impl Trace {
                     continue;
                 }
                 let t = by_tok.entry(a.token_pos).or_insert_with(|| vec![Vec::new(); n_layer]);
-                t[a.layer as usize] = a.expert_ids.iter().map(|&e| e as u16).collect();
+                // ids outside the model's expert range are dropped (as `Histogram::from_scrapes`
+                // does); they would otherwise index past the per-expert count arrays.
+                t[a.layer as usize] = a.expert_ids.iter().filter(|&&e| (e as usize) < n_expert && e <= u16::MAX as u32).map(|&e| e as u16).collect();
             }
             if by_tok.is_empty() {
                 continue;
@@ -138,5 +140,28 @@ mod tests {
         assert!((coverage(&t, &s) - 4.0 / 6.0).abs() < 1e-9);
         let (a, b) = t.split(2);
         assert_eq!((a.requests.len(), b.requests.len()), (1, 1));
+    }
+
+    #[test]
+    fn out_of_range_expert_ids_are_dropped_not_panicking() {
+        use lb_lfm2::moe::{Activation, Scrape};
+        let sc = Scrape {
+            schema_version: 1,
+            model_id: "m".into(),
+            request_id: "r".into(),
+            class_id: "c".into(),
+            source: "scrape".into(),
+            phase: "prefill".into(),
+            n_tokens: 1,
+            dtype: "gguf".into(),
+            token_ids: vec![],
+            // 64 is out of range for 64 experts; 65536 would wrap to 0 under `as u16`
+            activations: vec![Activation { layer: 1, token_pos: 0, expert_ids: vec![3, 64, 65536, 63] }],
+        };
+        let t = Trace::from_scrapes(&[sc], 2, 64);
+        assert_eq!(t.requests[0].tokens[0].experts[1], vec![3, 63]);
+        let h = t.histogram();
+        assert_eq!(h[1][3], 1);
+        assert_eq!(h[1][0], 0);
     }
 }
