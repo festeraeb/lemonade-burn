@@ -578,6 +578,32 @@ mod repack_tests {
     }
 }
 
+#[cfg(test)]
+mod cube_count_tests {
+    use super::*;
+
+    fn dims(n: usize, per_cube: usize) -> (u64, u64) {
+        match cube_count(n, per_cube) {
+            CubeCount::Static(x, y, z) => {
+                assert_eq!(z, 1);
+                (x as u64, y as u64)
+            }
+            _ => panic!("expected a static count"),
+        }
+    }
+
+    #[test]
+    fn no_dispatch_dimension_exceeds_65535_and_every_output_is_covered() {
+        // 2048 rows x m=32 prefill tokens, one output per cube: 65,536 cubes (the review's case)
+        assert_eq!(dims(2048 * 32, 1), (65535, 2));
+        for &(n, p) in &[(1usize, 1usize), (0, 4), (65535, 1), (65536, 1), (65535 * 3 + 1, 1), (2048 * 4096, 4), (1 << 30, 8), (7, 100)] {
+            let (x, y) = dims(n, p);
+            assert!(x >= 1 && y >= 1 && x <= 65535 && y <= 65535, "{n}/{p}: {x}x{y}");
+            assert!(x * y >= n.div_ceil(p).max(1) as u64, "{n}/{p}: {x}x{y} cubes cannot cover the outputs");
+        }
+    }
+}
+
 /// Cube count for `n` outputs given `per_cube` outputs per cube: wgpu caps each dispatch
 /// dimension at 65535, so the cubes are laid out in two dimensions and the kernel reads the
 /// linear `CUBE_POS`.
