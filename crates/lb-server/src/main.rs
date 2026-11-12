@@ -125,8 +125,13 @@ pub trait Decoder: Send + 'static {
     fn max_context(&self) -> usize;
     fn bos(&self) -> u32;
     fn kernel_name(&self) -> &'static str;
-    /// Called after each request (scrape flush, profiling); default nothing.
-    fn after_request(&self, _prompt: &[u32]) {}
+    /// Called when a request finished normally (scrape flush, profiling); default nothing.
+    /// `generated` is every token the request emitted.
+    fn after_request(&self, _prompt: &[u32], _generated: &[u32]) {}
+    /// Called after every request however it ended (client gone, error, panic): drop any
+    /// per-request state so it cannot leak into the next request. A no-op after a normal
+    /// finish, which already consumed it.
+    fn discard_request(&self) {}
 }
 
 impl Decoder for BitNet {
@@ -169,21 +174,33 @@ impl Decoder for lb_lfm2::Lfm2 {
             "lfm2 q4_0 (CPU)"
         }
     }
-    fn after_request(&self, prompt: &[u32]) {
-        if let Err(e) = self.scraper.flush("prefill", prompt) {
+    fn after_request(&self, prompt: &[u32], generated: &[u32]) {
+        // prefill and decode routes go to separate files, each labelled with its own phase
+        if let Err(e) = self.scraper.flush_request(prompt, generated) {
             eprintln!("scrape flush failed: {e}");
         }
+    }
+    fn discard_request(&self) {
+        self.scraper.take();
     }
 }
 
 fn worker<D: Decoder>(model: D, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
     while let Ok(job) = rx.recv() {
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&model, &codec, &job)));
+        let res = guarded(&model, || run_job(&model, &codec, &job));
         if let Err(e) = res {
             let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
             let _ = job.tx.send(Gen::Error(format!("generation panicked: {msg}")));
         }
     }
+}
+
+/// Run one job's work; whatever happens (return, early return, panic) the decoder's
+/// per-request state is discarded afterwards. A panic is returned, not propagated.
+fn guarded<D: Decoder>(model: &D, work: impl FnOnce()) -> std::thread::Result<()> {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    model.discard_request();
+    res
 }
 
 fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
@@ -198,6 +215,7 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
     let mut text = String::new();
     let mut sent = 0usize; // bytes of `text` already sent
     let mut n = 0;
+    let mut generated: Vec<u32> = Vec::new();
     let t1 = Instant::now();
     let mut finish = "length";
     let max_stop = job.stop.iter().map(|s| s.len()).max().unwrap_or(0);
@@ -207,6 +225,7 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
             break;
         }
         n += 1;
+        generated.push(next);
         match dec.push(codec, next) {
             Ok(piece) => text.push_str(&piece),
             Err(e) => {
@@ -243,7 +262,7 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
     if text.len() > sent {
         let _ = job.tx.send(Gen::Text(text[sent..].to_string()));
     }
-    model.after_request(&job.prompt);
+    model.after_request(&job.prompt, &generated);
     let _ = job.tx.send(Gen::Done {
         finish_reason: finish,
         prompt_tokens: job.prompt.len(),
@@ -584,4 +603,43 @@ fn main() -> Result<()> {
             .await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Fake {
+        discards: AtomicUsize,
+    }
+    impl Decoder for Fake {
+        type Cache = ();
+        fn new_cache(&self) {}
+        fn forward(&self, _: &[u32], _: &mut (), _: bool) -> Tensor<2> {
+            unimplemented!()
+        }
+        fn max_context(&self) -> usize {
+            0
+        }
+        fn bos(&self) -> u32 {
+            0
+        }
+        fn kernel_name(&self) -> &'static str {
+            "fake"
+        }
+        fn discard_request(&self) {
+            self.discards.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn request_state_is_discarded_on_every_exit() {
+        let m = Fake { discards: AtomicUsize::new(0) };
+        assert!(guarded(&m, || {}).is_ok()); // normal / early return (client gone)
+        assert_eq!(m.discards.load(Ordering::SeqCst), 1);
+        let r = guarded(&m, || panic!("boom")); // generation panic is caught, state still dropped
+        assert!(r.is_err());
+        assert_eq!(m.discards.load(Ordering::SeqCst), 2);
+    }
 }
