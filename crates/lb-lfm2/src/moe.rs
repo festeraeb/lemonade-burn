@@ -511,14 +511,21 @@ pub fn moe_ffn(
 
 /// Read every `run-*.json` scrape file in `dir` (unreadable files are skipped).
 pub fn read_scrape_dir(dir: &std::path::Path) -> std::io::Result<Vec<Scrape>> {
-    let mut out = Vec::new();
+    // `read_dir` order is unspecified: sort by file name so the same files always give the
+    // same sequence (callers split train/held-out by index).
+    let mut paths = Vec::new();
     for e in std::fs::read_dir(dir)? {
         let p = e?.path();
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.starts_with("run-") && name.ends_with(".json") {
-            if let Ok(s) = serde_json::from_str::<Scrape>(&std::fs::read_to_string(&p)?) {
-                out.push(s);
-            }
+            paths.push(p);
+        }
+    }
+    paths.sort();
+    let mut out = Vec::new();
+    for p in paths {
+        if let Ok(s) = serde_json::from_str::<Scrape>(&std::fs::read_to_string(&p)?) {
+            out.push(s);
         }
     }
     Ok(out)
@@ -691,5 +698,33 @@ mod tests {
         };
         let h = Histogram::from_scrapes("m", 4, 4, &[sc]);
         assert_eq!(h.counts[3], vec![0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn read_scrape_dir_is_sorted_by_file_name() {
+        let dir = std::env::temp_dir().join(format!("lb-scrape-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..40u32 {
+            // written in a scrambled order; file name order is the id order
+            let n = (i * 17) % 40;
+            let sc = Scrape {
+                schema_version: 1,
+                model_id: "m".into(),
+                request_id: format!("req{n:02}"),
+                class_id: "c".into(),
+                source: "scrape".into(),
+                phase: "prefill".into(),
+                n_tokens: 0,
+                dtype: "gguf".into(),
+                token_ids: vec![],
+                activations: vec![],
+            };
+            std::fs::write(dir.join(format!("run-1000-{n:04}.json")), serde_json::to_string(&sc).unwrap()).unwrap();
+        }
+        let got: Vec<String> = read_scrape_dir(&dir).unwrap().into_iter().map(|s| s.request_id).collect();
+        let want: Vec<String> = (0..40).map(|n| format!("req{n:02}")).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, want);
     }
 }
