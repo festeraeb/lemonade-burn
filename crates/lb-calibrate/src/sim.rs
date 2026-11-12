@@ -143,6 +143,8 @@ pub struct SimResult {
 struct LayerPool {
     staged: Vec<bool>,
     admitted: Vec<bool>,
+    /// Simulated time (ms) at which an admitted expert's upload completes; it is a hit only after.
+    ready_at: Vec<f64>,
     counts: Vec<u32>,
     spare: usize,
     n_admitted: usize,
@@ -171,7 +173,7 @@ pub fn simulate(cfg: &SimConfig, trace: &Trace, staged: &[Vec<u16>]) -> SimResul
                     st[e as usize] = true;
                 }
             }
-            LayerPool { staged: st, admitted: vec![false; trace.n_expert], counts: vec![0; trace.n_expert], spare, n_admitted: 0, demands: 0 }
+            LayerPool { staged: st, admitted: vec![false; trace.n_expert], ready_at: vec![0.0; trace.n_expert], counts: vec![0; trace.n_expert], spare, n_admitted: 0, demands: 0 }
         })
         .collect();
     res.resident_experts_total = pools.iter().map(|p| p.staged.iter().filter(|&&s| s).count()).sum::<usize>()
@@ -183,6 +185,8 @@ pub fn simulate(cfg: &SimConfig, trace: &Trace, staged: &[Vec<u16>]) -> SimResul
     let (mut sum_ms, mut sum_stall, mut sum_cpu, mut sum_gpu, mut sum_dense, mut sum_hand, mut sum_staged, mut sum_od) =
         (0f64, 0f64, 0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
     let mut tokens = 0usize;
+    // per card: simulated time at which its copy queue is free (admission uploads are serial)
+    let mut copy_free_at = vec![0f64; n_cards];
     for r in &trace.requests {
         for t in &r.tokens {
             tokens += 1;
@@ -197,13 +201,15 @@ pub fn simulate(cfg: &SimConfig, trace: &Trace, staged: &[Vec<u16>]) -> SimResul
                 if l >= cfg.n_dense_lead {
                     let es = t.experts.get(l).map(|v| v.as_slice()).unwrap_or(&[]);
                     let pool = &mut pools[l];
+                    // simulated time at which this layer's routing is known (after its dense part)
+                    let now = sum_ms + tok_ms + layer_ms;
                     let mut hits = 0usize;
                     let mut miss_ids: Vec<u16> = Vec::new();
                     for &e in es {
                         demands_total += 1;
                         pool.demands += 1;
                         pool.counts[e as usize] = pool.counts[e as usize].saturating_add(1);
-                        if pool.staged[e as usize] || pool.admitted[e as usize] {
+                        if pool.staged[e as usize] || (pool.admitted[e as usize] && pool.ready_at[e as usize] <= now) {
                             hits += 1;
                         } else {
                             miss_ids.push(e);
@@ -218,7 +224,9 @@ pub fn simulate(cfg: &SimConfig, trace: &Trace, staged: &[Vec<u16>]) -> SimResul
                         MissPolicy::Cpu => (gpu_ms.max(cpu_ms), 0.0),
                         MissPolicy::OnDemand => (gpu_ms + od_ms, misses as f64 * b_mb),
                         MissPolicy::Best => {
-                            if cpu_ms <= od_ms {
+                            // compare whole-layer costs: CPU misses overlap the card's
+                            // resident work, on-demand copies serialise with it
+                            if gpu_ms.max(cpu_ms) <= gpu_ms + od_ms {
                                 (gpu_ms.max(cpu_ms), 0.0)
                             } else {
                                 (gpu_ms + od_ms, misses as f64 * b_mb)
@@ -229,25 +237,36 @@ pub fn simulate(cfg: &SimConfig, trace: &Trace, staged: &[Vec<u16>]) -> SimResul
                     sum_cpu += if od_bytes > 0.0 { 0.0 } else { cpu_ms };
                     sum_od += od_bytes;
                     layer_ms += moe_ms;
-                    // dynamic admission on spare slots (deferred copies: cost counted as staging bytes)
+                    // dynamic admission on spare slots: the upload goes through the card's copy
+                    // queue and the expert counts as resident only once it completes (until then
+                    // its demands are misses). An evicted expert's slot is gone immediately.
+                    let upload_ms = b_mb / bw * 1000.0;
                     if pool.spare > 0 {
                         for &e in &miss_ids {
-                            if pool.counts[e as usize] >= cfg.admit_after {
-                                if pool.n_admitted < pool.spare {
-                                    pool.admitted[e as usize] = true;
-                                    pool.n_admitted += 1;
-                                    sum_staged += b_mb;
-                                } else {
-                                    // evict the coldest admitted expert if this one is hotter
-                                    let coldest = (0..trace.n_expert).filter(|&i| pool.admitted[i]).min_by_key(|&i| pool.counts[i]);
-                                    if let Some(ci) = coldest {
-                                        if pool.counts[ci] < pool.counts[e as usize] {
-                                            pool.admitted[ci] = false;
-                                            pool.admitted[e as usize] = true;
-                                            sum_staged += b_mb;
-                                        }
+                            let ei = e as usize;
+                            if pool.admitted[ei] || pool.counts[ei] < cfg.admit_after {
+                                continue; // already admitted (upload in flight) or not hot yet
+                            }
+                            let slot_ok = if pool.n_admitted < pool.spare {
+                                pool.n_admitted += 1;
+                                true
+                            } else {
+                                // evict the coldest admitted expert if this one is hotter
+                                let coldest = (0..trace.n_expert).filter(|&i| pool.admitted[i]).min_by_key(|&i| pool.counts[i]);
+                                match coldest {
+                                    Some(ci) if pool.counts[ci] < pool.counts[ei] => {
+                                        pool.admitted[ci] = false;
+                                        true
                                     }
+                                    _ => false,
                                 }
+                            };
+                            if slot_ok {
+                                let done = now.max(copy_free_at[c]) + upload_ms;
+                                copy_free_at[c] = done;
+                                pool.admitted[ei] = true;
+                                pool.ready_at[ei] = done;
+                                sum_staged += b_mb;
                             }
                         }
                         if pool.demands >= cfg.age_every {
@@ -396,5 +415,45 @@ mod tests {
         let staged = top_k(&t.histogram(), 2);
         let r = simulate(&cfg, &t, &staged);
         assert!(r.hit_rate > 0.5, "{}", r.hit_rate);
+    }
+
+    #[test]
+    fn best_is_never_slower_than_cpu_or_on_demand() {
+        // One MoE layer (layer 2), one token routing to experts 0..4 of which 0,1,2 are staged.
+        // hits = 3 x 0.5 ms + 0.3 ms sync = 1.8 ms on the card. One miss:
+        //   CPU      : max(1.8, 2.0)                      = 2.0 ms
+        //   on demand: 1.8 + (5.308416/10000*1000 + 0.5)  = 2.831 ms
+        // Best must take the CPU path (2.0), not the on-demand one.
+        let tok = TokenRoute { experts: vec![vec![], vec![], vec![0, 1, 2, 3]] };
+        let t = Trace { n_layer: 3, n_expert: 8, requests: vec![Request { id: "r".into(), tokens: vec![tok] }] };
+        let staged = vec![vec![], vec![], vec![0u16, 1, 2]];
+        let mut cfg = SimConfig::single_card(card(0.5, 10_000.0), host(), 1000, 3);
+        cfg.miss_policy = MissPolicy::Cpu;
+        let cpu = simulate(&cfg, &t, &staged);
+        cfg.miss_policy = MissPolicy::OnDemand;
+        let od = simulate(&cfg, &t, &staged);
+        cfg.miss_policy = MissPolicy::Best;
+        let best = simulate(&cfg, &t, &staged);
+        assert!((od.ms_per_token - cpu.ms_per_token - (2.830_841_6 - 2.0)).abs() < 1e-4, "{} {}", od.ms_per_token, cpu.ms_per_token);
+        assert!((best.ms_per_token - cpu.ms_per_token).abs() < 1e-9, "best {} cpu {}", best.ms_per_token, cpu.ms_per_token);
+        assert_eq!(best.ondemand_mb_per_token, 0.0);
+    }
+
+    #[test]
+    fn admitted_experts_are_hits_only_after_their_upload_completes() {
+        let t = trace(4); // experts 0..4 every token; only 0,1 staged, 2 and 3 are admission candidates
+        let staged = top_k(&t.histogram(), 2);
+        let run = |bw: f64| {
+            let mut cfg = SimConfig::single_card(card(0.5, bw), host(), 1000, 2);
+            cfg.dynamic_admit = true;
+            cfg.admit_after = 2;
+            simulate(&cfg, &t, &staged)
+        };
+        // 1 MB/s: one upload takes 5308 ms, far longer than the whole 10-token trace.
+        let slow = run(1.0);
+        assert!((slow.hit_rate - 0.5).abs() < 1e-12, "slow bus must give no admission hits: {}", slow.hit_rate);
+        // 1e6 MB/s: uploads finish in microseconds, so admitted experts hit from the next layer visit.
+        let fast = run(1e6);
+        assert!(fast.hit_rate > 0.8, "{}", fast.hit_rate);
     }
 }
