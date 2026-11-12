@@ -839,14 +839,21 @@ fn moe_cached(
 
 /// Read every `run-*.json` scrape file in `dir` (unreadable files are skipped).
 pub fn read_scrape_dir(dir: &std::path::Path) -> std::io::Result<Vec<Scrape>> {
-    let mut out = Vec::new();
+    // `read_dir` order is unspecified: sort by file name so the same files always give the
+    // same sequence (callers split train/held-out by index).
+    let mut paths = Vec::new();
     for e in std::fs::read_dir(dir)? {
         let p = e?.path();
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.starts_with("run-") && name.ends_with(".json") {
-            if let Ok(s) = serde_json::from_str::<Scrape>(&std::fs::read_to_string(&p)?) {
-                out.push(s);
-            }
+            paths.push(p);
+        }
+    }
+    paths.sort();
+    let mut out = Vec::new();
+    for p in paths {
+        if let Ok(s) = serde_json::from_str::<Scrape>(&std::fs::read_to_string(&p)?) {
+            out.push(s);
         }
     }
     Ok(out)
@@ -954,6 +961,27 @@ impl Scraper {
     /// Write the pending activations as one scrape file; returns its path when enabled.
     pub fn flush(&self, phase: &str, token_ids: &[u32]) -> std::io::Result<Option<PathBuf>> {
         let acts = self.take();
+        self.write(phase, token_ids, acts)
+    }
+
+    /// Write one request's pending activations as up to two correctly labelled files: the
+    /// positions inside the prompt as `prefill` (`token_ids` = the prompt), and the later
+    /// positions as `decode` (`token_ids` = prompt plus the generated tokens that were fed
+    /// back, so every row's `token_pos` is below `n_tokens`). Returns the paths written.
+    pub fn flush_request(&self, prompt: &[u32], generated: &[u32]) -> std::io::Result<Vec<PathBuf>> {
+        let acts = self.take();
+        let n_prompt = prompt.len() as u32;
+        let (pre, dec): (Vec<Activation>, Vec<Activation>) = acts.into_iter().partition(|a| a.token_pos < n_prompt);
+        let mut out = Vec::new();
+        out.extend(self.write("prefill", prompt, pre)?);
+        if let Some(n_total) = dec.iter().map(|a| a.token_pos as usize + 1).max() {
+            let history: Vec<u32> = prompt.iter().chain(generated).copied().take(n_total).collect();
+            out.extend(self.write("decode", &history, dec)?);
+        }
+        Ok(out)
+    }
+
+    fn write(&self, phase: &str, token_ids: &[u32], acts: Vec<Activation>) -> std::io::Result<Option<PathBuf>> {
         let Some(dir) = self.dir() else { return Ok(None) };
         if acts.is_empty() {
             return Ok(None);
@@ -1071,5 +1099,59 @@ mod tests {
         };
         let h = Histogram::from_scrapes("m", 4, 4, &[sc]);
         assert_eq!(h.counts[3], vec![0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn read_scrape_dir_is_sorted_by_file_name() {
+        let dir = std::env::temp_dir().join(format!("lb-scrape-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..40u32 {
+            // written in a scrambled order; file name order is the id order
+            let n = (i * 17) % 40;
+            let sc = Scrape {
+                schema_version: 1,
+                model_id: "m".into(),
+                request_id: format!("req{n:02}"),
+                class_id: "c".into(),
+                source: "scrape".into(),
+                phase: "prefill".into(),
+                n_tokens: 0,
+                dtype: "gguf".into(),
+                token_ids: vec![],
+                activations: vec![],
+            };
+            std::fs::write(dir.join(format!("run-1000-{n:04}.json")), serde_json::to_string(&sc).unwrap()).unwrap();
+        }
+        let got: Vec<String> = read_scrape_dir(&dir).unwrap().into_iter().map(|s| s.request_id).collect();
+        let want: Vec<String> = (0..40).map(|n| format!("req{n:02}")).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn flush_request_splits_prefill_and_decode_with_matching_labels() {
+        let dir = std::env::temp_dir().join(format!("lb-scrape-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Scraper::new(Some(dir.clone()), "m".into(), "c".into());
+        let r = Route { experts: vec![1, 2], weights: vec![0.5, 0.5] };
+        // prompt of 3 tokens (positions 0..3), then two decode steps at positions 3 and 4
+        s.record(2, 0, &[r.clone(), r.clone(), r.clone()]);
+        s.record(2, 3, &[r.clone()]);
+        s.record(2, 4, &[r.clone()]);
+        let paths = s.flush_request(&[10, 11, 12], &[20, 21, 22]).unwrap();
+        assert_eq!(paths.len(), 2);
+        let read = |p: &PathBuf| serde_json::from_str::<Scrape>(&std::fs::read_to_string(p).unwrap()).unwrap();
+        let (pre, dec) = (read(&paths[0]), read(&paths[1]));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((pre.phase.as_str(), pre.n_tokens, pre.token_ids.clone()), ("prefill", 3, vec![10, 11, 12]));
+        assert_eq!(pre.activations.len(), 3);
+        // decode: positions 3 and 4 were fed tokens 20 and 21; 22 was never forwarded
+        assert_eq!((dec.phase.as_str(), dec.n_tokens, dec.token_ids.clone()), ("decode", 5, vec![10, 11, 12, 20, 21]));
+        assert_eq!(dec.activations.iter().map(|a| a.token_pos).collect::<Vec<_>>(), vec![3, 4]);
+        for sc in [&pre, &dec] {
+            assert!(sc.activations.iter().all(|a| a.token_pos < sc.n_tokens && sc.n_tokens as usize == sc.token_ids.len()));
+        }
+        assert!(s.take().is_empty(), "everything pending was consumed");
     }
 }
