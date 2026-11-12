@@ -41,6 +41,8 @@ pub struct StagingConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candidate {
+    /// Indices into `TuneInput::cards` of the cards used, in the order layers are dealt to them.
+    pub card_idx: Vec<usize>,
     pub n_cards: usize,
     pub k: usize,
     pub lookahead: usize,
@@ -69,10 +71,16 @@ pub fn slots_for(budget_mb: f64) -> usize {
 /// Run every candidate; returns them sorted best first.
 pub fn enumerate(inp: &TuneInput<'_>) -> Vec<Candidate> {
     let hist = inp.train.histogram();
+    let n_layer = inp.train.n_layer;
     let mut out = Vec::new();
-    for n in 1..=inp.cards.len() {
-        let cards: Vec<CardTimings> = inp.cards[..n].to_vec();
-        let slots: Vec<usize> = inp.budgets_mb[..n].iter().map(|&b| slots_for(b)).collect();
+    // every non-empty subset of the cards (a slow or zero-budget first card must not rule
+    // out a faster later one); bit i of `mask` selects card i
+    assert!(inp.cards.len() < 16, "too many cards to enumerate subsets");
+    for mask in 1u32..(1u32 << inp.cards.len()) {
+        let card_idx: Vec<usize> = (0..inp.cards.len()).filter(|&i| mask >> i & 1 == 1).collect();
+        let n = card_idx.len();
+        let cards: Vec<CardTimings> = card_idx.iter().map(|&i| inp.cards[i].clone()).collect();
+        let slots: Vec<usize> = card_idx.iter().map(|&i| slots_for(inp.budgets_mb[i])).collect();
         for &k in &inp.ks {
             if slots.iter().any(|&s| s < k) {
                 continue; // a card must hold at least one layer's set
@@ -86,11 +94,16 @@ pub fn enumerate(inp: &TuneInput<'_>) -> Vec<Candidate> {
                             cfg.cards = cards.clone();
                             cfg.slots = slots.clone();
                             cfg.lookahead = la;
+                            // a rolling card needs `lookahead` staged sets in flight at once
+                            // (V2_PIPELINE.md section 5)
+                            if (0..n).any(|c| !cfg.is_static(c, n_layer) && slots[c] < k * la) {
+                                continue;
+                            }
                             cfg.dense_on_gpu = dense;
                             cfg.miss_policy = mp;
                             cfg.dynamic_admit = dyn_admit;
                             let result = simulate(&cfg, inp.test, &staged);
-                            out.push(Candidate { n_cards: n, k, lookahead: la, miss_policy: mp, dynamic_admit: dyn_admit, dense_on_gpu: dense, result });
+                            out.push(Candidate { card_idx: card_idx.clone(), n_cards: n, k, lookahead: la, miss_policy: mp, dynamic_admit: dyn_admit, dense_on_gpu: dense, result });
                         }
                     }
                 }
@@ -107,17 +120,20 @@ pub fn best_config(inp: &TuneInput<'_>, model: &str) -> Option<(StagingConfig, V
     let hist = inp.train.histogram();
     let staged = top_k(&hist, best.k);
     let n_layer = inp.train.n_layer;
-    let mut cfg = SimConfig::single_card(inp.cards[0].clone(), inp.host.clone(), slots_for(inp.budgets_mb[0]), best.k);
-    cfg.cards = inp.cards[..best.n_cards].to_vec();
-    cfg.slots = inp.budgets_mb[..best.n_cards].iter().map(|&b| slots_for(b)).collect();
-    let cards = (0..best.n_cards)
-        .map(|c| CardAssign {
-            host: inp.cards[c].host.clone(),
-            device: inp.cards[c].device.clone(),
-            name: inp.cards[c].name.clone(),
+    let idx = &best.card_idx;
+    let mut cfg = SimConfig::single_card(inp.cards[idx[0]].clone(), inp.host.clone(), slots_for(inp.budgets_mb[idx[0]]), best.k);
+    cfg.cards = idx.iter().map(|&i| inp.cards[i].clone()).collect();
+    cfg.slots = idx.iter().map(|&i| slots_for(inp.budgets_mb[i])).collect();
+    let cards = idx
+        .iter()
+        .enumerate()
+        .map(|(c, &oi)| CardAssign {
+            host: inp.cards[oi].host.clone(),
+            device: inp.cards[oi].device.clone(),
+            name: inp.cards[oi].name.clone(),
             layers: (0..n_layer).filter(|&l| cfg.card_of(l) == c && l >= cfg.n_dense_lead).collect(),
             slots: cfg.slots[c],
-            budget_mb: inp.budgets_mb[c],
+            budget_mb: inp.budgets_mb[oi],
             is_static: cfg.is_static(c, n_layer),
         })
         .collect();
@@ -125,7 +141,7 @@ pub fn best_config(inp: &TuneInput<'_>, model: &str) -> Option<(StagingConfig, V
         "decode, one stream; prefill and multi-stream pipelining not modelled".into(),
         "staged sets = top-k per layer of the train trace histogram; judged on the held-out trace".into(),
     ];
-    if inp.cards.iter().any(|c| !c.measured) {
+    if idx.iter().any(|&i| !inp.cards[i].measured) {
         notes.push("includes hypothetical cards".into());
     }
     Some((
@@ -143,7 +159,7 @@ pub fn best_config(inp: &TuneInput<'_>, model: &str) -> Option<(StagingConfig, V
             predicted: best.result.clone(),
             train_tokens: inp.train.n_tokens(),
             held_out_tokens: inp.test.n_tokens(),
-            measured_on: inp.cards.iter().map(|c| c.name.clone()).collect(),
+            measured_on: idx.iter().map(|&i| inp.cards[i].name.clone()).collect(),
             notes,
         },
         cands,
@@ -201,5 +217,63 @@ mod tests {
         assert_eq!(best.k_per_layer, 8, "all 8 experts fit, so the best k is 8");
         assert_eq!(best.predicted.hit_rate, 1.0);
         assert!(best.cards[0].is_static);
+    }
+
+    fn test_card(expert_ms: f64) -> CardTimings {
+        CardTimings {
+            name: format!("c{expert_ms}"),
+            host: "h".into(),
+            device: "d".into(),
+            expert_ms,
+            expert_m4_ms: expert_ms,
+            h2d_mb_s: 3000.0,
+            h2d_bulk_mb_s: 3000.0,
+            handoff_us: 200.0,
+            conv_layer_ms: 0.5,
+            attn_layer_ms: 0.5,
+            dense_ffn_ms: 1.0,
+            vram_free_mb: 8000.0,
+            measured: true,
+        }
+    }
+    fn test_host() -> HostTimings {
+        HostTimings { host: "h".into(), threads: 32, cpu_expert_ms: 1.0, cpu_head_ms: 30.0, cpu_conv_layer_ms: 2.0, cpu_attn_layer_ms: 1.5, cpu_dense_ffn_ms: 6.0, measured: true }
+    }
+    /// 6 layers (2 dense lead + 4 MoE), 8 experts, every token routes to experts 0..4.
+    fn flat_trace() -> Trace {
+        let tok = TokenRoute { experts: (0..6).map(|l| if l < 2 { vec![] } else { vec![0, 1, 2, 3] }).collect() };
+        Trace { n_layer: 6, n_expert: 8, requests: vec![Request { id: "r".into(), tokens: vec![tok; 5] }] }
+    }
+
+    #[test]
+    fn a_zero_budget_first_card_does_not_rule_out_a_later_card() {
+        let t = flat_trace();
+        let inp = TuneInput { cards: vec![test_card(0.3), test_card(0.3)], budgets_mb: vec![0.0, 1000.0], host: test_host(), train: &t, test: &t, ks: vec![4], lookaheads: vec![1], dense_options: vec![true] };
+        let (best, cands) = best_config(&inp, "t").expect("card 1 alone is feasible");
+        assert!(cands.iter().all(|c| c.card_idx == vec![1]));
+        assert_eq!(best.cards.len(), 1);
+        assert_eq!(best.cards[0].budget_mb, 1000.0, "assignment keeps the original card's budget");
+    }
+
+    #[test]
+    fn a_faster_second_card_can_win_alone() {
+        let t = flat_trace();
+        let inp = TuneInput { cards: vec![test_card(5.0), test_card(0.1)], budgets_mb: vec![1000.0, 1000.0], host: test_host(), train: &t, test: &t, ks: vec![4], lookaheads: vec![1], dense_options: vec![true] };
+        let (best, _) = best_config(&inp, "t").unwrap();
+        assert_eq!(best.measured_on, vec!["c0.1".to_string()]);
+    }
+
+    #[test]
+    fn rolling_cards_need_lookahead_sets_of_slots() {
+        let t = flat_trace();
+        // 22 MB = 4 slots per card; k=4 with two cards: each holds 2 MoE layers = 8 > 4 slots, so
+        // both roll. Lookahead 1 needs 4 slots (fits); lookahead 2 needs 8 (does not).
+        let inp = TuneInput { cards: vec![test_card(0.3), test_card(0.3)], budgets_mb: vec![22.0, 22.0], host: test_host(), train: &t, test: &t, ks: vec![4], lookaheads: vec![1, 2], dense_options: vec![true] };
+        let cands = enumerate(&inp);
+        assert!(cands.iter().any(|c| c.card_idx == vec![0, 1] && c.lookahead == 1));
+        assert!(!cands.iter().any(|c| c.card_idx == vec![0, 1] && c.lookahead == 2));
+        // a single card never rolls with lookahead overlap, but it also needs its own 4x2 slots to be static;
+        // with 4 slots it rolls and lookahead 2 is rejected as well
+        assert!(!cands.iter().any(|c| c.card_idx.len() == 1 && c.lookahead == 2));
     }
 }
