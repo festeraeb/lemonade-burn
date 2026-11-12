@@ -171,6 +171,13 @@ fn main() -> Result<()> {
                 }
             }
             decode_s = t.elapsed().as_secs_f32();
+            // The decode forwards recorded routes at positions after the prompt: write them
+            // now, labelled "decode" with the whole processed token history, so they neither
+            // leak into the next prompt's prefill scrape nor get lost after the last prompt.
+            let history: Vec<u32> = ids.iter().chain(gen.iter()).copied().collect();
+            if let Some(p) = model.scraper.flush("decode", &history)? {
+                eprintln!("scrape written: {}", p.display());
+            }
             println!(
                 "ours greedy: {:?}  ({} decode steps in {decode_s:.1}s = {:.2} tok/s)",
                 oracle_detokenize(&args.oracle, &gen).unwrap_or_default(),
