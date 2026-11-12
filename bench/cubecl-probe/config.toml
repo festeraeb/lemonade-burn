@@ -1,0 +1,8 @@
+# Cargo config that swaps the two CubeCL crates for locally instrumented copies (the h2d
+# write-path probe, 2026-11-03). Never committed upstream; the copies live outside the repo:
+#   cargo --config bench/cubecl-probe/config.toml build --release -p lb-q4-gpu --features cuda --example copy_bench
+# then `git checkout Cargo.lock` (the patch rewrites the lock's source lines).
+# The diffs against the pristine 0.11.2 crates are in cubecl-probe.patch next to this file.
+[patch.crates-io]
+cubecl-cuda = { path = "/data/cubecl-probe/cubecl-cuda-0.11.2" }
+cubecl-server = { path = "/data/cubecl-probe/cubecl-server-0.11.2" }

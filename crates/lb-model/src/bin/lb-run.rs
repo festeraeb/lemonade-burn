@@ -99,7 +99,7 @@ fn main() -> Result<()> {
             let mut dec = StreamDecoder::new();
             let t1 = Instant::now();
             let mut n = 0;
-            while n < max_tokens && !TextCodec::is_stop(next) {
+            while n < max_tokens && !codec.is_stop(next) {
                 print!("{}", dec.push(&codec, next)?);
                 std::io::stdout().flush()?;
                 n += 1;

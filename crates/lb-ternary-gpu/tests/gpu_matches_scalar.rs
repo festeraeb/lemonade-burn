@@ -52,3 +52,23 @@ fn bitnet_square() {
 fn bitnet_ffn_four_tokens() {
     check(6912, 2560, 4, 4);
 }
+
+/// Long run on the GPU chosen by LB_WGPU_DEVICE, to see which card works (sysfs busy %) and time it.
+/// Run with `--ignored`. Checks the last result against the scalar reference.
+#[test]
+#[ignore]
+fn sustained_load_on_chosen_device() {
+    let (rows, cols, m) = (2048, 2048, 8);
+    let mut rng = Rng(7);
+    let values: Vec<i8> = (0..rows * cols).map(|_| rng.ternary()).collect();
+    let w = PackedTernary::from_ternary(rows, cols, &values, 1.0);
+    let acts: Vec<f32> = (0..m * cols).map(|_| rng.unit() * 4.0).collect();
+    let x = quantize_acts(&acts, m, cols);
+    let want = ternary_gemm_i32(w.view(), &x, Kernel::Scalar);
+    let t = std::time::Instant::now();
+    let mut got = Vec::new();
+    while t.elapsed().as_secs_f32() < 8.0 {
+        got = ternary_gemm_i32_gpu(w.view(), &x).expect("GPU call");
+    }
+    assert_eq!(got, want);
+}

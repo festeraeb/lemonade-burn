@@ -1,0 +1,175 @@
+diff --git a/cubecl-cuda-0.11.2/src/compute/driver.rs b/cubecl-cuda-0.11.2/src/compute/driver.rs
+index c76ae1b..c65c913 100644
+--- a/cubecl-cuda-0.11.2/src/compute/driver.rs
++++ b/cubecl-cuda-0.11.2/src/compute/driver.rs
+@@ -142,6 +142,34 @@ impl Driver for Cuda {
+             // SAFETY: the destination is contiguous, the bound check above
+             // covers it, and `data` is a live host slice the caller keeps
+             // alive until the stream is synchronized.
++            // PROBE (local, not upstream): time the enqueue, say whether the host pointer is
++            // page-locked, and optionally sync the stream here to isolate the DMA.
++            if cubecl_server::probe::enabled() {
++                let mut flags: std::ffi::c_uint = 0;
++                let pinned = unsafe {
++                    cudarc::driver::sys::cuMemHostGetFlags(&mut flags, data.as_ptr() as *mut c_void)
++                } == cudarc::driver::sys::CUresult::CUDA_SUCCESS;
++                let t = std::time::Instant::now();
++                let r = unsafe {
++                    cudarc::driver::result::memcpy_htod_async(resource.ptr, data, stream.sys)
++                        .map_err(|err| copy_failed("memcpy_htod_async", err, layout))
++                };
++                let htod_us = cubecl_server::probe::us(t);
++                let mut sync_us = -1.0f64;
++                if cubecl_server::probe::sync_after_enqueue() {
++                    let t = std::time::Instant::now();
++                    let s = unsafe { cudarc::driver::sys::cuStreamSynchronize(stream.sys) };
++                    sync_us = cubecl_server::probe::us(t);
++                    if s != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
++                        std::eprintln!("probe{{\"w\":\"cuStreamSynchronize\",\"err\":\"{s:?}\"}}");
++                    }
++                }
++                std::eprintln!(
++                    "probe{{\"w\":\"copy_to_device\",\"bytes\":{},\"host_pinned\":{pinned},\"htod_async_us\":{htod_us:.1},\"sync_after_us\":{sync_us:.1}}}",
++                    data.len()
++                );
++                return r;
++            }
+             return unsafe {
+                 cudarc::driver::result::memcpy_htod_async(resource.ptr, data, stream.sys)
+                     .map_err(|err| copy_failed("memcpy_htod_async", err, layout))
+diff --git a/cubecl-cuda-0.11.2/src/compute/storage/cpu.rs b/cubecl-cuda-0.11.2/src/compute/storage/cpu.rs
+index 156777e..f9a1193 100644
+--- a/cubecl-cuda-0.11.2/src/compute/storage/cpu.rs
++++ b/cubecl-cuda-0.11.2/src/compute/storage/cpu.rs
+@@ -90,7 +90,11 @@ impl ComputeStorage for PinnedMemoryStorage {
+             let ptr2ptr: *mut *mut c_void = &mut ptr;
+ 
+             // Allocate pinned host memory using cuMemAllocHost_v2
++            let t = std::time::Instant::now();
+             let result = cudarc::driver::sys::cuMemAllocHost_v2(ptr2ptr, size as usize);
++            if cubecl_server::probe::enabled() {
++                eprintln!("probe{{\"w\":\"cuMemAllocHost\",\"bytes\":{size},\"us\":{:.1}}}", cubecl_server::probe::us(t));
++            }
+ 
+             if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                 return Err(IoError::Unknown {
+diff --git a/cubecl-cuda-0.11.2/src/compute/storage/gpu.rs b/cubecl-cuda-0.11.2/src/compute/storage/gpu.rs
+index a4a8892..66a86ff 100644
+--- a/cubecl-cuda-0.11.2/src/compute/storage/gpu.rs
++++ b/cubecl-cuda-0.11.2/src/compute/storage/gpu.rs
+@@ -195,7 +195,8 @@ impl ComputeStorage for GpuStorage {
+         } else {
+             // SAFETY: The context and stream are valid. Successful allocations
+             // remain owned by `self.memory` and are freed by their actual kind.
+-            unsafe {
++            let t = std::time::Instant::now();
++            let r = unsafe {
+                 match self.allocator {
+                     CudaAllocator::Sync => cudarc::driver::result::malloc_sync(size as usize)
+                         .map(|ptr| (ptr, AllocationKind::Sync)),
+@@ -208,7 +209,11 @@ impl ComputeStorage for GpuStorage {
+                             })
+                     }
+                 }
++            };
++            if cubecl_server::probe::enabled() {
++                eprintln!("probe{{\"w\":\"cuMemAlloc\",\"bytes\":{size},\"us\":{:.1}}}", cubecl_server::probe::us(t));
+             }
++            r
+         };
+         let (ptr, kind) = match allocation {
+             Ok(allocation) => allocation,
+diff --git a/cubecl-server-0.11.2/src/command/base.rs b/cubecl-server-0.11.2/src/command/base.rs
+index 809aafd..53da5ed 100644
+--- a/cubecl-server-0.11.2/src/command/base.rs
++++ b/cubecl-server-0.11.2/src/command/base.rs
+@@ -27,7 +27,7 @@ use crate::stream::TouchedPage;
+ use alloc::boxed::Box;
+ use alloc::vec;
+ use alloc::vec::Vec;
+-use cubecl_common::{bytes::Bytes, device::ServiceId};
++use cubecl_common::{bytes::{AllocationProperty, Bytes}, device::ServiceId};
+ use cubecl_environment::backtrace::BackTrace;
+ use cubecl_environment::future::DynFut;
+ use cubecl_environment::stream::StreamId;
+@@ -460,9 +460,16 @@ impl<'a, D: Driver> Command<'a, D> {
+             return Ok(());
+         }
+ 
++        // PROBE (local, not upstream): see crate::probe.
++        let probe = crate::probe::enabled();
++        let t_start = std::time::Instant::now();
++        let in_prop = data.property();
++        let (mut reserve_us, mut memcpy_us, mut got_pinned) = (0.0f64, 0.0f64, false);
++
+         let layout = CopyLayout::of(&shape, &strides, elem_size)?;
+         let resource = self.resource(binding)?;
+         let staging = Staging::of(size, data.property());
++        let t_prelude_us = crate::probe::us(t_start);
+ 
+         let data = match staging.through_pinned {
+             true => {
+@@ -472,10 +479,15 @@ impl<'a, D: Driver> Command<'a, D> {
+                 // gives for the same condition. File-backed data still lands in
+                 // real memory before the driver reads it asynchronously, which
+                 // is the half of the staging that is mandatory.
++                let t = std::time::Instant::now();
+                 let mut buffer = self
+                     .reserve_pinned(size, None)
+                     .unwrap_or_else(|| Bytes::from_bytes_vec(vec![0; size]));
++                reserve_us = crate::probe::us(t);
++                got_pinned = matches!(buffer.property(), AllocationProperty::Pinned);
++                let t = std::time::Instant::now();
+                 data.copy_into(&mut buffer);
++                memcpy_us = crate::probe::us(t);
+                 buffer
+             }
+             false => data,
+@@ -486,8 +498,11 @@ impl<'a, D: Driver> Command<'a, D> {
+         // SAFETY: `resource` is a live device allocation, `data` is a valid
+         // host buffer, and either the drop queue or the capture window below
+         // keeps it alive for as long as the device reads it.
++        let t = std::time::Instant::now();
+         unsafe { D::copy_to_device(&resource, &layout, &data, current)? };
++        let enqueue_us = crate::probe::us(t);
+ 
++        let (mut flushed, mut flush_us) = (false, 0.0f64);
+         if current.capturing().is_recording() {
+             // A copy recorded into a graph is not executed now but re-read on
+             // every replay: the node keeps the raw host pointer, so the bytes
+@@ -496,11 +511,22 @@ impl<'a, D: Driver> Command<'a, D> {
+             // starts needing them.
+             current.capturing().retain_host(data);
+         } else {
++            let t = std::time::Instant::now();
+             current.drop_queue().push(data);
+             if staging.flush_after || current.drop_queue().should_flush() {
++                flushed = true;
+                 let signal = current.signal();
+                 current.drop_queue().flush(|| D::Stream::fence(signal));
+             }
++            flush_us = crate::probe::us(t);
++        }
++
++        if probe {
++            std::eprintln!(
++                "probe{{\"w\":\"write_to_gpu\",\"bytes\":{size},\"in_prop\":\"{in_prop:?}\",\"staged\":{},\"got_pinned\":{got_pinned},\"prelude_us\":{t_prelude_us:.1},\"reserve_us\":{reserve_us:.1},\"memcpy_us\":{memcpy_us:.1},\"enqueue_us\":{enqueue_us:.1},\"flushed\":{flushed},\"flush_us\":{flush_us:.1},\"total_us\":{:.1}}}",
++                staging.through_pinned,
++                crate::probe::us(t_start)
++            );
+         }
+ 
+         Ok(())
+diff --git a/cubecl-server-0.11.2/src/lib.rs b/cubecl-server-0.11.2/src/lib.rs
+index 11a4b5a..725796b 100644
+--- a/cubecl-server-0.11.2/src/lib.rs
++++ b/cubecl-server-0.11.2/src/lib.rs
+@@ -35,6 +35,8 @@ pub use cubecl_runtime::{local_tuner, storage_id_type};
+ 
+ /// Kernel related traits, and the compiled kernel a launch produces.
+ pub mod kernel;
++#[cfg(feature = "std")]
++pub mod probe;
+ 
+ /// Stream related utilities.
+ pub mod stream;

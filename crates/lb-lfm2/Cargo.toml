@@ -1,0 +1,26 @@
+[package]
+name = "lb-lfm2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "LFM2 / LFM2-MoE (LiquidAI) decoder on Burn, loaded from GGUF, with scrape-driven expert placement"
+
+[features]
+default = []
+# Resident experts on the wgpu device chosen by LB_WGPU_DEVICE (CubeCL kernels).
+gpu = ["lb-q4-gpu"]
+# Also build the cubecl-cuda runtime (LB_CUDA_DEVICE=N); see lb-q4-gpu.
+cuda = ["gpu", "lb-q4-gpu/cuda"]
+
+[dependencies]
+lb-gguf.workspace = true
+lb-q4-gpu = { workspace = true, optional = true }
+burn.workspace = true
+burn-flex = "=0.22.1"
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+ureq = { version = "2", features = ["json"] }

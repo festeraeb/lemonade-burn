@@ -33,6 +33,21 @@ fn ternary_gemm_kernel(w: &[u32], x: &[i32], dims: &[u32], out: &mut [i32]) {
     }
 }
 
+/// The wgpu device from `LB_WGPU_DEVICE`: unset or "default" = wgpu's choice, "discrete:N" = the
+/// Nth discrete GPU, "integrated:N" = the Nth integrated one (e.g. "discrete:1" for a second card).
+pub fn pick_device() -> Result<WgpuDevice, String> {
+    use cubecl::device::WgpuDeviceKind;
+    let spec = std::env::var("LB_WGPU_DEVICE").unwrap_or_default();
+    let (kind, idx) = spec.split_once(':').unwrap_or((spec.as_str(), "0"));
+    let n: usize = idx.parse().map_err(|_| format!("LB_WGPU_DEVICE {spec:?}: index must be a number"))?;
+    Ok(match kind {
+        "" | "default" => WgpuDevice::default(),
+        "discrete" => WgpuDevice::new(WgpuDeviceKind::DiscreteGpu(n)),
+        "integrated" => WgpuDevice::new(WgpuDeviceKind::IntegratedGpu(n)),
+        _ => return Err(format!("LB_WGPU_DEVICE {spec:?}: use default, discrete:N or integrated:N")),
+    })
+}
+
 pub fn ternary_gemm_i32_gpu(w: TernaryView<'_>, x: &QuantActs) -> Result<Vec<i32>, String> {
     let kp = lb_ternary::pack::padded_cols(w.cols);
     if x.kp != kp {
@@ -42,7 +57,8 @@ pub fn ternary_gemm_i32_gpu(w: TernaryView<'_>, x: &QuantActs) -> Result<Vec<i32
     if n_out == 0 {
         return Ok(Vec::new());
     }
-    let client = std::panic::catch_unwind(|| cubecl::Device::Wgpu(WgpuDevice::default()).client())
+    let device = pick_device()?;
+    let client = std::panic::catch_unwind(|| cubecl::Device::Wgpu(device.clone()).client())
         .map_err(|_| "no wgpu adapter available (WgpuRuntime::client panicked)".to_string())?;
 
     let words: Vec<u32> = w.data[..w.rows * w.row_bytes()]

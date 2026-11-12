@@ -21,8 +21,9 @@ use burn::tensor::Device;
 use clap::Parser;
 use futures_util::stream::{self, Stream};
 use lb_model::sample::{Sampler, SamplingParams};
-use lb_model::text::{ChatMessage, StreamDecoder, TextCodec};
+use lb_model::text::{ChatMessage, ChatStyle, StreamDecoder, TextCodec};
 use lb_model::BitNet;
+use burn::tensor::Tensor;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -38,9 +39,31 @@ pub const RUNTIME_NAME: &str = "lemonade-burn";
 #[derive(Parser, Debug, Clone)]
 #[command(name = "lemonade-burn-server")]
 struct Args {
-    /// Converted model directory (lb-convert output).
+    /// Model: a converted BitNet directory (lb-convert output) or an LFM2 / LFM2-MoE `.gguf`
+    /// file (with `tokenizer.json` beside it).
     #[arg(long)]
     model: PathBuf,
+    /// LFM2 only: directory of NautiBurn scrape files to plan the expert placement from.
+    #[arg(long)]
+    placement_from_scrapes: Option<PathBuf>,
+    /// LFM2 only: GPU byte budget for resident experts (MB); 0 = all experts on the CPU.
+    #[arg(long, default_value_t = 0)]
+    gpu_budget_mb: usize,
+    /// LFM2 only: upload the planned residents to the GPU named by LB_WGPU_DEVICE and run
+    /// them there (needs the `gpu` feature).
+    #[arg(long, default_value_t = false)]
+    gpu: bool,
+    /// LFM2 only: what to do with an expert the router asked for that is not resident.
+    /// `cpu` runs it on the CPU reference path; `on-demand` copies it to the device and
+    /// runs it there, which measured 45.2 ms against about 4 ms a call on the 24B.
+    #[arg(long, default_value = "cpu")]
+    miss_policy: String,
+    /// LFM2 only, with `--gpu`: byte budget (MB) for resident *dense* weights — the
+    /// short-conv projections, attention q/k/v/o and the leading dense FFNs. These run for
+    /// every token, so there is nothing to plan: give it enough and all of them go over
+    /// (424 MB on the 24B). 0 = leave the dense side on the CPU.
+    #[arg(long, default_value_t = 0)]
+    gpu_dense_mb: usize,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8000)]
@@ -83,15 +106,88 @@ struct AppState {
     started: u64,
     kernel: &'static str,
     threads: usize,
+    /// LFM2 only: the live expert-placement counters, shared with the model thread.
+    placement: Option<Arc<lb_lfm2::moe::PlacementStats>>,
+    /// LFM2 only: the forward-pass time split, shared with the model thread.
+    timings: Option<Arc<lb_lfm2::model::Timings>>,
 }
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn worker(model: BitNet, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
+/// A decoder the server can host: prefill/decode with its own cache.
+pub trait Decoder: Send + 'static {
+    type Cache;
+    fn new_cache(&self) -> Self::Cache;
+    /// Logits `[1, vocab]` for the last of `tokens`, run at positions `cache.len..`.
+    fn forward(&self, tokens: &[u32], cache: &mut Self::Cache, all_logits: bool) -> Tensor<2>;
+    fn max_context(&self) -> usize;
+    fn bos(&self) -> u32;
+    fn kernel_name(&self) -> &'static str;
+    /// Called when a request finished normally (scrape flush, profiling); default nothing.
+    /// `generated` is every token the request emitted.
+    fn after_request(&self, _prompt: &[u32], _generated: &[u32]) {}
+    /// Called after every request however it ended (client gone, error, panic): drop any
+    /// per-request state so it cannot leak into the next request. A no-op after a normal
+    /// finish, which already consumed it.
+    fn discard_request(&self) {}
+}
+
+impl Decoder for BitNet {
+    type Cache = lb_model::model::KvCache;
+    fn new_cache(&self) -> Self::Cache {
+        BitNet::new_cache(self)
+    }
+    fn forward(&self, tokens: &[u32], cache: &mut Self::Cache, all_logits: bool) -> Tensor<2> {
+        BitNet::forward(self, tokens, cache, all_logits)
+    }
+    fn max_context(&self) -> usize {
+        self.cfg.max_position_embeddings
+    }
+    fn bos(&self) -> u32 {
+        self.cfg.bos_token_id
+    }
+    fn kernel_name(&self) -> &'static str {
+        lb_ternary::Kernel::detect().name()
+    }
+}
+
+impl Decoder for lb_lfm2::Lfm2 {
+    type Cache = lb_lfm2::Cache;
+    fn new_cache(&self) -> Self::Cache {
+        lb_lfm2::Lfm2::new_cache(self)
+    }
+    fn forward(&self, tokens: &[u32], cache: &mut Self::Cache, all_logits: bool) -> Tensor<2> {
+        lb_lfm2::Lfm2::forward(self, tokens, cache, all_logits)
+    }
+    fn max_context(&self) -> usize {
+        self.cfg().n_ctx
+    }
+    fn bos(&self) -> u32 {
+        self.cfg().bos
+    }
+    fn kernel_name(&self) -> &'static str {
+        if self.store.n_resident() > 0 {
+            "lfm2 q4_0 (resident experts on GPU, rest CPU)"
+        } else {
+            "lfm2 q4_0 (CPU)"
+        }
+    }
+    fn after_request(&self, prompt: &[u32], generated: &[u32]) {
+        // prefill and decode routes go to separate files, each labelled with its own phase
+        if let Err(e) = self.scraper.flush_request(prompt, generated) {
+            eprintln!("scrape flush failed: {e}");
+        }
+    }
+    fn discard_request(&self) {
+        self.scraper.take();
+    }
+}
+
+fn worker<D: Decoder>(model: D, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
     while let Ok(job) = rx.recv() {
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&model, &codec, &job)));
+        let res = guarded(&model, || run_job(&model, &codec, &job));
         if let Err(e) = res {
             let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
             let _ = job.tx.send(Gen::Error(format!("generation panicked: {msg}")));
@@ -99,7 +195,15 @@ fn worker(model: BitNet, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
     }
 }
 
-fn run_job(model: &BitNet, codec: &TextCodec, job: &Job) {
+/// Run one job's work; whatever happens (return, early return, panic) the decoder's
+/// per-request state is discarded afterwards. A panic is returned, not propagated.
+fn guarded<D: Decoder>(model: &D, work: impl FnOnce()) -> std::thread::Result<()> {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    model.discard_request();
+    res
+}
+
+fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
     let to_vec = |t: burn::tensor::Tensor<2>| t.into_data().try_to_vec::<f32>().expect("logits");
     let mut cache = model.new_cache();
     let mut sampler = Sampler::new(job.params.clone());
@@ -111,15 +215,17 @@ fn run_job(model: &BitNet, codec: &TextCodec, job: &Job) {
     let mut text = String::new();
     let mut sent = 0usize; // bytes of `text` already sent
     let mut n = 0;
+    let mut generated: Vec<u32> = Vec::new();
     let t1 = Instant::now();
     let mut finish = "length";
     let max_stop = job.stop.iter().map(|s| s.len()).max().unwrap_or(0);
     while n < job.max_tokens {
-        if TextCodec::is_stop(next) {
+        if codec.is_stop(next) {
             finish = "stop";
             break;
         }
         n += 1;
+        generated.push(next);
         match dec.push(codec, next) {
             Ok(piece) => text.push_str(&piece),
             Err(e) => {
@@ -156,6 +262,7 @@ fn run_job(model: &BitNet, codec: &TextCodec, job: &Job) {
     if text.len() > sent {
         let _ = job.tx.send(Gen::Text(text[sent..].to_string()));
     }
+    model.after_request(&job.prompt, &generated);
     let _ = job.tx.send(Gen::Done {
         finish_reason: finish,
         prompt_tokens: job.prompt.len(),
@@ -356,6 +463,33 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"status": "ok", "runtime": RUNTIME_NAME, "version": env!("CARGO_PKG_VERSION"), "model": st.model_id, "model_loaded": st.model_id}))
 }
 
+/// Where the expert calls went since start: how many the GPU residents caught, how many
+/// fell through to the CPU, and the wall time each side cost. Cumulative, not per request.
+async fn placement_stats(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let Some(s) = st.placement.as_ref() else {
+        return Json(json!({"placement": "none (not an LFM2 model)"}));
+    };
+    let t = s.snapshot();
+    let mut v = json!({
+        "schema": "lemonade-burn.placement.v1",
+        "gpu_hits": t.gpu_hits, "cpu_calls": t.cpu_calls, "on_demand": t.on_demand,
+        "gpu_hit_rate": t.hit_rate,
+        "gpu_s": t.gpu_s, "cpu_s": t.cpu_s, "on_demand_s": t.on_demand_s
+    });
+    // Where a forward pass went, so "what is left to optimise" is read off the server
+    // instead of inferred from the token rate.
+    if let Some(tm) = st.timings.as_ref() {
+        let r2 = |x: f64| (x * 100.0).round() / 100.0;
+        for (prefix, s) in [("all", tm.snapshot()), ("decode", tm.decode())] {
+            v[format!("{prefix}_passes")] = json!(s.passes);
+            v[format!("{prefix}_forward_ms")] = json!(r2(s.forward_ms));
+            v[format!("{prefix}_matmul_ms")] = json!(r2(s.matmul_ms));
+            v[format!("{prefix}_other_ms")] = json!(r2(s.other_ms));
+        }
+    }
+    Json(v)
+}
+
 async fn topology(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "schema": "lemonade-burn.topology.v1",
@@ -371,20 +505,65 @@ fn main() -> Result<()> {
     }
     let t0 = Instant::now();
     let dev = Device::flex();
-    let model = BitNet::load(&args.model, &dev)?;
-    let codec = Arc::new(TextCodec::load(&args.model, model.cfg.bos_token_id)?);
-    let ctx = args.ctx.min(model.cfg.max_position_embeddings);
-    let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "bitnet".into()));
+    let is_gguf = args.model.extension().map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false);
+    let (jtx, jrx) = std_mpsc::channel::<Job>();
+    type Loaded = (Arc<TextCodec>, usize, String, &'static str, Option<Arc<lb_lfm2::moe::PlacementStats>>, Option<Arc<lb_lfm2::model::Timings>>);
+    let (codec, ctx, model_id, kernel, placement, timings): Loaded = if is_gguf {
+        let mut model = lb_lfm2::Lfm2::load(&args.model, &dev)?;
+        let cfg = model.cfg().clone();
+        model.store.miss = lb_lfm2::moe::MissPolicy::parse(&args.miss_policy).map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(dir) = &args.placement_from_scrapes {
+            let scrapes = lb_lfm2::moe::read_scrape_dir(dir)?;
+            let hist = lb_lfm2::moe::Histogram::from_scrapes("lfm2", cfg.n_layer, cfg.n_expert, &scrapes);
+            let bytes: Vec<usize> = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).collect();
+            model.placement = lb_lfm2::moe::Placement::plan(&hist, &bytes, args.gpu_budget_mb * 1_000_000);
+            eprintln!("placement: {} experts planned resident ({:.0} MB) from {} scrape files", model.placement.n_resident(), model.placement.resident_bytes as f64 / 1e6, scrapes.len());
+            if args.gpu {
+                let n = model.load_residents().map_err(|e| anyhow::anyhow!(e))?;
+                eprintln!("uploaded {n} experts ({:.0} MB) to the GPU", model.store.bytes as f64 / 1e6);
+            }
+        }
+        if args.gpu && args.gpu_dense_mb > 0 {
+            #[cfg(feature = "gpu")]
+            {
+                let want = lb_lfm2::dense::DenseStore::candidate_bytes(&model.w);
+                let n = model.load_dense(args.gpu_dense_mb * 1_000_000).map_err(|e| anyhow::anyhow!(e))?;
+                eprintln!(
+                    "dense: {n} matrices resident ({:.0} MB of {:.0} MB available)",
+                    model.dense.bytes as f64 / 1e6,
+                    want as f64 / 1e6
+                );
+            }
+            #[cfg(not(feature = "gpu"))]
+            anyhow::bail!("--gpu-dense-mb needs the `gpu` feature");
+        }
+        let dir = args.model.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let codec = Arc::new(TextCodec::load_with(&dir.join("tokenizer.json"), cfg.bos, ChatStyle::ChatMl, vec![cfg.eos])?);
+        let ctx = args.ctx.min(cfg.n_ctx);
+        let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "lfm2".into()));
+        let kernel = model.kernel_name();
+        let stats = model.stats.clone();
+        let tm = model.timings.clone();
+        let wc = codec.clone();
+        std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
+        (codec, ctx, model_id, kernel, Some(stats), Some(tm))
+    } else {
+        let model = BitNet::load(&args.model, &dev)?;
+        let codec = Arc::new(TextCodec::load(&args.model, model.cfg.bos_token_id)?);
+        let ctx = args.ctx.min(model.cfg.max_position_embeddings);
+        let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "bitnet".into()));
+        let kernel = model.kernel_name();
+        let wc = codec.clone();
+        std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
+        (codec, ctx, model_id, kernel, None, None)
+    };
     eprintln!(
         "lemonade-burn-server: loaded {} in {:.1}s (kernel {}, {} threads, ctx {ctx})",
         model_id,
         t0.elapsed().as_secs_f64(),
-        lb_ternary::Kernel::detect().name(),
+        kernel,
         rayon::current_num_threads()
     );
-    let (jtx, jrx) = std_mpsc::channel::<Job>();
-    let wc = codec.clone();
-    std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
     let state = Arc::new(AppState {
         model_id,
         ctx,
@@ -392,11 +571,14 @@ fn main() -> Result<()> {
         codec,
         jobs: jtx,
         started: now(),
-        kernel: lb_ternary::Kernel::detect().name(),
+        kernel,
         threads: rayon::current_num_threads(),
+        placement,
+        timings,
     });
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/placement", get(placement_stats))
         .route("/v1/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
@@ -421,4 +603,43 @@ fn main() -> Result<()> {
             .await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Fake {
+        discards: AtomicUsize,
+    }
+    impl Decoder for Fake {
+        type Cache = ();
+        fn new_cache(&self) {}
+        fn forward(&self, _: &[u32], _: &mut (), _: bool) -> Tensor<2> {
+            unimplemented!()
+        }
+        fn max_context(&self) -> usize {
+            0
+        }
+        fn bos(&self) -> u32 {
+            0
+        }
+        fn kernel_name(&self) -> &'static str {
+            "fake"
+        }
+        fn discard_request(&self) {
+            self.discards.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn request_state_is_discarded_on_every_exit() {
+        let m = Fake { discards: AtomicUsize::new(0) };
+        assert!(guarded(&m, || {}).is_ok()); // normal / early return (client gone)
+        assert_eq!(m.discards.load(Ordering::SeqCst), 1);
+        let r = guarded(&m, || panic!("boom")); // generation panic is caught, state still dropped
+        assert!(r.is_err());
+        assert_eq!(m.discards.load(Ordering::SeqCst), 2);
+    }
 }

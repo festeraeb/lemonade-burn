@@ -3832,6 +3832,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
+name = "lb-addmodel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "lb-gguf",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lb-calibrate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "lb-lfm2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lb-convert"
 version = "0.1.0"
 dependencies = [
@@ -3844,6 +3866,31 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "lb-gguf"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "memmap2",
+ "rayon",
+]
+
+[[package]]
+name = "lb-lfm2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "burn",
+ "burn-flex",
+ "clap",
+ "lb-gguf",
+ "lb-q4-gpu",
+ "rayon",
+ "serde",
+ "serde_json",
+ "ureq 2.12.1",
 ]
 
 [[package]]
@@ -3865,6 +3912,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-q4-gpu"
+version = "0.1.0"
+dependencies = [
+ "cubecl",
+ "cudarc",
+ "half",
+ "lb-gguf",
+ "lb-ternary-gpu",
+ "rayon",
+]
+
+[[package]]
 name = "lb-server"
 version = "0.1.0"
 dependencies = [
@@ -3873,6 +3932,7 @@ dependencies = [
  "burn",
  "clap",
  "futures-util",
+ "lb-lfm2",
  "lb-model",
  "lb-ternary",
  "rayon",
@@ -3887,6 +3947,14 @@ version = "0.1.0"
 dependencies = [
  "nix",
  "rayon",
+]
+
+[[package]]
+name = "lb-ternary-gpu"
+version = "0.1.0"
+dependencies = [
+ "cubecl",
+ "lb-ternary",
 ]
 
 [[package]]

@@ -1,0 +1,30 @@
+[package]
+name = "lb-q4-gpu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Q4_0 (GGUF) dequant + matvec on the GPU with CubeCL (wgpu: Vulkan/DX12/Metal, or CUDA with the `cuda` feature), checked against lb-gguf's CPU kernels"
+
+[features]
+default = []
+# The cubecl-cuda runtime beside wgpu. `LB_CUDA_DEVICE=N` opens CUDA device N (the driver's
+# order, which is nvidia-smi's); `LB_WGPU_DEVICE` still opens the wgpu path, so one binary can
+# A/B both runtimes on the same card. Needs libcuda + libnvrtc (CUDA 12.8 for Pascal) at run
+# time only; nothing is linked at build time (cudarc dynamic loading).
+cuda = ["cubecl/cuda", "dep:cudarc"]
+
+
+[dependencies]
+lb-gguf.workspace = true
+lb-ternary-gpu = { path = "../lb-ternary-gpu" }
+cubecl.workspace = true
+# Only for the page-locked staging pool (`pinned.rs`), the same crate and feature set cubecl-cuda
+# itself uses; nothing is linked at build time.
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["std", "driver", "fallback-dynamic-loading", "cuda-version-from-build-system", "fallback-latest"] }
+half = "2"
+rayon.workspace = true
+
+[[example]]
+name = "register_bench"
+required-features = ["cuda"]
