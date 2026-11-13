@@ -132,3 +132,33 @@ is not the limiter (the fork found the same on its decode kernel). Default batch
   (LFM2.5 does not).
 * **6-bit weights** (Q6_K): near-Q8 quality at 6.56 bpw; the Q6_K kernel exists (the LFM2 head); costs ~45 %
   more bytes per token than Q4_0 in bandwidth-bound decode.
+
+## Reference test (operator, 2026-11-13): is the Kmic-68 fork's gain model-dependent?
+
+c4, P100s AF + D8 (P2P pair), `llama-bench` pp512 / pp2048 / tg256 x3, `-fa on -ctk q4_0 -ctv q4_0 -ub 2048`.
+Fork = Kmic-68/llama.cpp `p100-optimizations` (sm_60 only build); stock = upstream at the fork's merge base
+`f46bc30cb`, same flags. Runner `/mnt/fast/kmic68/run_ref.sh`, raw `/mnt/fast/kmic68/results/*.json`.
+
+| model, layout | build | tg256 | pp512 | pp2048 |
+|---|---|---|---|---|
+| Qwen3.8-27B abliterated IQ3_S (dense), 2x P100 tensor split | stock | 19.3 | 223 | 384 |
+| | fork | **35.1** (1.82x) | 409 | 525 |
+| LFM2.5-24B-A2B Q4_0 (MoE), 1x P100 | stock | 94.1 | 656 | 1044 |
+| | fork | **134.6** (1.43x) | 943 | 1222 |
+| LFM2.5, 2x P100 tensor split | stock | 68.1 | 1061 | 1584 |
+| | fork | 91.7 | 1477 | **1939** |
+| LFM2.5, lemonade-burn, 1x P100 (AF) | ours | 92.6 | 557 | 791 |
+| LFM2.5, lemonade-burn, P100 + RTX 2060 prefill card (31 of 40 layers) | ours | 92.3 | 919 | 1207 |
+| LFM2.5, lemonade-burn, P100 + T10 prefill card (40 layers, c2) | ours | 77-85 | 1352 | 1736 |
+
+Findings:
+* The fork's numbers reproduce here (its published decode gain on Q6_K: 1.86x; ours on IQ3_S: 1.82x).
+* **Model-dependent, yes.** Tensor split is what makes the dense 27B fast, and it makes LFM2.5's decode
+  *slower* than one card (fork 134.6 -> 91.7): a token touches top-4 of 64 experts, so the per-layer exchange
+  costs more than the halved matvec saves. Prefill gains from the split on both models.
+* The fork's single-card decode kernel carries to LFM2.5 (1.43x stock) and is 1.45x our decode: the next
+  thing to learn from (activation staged in shared memory, `mmvq` rebuilt around the activation re-read).
+* Our P100 prefill is 76 % of stock, 65 % of the fork; our Turing prefill card reaches the fork's one-P100
+  rate with a 2060 and within 10 % of the fork's two-P100 rate with a T10.
+* So "probe each model" holds: layout (one card / tensor split / prefill card) should be chosen per model
+  from a short bench like this one, not fixed.
