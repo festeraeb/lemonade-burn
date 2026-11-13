@@ -25,6 +25,9 @@ macro_rules! gemm_launch {
         if $gpu.tensor_cores {
             let xh = $gpu.to_f16(&$x, $n);
             crate::gemm::q4_0_gemm_tc_kernel::launch(&$gpu.client, $count, $dim, $gq, $gs, $uq, $us, BufferArg::from_raw_parts(xh, $n), $($arg),+, crate::gemm::tc_stage2())
+        } else if $gpu.fp16_pipe {
+            let xh = $gpu.to_f16(&$x, $n);
+            crate::gemm::q4_0_gemm_h2_kernel::launch(&$gpu.client, $count, $dim, $gq, $gs, $uq, $us, BufferArg::from_raw_parts(xh, $n), $($arg),+)
         } else {
             crate::gemm::q4_0_gemm_kernel::launch(&$gpu.client, $count, $dim, $gq, $gs, $uq, $us, BufferArg::from_raw_parts($x.clone(), $n), $($arg),+)
         }
@@ -48,6 +51,9 @@ pub struct Gpu {
     /// 32: the prefill GEMM takes `q4_0_gemm_tc_kernel` (`gemm.rs`). `LB_NO_TC=1` forces the f32
     /// GEMM on such a card (the A/B switch).
     pub tensor_cores: bool,
+    /// fp16 multiplies at twice the fp32 rate and there are no tensor cores (sm_60, the P100): the
+    /// prefill GEMM takes `q4_0_gemm_h2_kernel`. `LB_NO_H2=1` forces the f32 tiles.
+    pub fp16_pipe: bool,
     /// Recycled scratch buffers, keyed by byte size.
     free: Mutex<HashMap<usize, Vec<Handle>>>,
     /// Scratch handed out since the last sync. Reusing one before the GPU has run would
@@ -270,7 +276,9 @@ impl Gpu {
             let want = cubecl::ir::features::MmaConfig { a_type: f16, b_type: f16, cd_type: ElemType::Float(FloatKind::F32), m: 16, n: 16, k: 16 };
             props.features.matmul.cmma.contains(&want) && pmax == 32 && pmin == 32 && std::env::var("LB_NO_TC").map(|v| v.is_empty() || v == "0").unwrap_or(true)
         };
+        let fp16_pipe = !tensor_cores && compute_capability == Some((6, 0)) && std::env::var("LB_NO_H2").map(|v| v.is_empty() || v == "0").unwrap_or(true);
         Ok(Self {
+            fp16_pipe,
             tensor_cores,
             client,
             name: format!("{dev:?}"),

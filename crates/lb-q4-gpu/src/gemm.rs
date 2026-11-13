@@ -446,6 +446,210 @@ pub fn q4_0_gemm_tc_kernel(
     }
 }
 
+type V2H = Vector<half::f16, Const<2>>;
+type V2F = Vector<f32, Const<2>>;
+/// Shared row stride of the half2 kernel's f16 stages (32 columns + 2: rows on different banks).
+const LDP: usize = 34;
+
+/// The fp16-pipe form of [`q4_0_gemm_kernel`] for cards whose fp16 multiplies at twice the fp32
+/// rate without tensor cores (sm_60: the P100). Same grid, tiling, grouping and outputs. A unit's
+/// 4 x 4 sub-tile is 8 `half2` accumulators: per column, 8 fp16 FMAs instead of 16 fp32 ones.
+/// The quants enter as exact integers (`q - 8`), the activation as f16 (`xh`, converted once per
+/// call), and each Q4_0 block's 32-term partial is folded into f32 and scaled by `d` there, so no
+/// sum longer than one block is ever held in fp16.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn q4_0_gemm_h2_kernel(
+    gq: &[u32],
+    gs: &[u32],
+    uq: &[u32],
+    us: &[u32],
+    xh: &[half::f16],
+    routes: &[u32],
+    perm: &[u32],
+    tiles: &[u32],
+    dims: &[u32],
+    out: &mut [f32],
+    #[comptime] grouped: bool,
+    #[comptime] gate_up: bool,
+    #[comptime] src_tok: bool,
+) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let m = dims[2] as usize;
+    let bpr = cols / 32usize;
+    let r0 = CUBE_POS_X as usize * 64usize;
+    let ty = (UNIT_POS / 16u32) as usize;
+    let tx = (UNIT_POS % 16u32) as usize;
+
+    let mut t0 = 0usize;
+    let mut count = 64usize;
+    let mut base_block = 0usize;
+    if grouped {
+        let tile = CUBE_POS_Y as usize;
+        let e = tiles[3usize * tile] as usize;
+        t0 = tiles[3usize * tile + 1usize] as usize;
+        count = tiles[3usize * tile + 2usize] as usize;
+        base_block = e * rows * bpr;
+    } else {
+        t0 = CUBE_POS_Y as usize * 64usize;
+        if t0 + 64usize > m {
+            count = m - t0;
+        }
+    }
+
+    let mut xs = Shared::<[half::f16]>::new_slice(64usize * LDP);
+    let mut ws = Shared::<[half::f16]>::new_slice(64usize * LDP);
+    let mut ds = Shared::<[f32]>::new_slice(64usize);
+    let mut ws2 = Shared::<[half::f16]>::new_slice(64usize * LDP);
+    let mut ds2 = Shared::<[f32]>::new_slice(64usize);
+
+    let xr = UNIT_POS as usize / 4usize;
+    let part = UNIT_POS as usize % 4usize;
+    let mut src = 0usize;
+    let valid = xr < count;
+    if valid {
+        if grouped {
+            let s = perm[t0 + xr] as usize;
+            if src_tok {
+                src = routes[2usize * s + 1usize] as usize;
+            } else {
+                src = s;
+            }
+        } else {
+            src = t0 + xr;
+        }
+    }
+    let wr = r0 + xr;
+
+    let mut acc = Array::<f32>::new(16usize);
+    let mut acc2 = Array::<f32>::new(16usize);
+    #[unroll]
+    for i in 0..16usize {
+        acc[i] = 0.0f32;
+        acc2[i] = 0.0f32;
+    }
+    let zero = half::f16::cast_from(0.0f32);
+
+    let mut kb = 0usize;
+    while kb < bpr {
+        let c0 = kb * 32usize + part * 8usize;
+        #[unroll]
+        for j in 0..8usize {
+            let mut v = zero;
+            if valid {
+                v = xh[src * cols + c0 + j];
+            }
+            xs[xr * LDP + part * 8usize + j] = v;
+        }
+        if wr < rows {
+            let gb = base_block + wr * bpr + kb;
+            let w = gq[gb * 4usize + part];
+            #[unroll]
+            for j in 0..8u32 {
+                ws[xr * LDP + 4usize * j as usize + part] = half::f16::cast_from(f32::cast_from((w >> (4u32 * j)) & 15u32) - 8.0f32);
+            }
+            if part == 0usize {
+                ds[xr] = f16_to_f32((gs[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+            }
+            if gate_up {
+                let w2 = uq[gb * 4usize + part];
+                #[unroll]
+                for j in 0..8u32 {
+                    ws2[xr * LDP + 4usize * j as usize + part] = half::f16::cast_from(f32::cast_from((w2 >> (4u32 * j)) & 15u32) - 8.0f32);
+                }
+                if part == 0usize {
+                    ds2[xr] = f16_to_f32((us[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+                }
+            }
+        } else {
+            #[unroll]
+            for j in 0..8u32 {
+                ws[xr * LDP + 4usize * j as usize + part] = zero;
+                if gate_up {
+                    ws2[xr * LDP + 4usize * j as usize + part] = zero;
+                }
+            }
+            if part == 0usize {
+                ds[xr] = 0.0f32;
+                ds2[xr] = 0.0f32;
+            }
+        }
+        sync_cube();
+        // part[i * 2 + h]: row i, weight rows (2h, 2h + 1) of this unit's 4 x 4
+        let mut pt = Array::<V2H>::new(8usize);
+        let mut pt2 = Array::<V2H>::new(8usize);
+        #[unroll]
+        for i in 0..8usize {
+            pt[i] = V2H::new(zero);
+            pt2[i] = V2H::new(zero);
+        }
+        for kk in 0..32usize {
+            let mut b01 = V2H::new(ws[(tx * 4usize) * LDP + kk]);
+            b01.insert(1usize, ws[(tx * 4usize + 1usize) * LDP + kk]);
+            let mut b23 = V2H::new(ws[(tx * 4usize + 2usize) * LDP + kk]);
+            b23.insert(1usize, ws[(tx * 4usize + 3usize) * LDP + kk]);
+            #[unroll]
+            for i in 0..4usize {
+                let a = V2H::new(xs[(ty * 4usize + i) * LDP + kk]);
+                pt[i * 2usize] = fma(a, b01, pt[i * 2usize]);
+                pt[i * 2usize + 1usize] = fma(a, b23, pt[i * 2usize + 1usize]);
+            }
+            if gate_up {
+                let mut c01 = V2H::new(ws2[(tx * 4usize) * LDP + kk]);
+                c01.insert(1usize, ws2[(tx * 4usize + 1usize) * LDP + kk]);
+                let mut c23 = V2H::new(ws2[(tx * 4usize + 2usize) * LDP + kk]);
+                c23.insert(1usize, ws2[(tx * 4usize + 3usize) * LDP + kk]);
+                #[unroll]
+                for i in 0..4usize {
+                    let a = V2H::new(xs[(ty * 4usize + i) * LDP + kk]);
+                    pt2[i * 2usize] = fma(a, c01, pt2[i * 2usize]);
+                    pt2[i * 2usize + 1usize] = fma(a, c23, pt2[i * 2usize + 1usize]);
+                }
+            }
+        }
+        // fold the block's partials into f32, scaled by each weight row's d
+        #[unroll]
+        for i in 0..4usize {
+            #[unroll]
+            for h in 0..2usize {
+                let f = V2F::cast_from(pt[i * 2usize + h]);
+                acc[i * 4usize + 2usize * h] += ds[tx * 4usize + 2usize * h] * f.extract(0usize);
+                acc[i * 4usize + 2usize * h + 1usize] += ds[tx * 4usize + 2usize * h + 1usize] * f.extract(1usize);
+                if gate_up {
+                    let f2 = V2F::cast_from(pt2[i * 2usize + h]);
+                    acc2[i * 4usize + 2usize * h] += ds2[tx * 4usize + 2usize * h] * f2.extract(0usize);
+                    acc2[i * 4usize + 2usize * h + 1usize] += ds2[tx * 4usize + 2usize * h + 1usize] * f2.extract(1usize);
+                }
+            }
+        }
+        sync_cube();
+        kb += 1usize;
+    }
+
+    #[unroll]
+    for i in 0..4usize {
+        let ti = ty * 4usize + i;
+        if ti < count {
+            let mut dst = t0 + ti;
+            if grouped {
+                dst = perm[t0 + ti] as usize;
+            }
+            #[unroll]
+            for j in 0..4usize {
+                let r = r0 + tx * 4usize + j;
+                if r < rows {
+                    let mut v = acc[i * 4usize + j];
+                    if gate_up {
+                        v = v / (1.0f32 + Exp::exp(-v)) * acc2[i * 4usize + j];
+                    }
+                    out[dst * rows + r] = v;
+                }
+            }
+        }
+    }
+}
+
 /// Two Q4_0 blocks per tensor-core stage (`LB_TC_STAGE2=1`) or one (default): two halves the
 /// barriers but needs 45 KB of shared memory a cube, one cube per Turing SM instead of two.
 pub fn tc_stage2() -> bool {

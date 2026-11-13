@@ -36,11 +36,11 @@ fn close_on(gpu: &Gpu, got: &[f32], want: &[f32], cols: usize, label: &str) {
     let scale = want.iter().fold(0f32, |a, w| a.max(w.abs()));
     let mut worst = 0f32;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        let tol = if gpu.tensor_cores { 4e-3 * scale.max(1e-3) } else { 2e-5 * (1.0 + w.abs()) + 2e-6 * cols as f32 };
+        let tol = if gpu.tensor_cores || gpu.fp16_pipe { 4e-3 * scale.max(1e-3) } else { 2e-5 * (1.0 + w.abs()) + 2e-6 * cols as f32 };
         assert!((g - w).abs() <= tol, "{label} [{i}]: gemm {g} rows {w} (tensor cores: {})", gpu.tensor_cores);
         worst = worst.max((g - w).abs());
     }
-    eprintln!("{label} ({}): max |gemm - rows| = {worst:e} of max |out| {scale:e}", if gpu.tensor_cores { "tensor cores" } else { "f32 tiles" });
+    eprintln!("{label} ({}): max |gemm - rows| = {worst:e} of max |out| {scale:e}", if gpu.tensor_cores { "tensor cores" } else if gpu.fp16_pipe { "fp16 pipe" } else { "f32 tiles" });
 }
 
 #[test]
