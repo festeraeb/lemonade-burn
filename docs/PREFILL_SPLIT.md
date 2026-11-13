@@ -109,6 +109,13 @@ f32 tiles' speed. The fork gets its accuracy from integer (q8) activations, whos
 fp16; ours are f16-rounded floats. Kept behind `LB_H2=1` (`LB_H2_FOLD`); the P100 default stays f32.
 Tensor-core stage width (T10): one block per stage 8584 / 10168, two blocks 7338 / 8775 (occupancy).
 
+**Where a P100 prefill chunk goes (`LB_PREFILL_TIMING=1`, 8192 tokens, ub 2048, f32 tiles):** expert GEMM
+55 %, dense GEMM 29 %, attention 6 %, router + grouping 3 %, conv 3 %, norms/adds 2 %, expert sum 1 %,
+embedding 0 %. So 84 % is the GEMM kernel at 4.1 of the card's 9.3 fp32 TFLOPS.
+**4-wide staged f32 GEMM (`LB_GEMM_V4=1`): measured, not adopted.** 3 shared loads per 32 multiply-adds
+instead of 8 per 16, 128-unit cubes: 3632 dense / 3595 MoE GFLOP/s against 4096 / 3734. Shared-load count
+is not the limiter (the fork found the same on its decode kernel). Default batch is now 2048 rows.
+
 ## Next, in order
 1. Larger chunks (`LB_PREFILL_UBATCH=2048`): fills the expert tiles (grouped GEMM 3.0x the rows kernels at
    m=2048 on a P100, 2.2x at 512). Measured as A2.

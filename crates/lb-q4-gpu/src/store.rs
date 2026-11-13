@@ -28,6 +28,8 @@ macro_rules! gemm_launch {
         } else if $gpu.fp16_pipe {
             let xh = $gpu.to_f16(&$x, $n);
             crate::gemm::q4_0_gemm_h2_kernel::launch(&$gpu.client, $count, $dim, $gq, $gs, $uq, $us, BufferArg::from_raw_parts(xh, $n), $($arg),+, crate::gemm::h2_fold())
+        } else if crate::gemm::gemm_v4() {
+            crate::gemm::q4_0_gemm_v4_kernel::launch(&$gpu.client, $count, CubeDim::new_1d(128), $gq, $gs, $uq, $us, BufferArg::from_raw_parts($x.clone(), $n / 4), $($arg),+)
         } else {
             crate::gemm::q4_0_gemm_kernel::launch(&$gpu.client, $count, $dim, $gq, $gs, $uq, $us, BufferArg::from_raw_parts($x.clone(), $n), $($arg),+)
         }

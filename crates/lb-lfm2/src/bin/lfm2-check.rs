@@ -605,6 +605,11 @@ fn ab_prefill(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u
         } else {
             (None, None)
         };
+        if lb_lfm2::device_prefill::timing_on() {
+            let t: Vec<u64> = lb_lfm2::device_prefill::TIMING.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed)).collect();
+            let tot: u64 = t.iter().sum::<u64>().max(1);
+            println!("  timing at {n} (2 passes): {}", lb_lfm2::device_prefill::TIMING_NAMES.iter().zip(&t).map(|(k, v)| format!("{k} {:.0} ms ({:.0}%)", *v as f64 / 1e6, 100.0 * *v as f64 / tot as f64)).collect::<Vec<_>>().join(", "));
+        }
         println!("prefill {n:>6} tokens: device {:>8.1} tok/s ({:.3} s){}", n as f64 / ds, ds, hrate.map(|r| format!("; host {r:.1} tok/s; last-row top-1 equal: {}", top_ok.unwrap())).unwrap_or_default());
         timing.push(json!({"n": n, "device_tok_s": n as f64 / ds, "device_s": ds, "host_tok_s": hrate, "top1_equal": top_ok}));
     }

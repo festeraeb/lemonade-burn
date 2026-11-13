@@ -1,5 +1,5 @@
 //! Device-resident prefill: a prompt of `n` tokens in chunks of `LB_PREFILL_UBATCH` rows (default
-//! 512), each chunk from the embedding upload to the last row's logits on the device, with the KV
+//! 2048), each chunk from the embedding upload to the last row's logits on the device, with the KV
 //! cache and the conv states written where device decode reads them. `LB_DEVICE_PREFILL=1` (or the
 //! live `device_prefill` knob) turns it on.
 //!
@@ -65,9 +65,31 @@ pub fn gemm_min() -> usize {
     std::env::var("LB_PREFILL_GEMM_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
 }
 
-/// Rows per chunk: `LB_PREFILL_UBATCH`, default 512.
+/// Rows per chunk: `LB_PREFILL_UBATCH`, default 2048 (fills the expert tiles: 780 vs 594 tok/s on a
+/// P100 against 512, docs/PREFILL_SPLIT.md).
 pub fn ubatch() -> usize {
-    std::env::var("LB_PREFILL_UBATCH").ok().and_then(|v| v.parse().ok()).filter(|v: &usize| *v > 0).unwrap_or(512)
+    std::env::var("LB_PREFILL_UBATCH").ok().and_then(|v| v.parse().ok()).filter(|v: &usize| *v > 0).unwrap_or(2048)
+}
+
+/// `LB_PREFILL_TIMING=1`: sync after every kind of step and total the wall time per kind
+/// ([`TIMING`]). Slower (hundreds of extra syncs a chunk); for finding where a chunk's time goes.
+pub fn timing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LB_PREFILL_TIMING").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+/// Step kinds of [`TIMING`].
+pub const TIMING_NAMES: [&str; 8] = ["embed+upload", "norms+adds", "dense gemm", "conv", "attention", "router+grouping", "expert gemm", "expert sum"];
+/// Nanoseconds per step kind, summed over every chunk and card since start (timing mode only).
+pub static TIMING: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// In timing mode: wait for the card and charge the time since `t` to kind `k`; restart `t`.
+fn mark(gpu: &Gpu, t: &mut Instant, k: usize) {
+    if timing_on() {
+        let _ = gpu.sync();
+        TIMING[k].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        *t = Instant::now();
+    }
 }
 
 fn decline(why: &str) -> Option<Tensor<2>> {
@@ -125,34 +147,47 @@ fn run_layers(m: &Lfm2, cv: &CardView, range: Range<usize>, x: &Handle, ps: &Pas
     let (nh, k_used, n_exp) = (cfg.n_head, cfg.n_expert_used, cfg.n_expert);
     let (gpu, mc, p0, cap) = (cv.gpu, ps.mc, ps.p0, ps.cap);
     let lin = |r: &MatRef, h: &Handle| if ps.gemm { cv.mat(r).launch_gemm(gpu, h, mc) } else { cv.mat(r).launch(gpu, h, mc) };
+    let mut tm = Instant::now();
     for li in range {
         let layer = &m.w.layers[li];
         let lp = &cv.layers[li];
         let h = gpu.rms_norm_rows(x, None, &lp.attn_norm, mc, e, eps);
+        mark(gpu, &mut tm, 1);
         let op_out = match (&layer.op, &lp.op) {
             (Operator::Conv { in_proj, out_proj, .. }, OpPrep::Conv { taps }) => {
                 let bcx = lin(in_proj, &h);
+                mark(gpu, &mut tm, 2);
                 let state = cv.conv[li].as_ref().expect("conv layer state");
                 let yy = gpu.conv_prefill(&bcx, taps, state, mc, e, l);
-                lin(out_proj, &yy)
+                mark(gpu, &mut tm, 3);
+                let o = lin(out_proj, &yy);
+                mark(gpu, &mut tm, 2);
+                o
             }
             (Operator::Attn { q, k, v, o, .. }, OpPrep::Attn { q_norm, k_norm }) => {
                 let kvh = cfg.kv_heads[li];
                 let (qh, kh, vh) = (lin(q, &h), lin(k, &h), lin(v, &h));
+                mark(gpu, &mut tm, 2);
                 let (kc, vc) = (cv.k[li].as_ref().expect("k cache"), cv.v[li].as_ref().expect("v cache"));
                 let qo = gpu.qk_norm_rope_rows(&qh, &kh, &vh, q_norm, k_norm, cv.rope, cv.rope_rows, kc, vc, (mc, p0, cap), (nh, kvh, hd), eps);
                 let att = gpu.attn_prefill(&qo, kc, vc, (mc, p0, cap), (nh, kvh, hd));
-                lin(o, &att)
+                mark(gpu, &mut tm, 4);
+                let ao = lin(o, &att);
+                mark(gpu, &mut tm, 2);
+                ao
             }
             _ => unreachable!("layer {li}: operator and its device copy disagree"),
         };
         let h2 = gpu.rms_norm_rows(x, Some(&op_out), &lp.ffn_norm, mc, e, eps);
+        mark(gpu, &mut tm, 1);
         let mut is_moe = false;
         let mut scraped = false;
         let ffn_out = match &layer.ffn {
             Ffn::Dense { gate, up, down } => {
                 let hh = if ps.gemm { GpuQ4Mat::launch_gemm_gate_up(gpu, cv.mat(gate), cv.mat(up), &h2, mc) } else { GpuQ4Mat::launch_gate_up_silu(gpu, cv.mat(gate), cv.mat(up), &h2, mc) };
-                lin(down, &hh)
+                let o = lin(down, &hh);
+                mark(gpu, &mut tm, 2);
+                o
             }
             Ffn::Moe { .. } => {
                 let stack = cv.stacks.get(&li).expect("stacked layer resident on this card");
@@ -174,14 +209,19 @@ fn run_layers(m: &Lfm2, cv: &CardView, range: Range<usize>, x: &Handle, ps: &Pas
                     let (perm, tiles) = lb_q4_gpu::gemm::group_slots(&r, n_exp);
                     let n_tiles = tiles.len() / 3;
                     let (ph, th) = (gpu.upload_u32(perm), gpu.upload_u32(tiles));
+                    mark(gpu, &mut tm, 5);
                     stack.launch_grouped(gpu, &h2, mc, cv.routes, slots, &ph, &th, n_tiles).0
                 } else {
                     stack.launch_device(gpu, &h2, mc, cv.routes, slots, 0, slots).0
                 };
-                gpu.weighted_sum_rows(&outs, cv.weights, cv.routes, (mc, k_used, e))
+                mark(gpu, &mut tm, 6);
+                let y = gpu.weighted_sum_rows(&outs, cv.weights, cv.routes, (mc, k_used, e));
+                mark(gpu, &mut tm, 7);
+                y
             }
         };
         gpu.add_rows(x, &ffn_out, mc * e);
+        mark(gpu, &mut tm, 1);
         if is_moe && ps.scrape && !scraped {
             let b = gpu.read_raw(vec![(cv.routes.clone(), 8 * mc * k_used), (cv.weights.clone(), 4 * mc * k_used)]).map_err(|err| format!("layer {li} routes: {err}"))?;
             record_routes(m, li, p0, mc, k_used, &u32s(&b[0]), &f32s(&b[1]));
@@ -431,9 +471,13 @@ pub fn prefill(m: &Lfm2, tokens: &[u32], cache: &mut Cache, all_logits: bool) ->
         let mc = ub.min(n - c0);
         let p0 = pos0 + c0;
         let ps = Pass { mc, p0, cap, gemm: gmin > 0 && mc >= gmin, seq, scrape };
+        let t_emb = Instant::now();
         let mut emb = vec![0f32; mc * e];
         for (i, &t) in tokens[c0..c0 + mc].iter().enumerate() {
             m.w.embed_row(t, &mut emb[i * e..(i + 1) * e]);
+        }
+        if timing_on() {
+            TIMING[0].fetch_add(t_emb.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         // the chunk's residual stream: a real buffer (not scratch), so a layer-end recycle keeps it
         let x: Handle = match (pc, pstate.as_ref()) {

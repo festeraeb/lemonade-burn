@@ -226,6 +226,248 @@ pub fn q4_0_gemm_kernel(
     }
 }
 
+type V4F = Vector<f32, Const<4>>;
+
+/// The f32 GEMM with 4-wide staging: same tile (64 input rows x 64 weight rows per cube), grouping
+/// and outputs as [`q4_0_gemm_kernel`], 128 units. A stage holds one Q4_0 block as column vectors:
+/// `xs[kk * 16 + g]` = column `kk` of input rows `4 g ..`, `ws[kk * 16 + t]` = `q - 8` of weight rows
+/// `4 t ..`. A unit owns 8 input rows x 4 weight rows: per column 3 shared loads (two x vectors, one
+/// w vector) feed 32 multiply-adds, where the scalar kernel needs 8 loads per 16. Same per-block
+/// `d * partial` arithmetic; only the summation grouping inside a block differs.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn q4_0_gemm_v4_kernel(
+    gq: &[u32],
+    gs: &[u32],
+    uq: &[u32],
+    us: &[u32],
+    x: &[V4F],
+    routes: &[u32],
+    perm: &[u32],
+    tiles: &[u32],
+    dims: &[u32],
+    out: &mut [f32],
+    #[comptime] grouped: bool,
+    #[comptime] gate_up: bool,
+    #[comptime] src_tok: bool,
+) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let m = dims[2] as usize;
+    let bpr = cols / 32usize;
+    let r0 = CUBE_POS_X as usize * 64usize;
+    let u = UNIT_POS as usize;
+
+    let mut t0 = 0usize;
+    let mut count = 64usize;
+    let mut base_block = 0usize;
+    if grouped {
+        let tile = CUBE_POS_Y as usize;
+        let e = tiles[3usize * tile] as usize;
+        t0 = tiles[3usize * tile + 1usize] as usize;
+        count = tiles[3usize * tile + 2usize] as usize;
+        base_block = e * rows * bpr;
+    } else {
+        t0 = CUBE_POS_Y as usize * 64usize;
+        if t0 + 64usize > m {
+            count = m - t0;
+        }
+    }
+
+    let mut xs = Shared::<[V4F]>::new_slice(32usize * 16usize);
+    let mut ws = Shared::<[V4F]>::new_slice(32usize * 16usize);
+    let mut ds = Shared::<[V4F]>::new_slice(16usize);
+    let mut ws2 = Shared::<[V4F]>::new_slice(32usize * 16usize);
+    let mut ds2 = Shared::<[V4F]>::new_slice(16usize);
+
+    // x staging role: input-row group xg (rows 4 xg ..), columns 4 xq .. + 4 of the block
+    let xg = u / 8usize;
+    let xq = u % 8usize;
+    let mut srcs = Array::<usize>::new(4usize);
+    let mut oks = Array::<bool>::new(4usize);
+    #[unroll]
+    for i in 0..4usize {
+        let ti = xg * 4usize + i;
+        let ok = ti < count;
+        let mut sidx = 0usize;
+        if ok {
+            if grouped {
+                let sl = perm[t0 + ti] as usize;
+                if src_tok {
+                    sidx = routes[2usize * sl + 1usize] as usize;
+                } else {
+                    sidx = sl;
+                }
+            } else {
+                sidx = t0 + ti;
+            }
+        }
+        srcs[i] = sidx;
+        oks[i] = ok;
+    }
+    // w staging role: weight-row group wg (rows 4 wg ..), Q4_0 word ww, nibbles 4 wh .. + 4
+    let wg = u / 8usize;
+    let ww = (u % 8usize) / 2usize;
+    let wh = u % 2usize;
+    // compute role: input rows 8 ty .. + 8, weight rows 4 tx .. + 4
+    let ty = u / 16usize;
+    let tx = u % 16usize;
+
+    let mut acc = Array::<V4F>::new(8usize);
+    let mut acc2 = Array::<V4F>::new(8usize);
+    #[unroll]
+    for i in 0..8usize {
+        acc[i] = V4F::new(0.0f32);
+        acc2[i] = V4F::new(0.0f32);
+    }
+
+    let mut kb = 0usize;
+    while kb < bpr {
+        // x: four rows' 4-vectors at this unit's columns, transposed into column vectors
+        let mut rv = Array::<V4F>::new(4usize);
+        #[unroll]
+        for i in 0..4usize {
+            let mut v = V4F::new(0.0f32);
+            if oks[i] {
+                v = x[(srcs[i] * cols + kb * 32usize) / 4usize + xq];
+            }
+            rv[i] = v;
+        }
+        #[unroll]
+        for c in 0..4usize {
+            let mut col = V4F::new(rv[0usize].extract(c));
+            col.insert(1usize, rv[1usize].extract(c));
+            col.insert(2usize, rv[2usize].extract(c));
+            col.insert(3usize, rv[3usize].extract(c));
+            xs[(xq * 4usize + c) * 16usize + xg] = col;
+        }
+        // w: word ww of four rows' blocks -> columns 4 j + ww for j = 4 wh .. + 4
+        let mut wv = Array::<u32>::new(4usize);
+        let mut dv = V4F::new(0.0f32);
+        #[unroll]
+        for i in 0..4usize {
+            let r = r0 + wg * 4usize + i;
+            let mut w = 0x8888_8888u32;
+            let mut d = 0.0f32;
+            if r < rows {
+                let gb = base_block + r * bpr + kb;
+                w = gq[gb * 4usize + ww];
+                d = f16_to_f32((gs[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+            }
+            wv[i] = w;
+            dv.insert(i, d);
+        }
+        #[unroll]
+        for jj in 0..4u32 {
+            let sh = 4u32 * (4u32 * wh as u32 + jj);
+            let mut col = V4F::new(f32::cast_from((wv[0usize] >> sh) & 15u32) - 8.0f32);
+            col.insert(1usize, f32::cast_from((wv[1usize] >> sh) & 15u32) - 8.0f32);
+            col.insert(2usize, f32::cast_from((wv[2usize] >> sh) & 15u32) - 8.0f32);
+            col.insert(3usize, f32::cast_from((wv[3usize] >> sh) & 15u32) - 8.0f32);
+            ws[(4usize * (4usize * wh + jj as usize) + ww) * 16usize + wg] = col;
+        }
+        if u % 8usize == 0usize {
+            ds[wg] = dv;
+        }
+        if gate_up {
+            let mut wv2 = Array::<u32>::new(4usize);
+            let mut dv2 = V4F::new(0.0f32);
+            #[unroll]
+            for i in 0..4usize {
+                let r = r0 + wg * 4usize + i;
+                let mut w = 0x8888_8888u32;
+                let mut d = 0.0f32;
+                if r < rows {
+                    let gb = base_block + r * bpr + kb;
+                    w = uq[gb * 4usize + ww];
+                    d = f16_to_f32((us[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+                }
+                wv2[i] = w;
+                dv2.insert(i, d);
+            }
+            #[unroll]
+            for jj in 0..4u32 {
+                let sh = 4u32 * (4u32 * wh as u32 + jj);
+                let mut col = V4F::new(f32::cast_from((wv2[0usize] >> sh) & 15u32) - 8.0f32);
+                col.insert(1usize, f32::cast_from((wv2[1usize] >> sh) & 15u32) - 8.0f32);
+                col.insert(2usize, f32::cast_from((wv2[2usize] >> sh) & 15u32) - 8.0f32);
+                col.insert(3usize, f32::cast_from((wv2[3usize] >> sh) & 15u32) - 8.0f32);
+                ws2[(4usize * (4usize * wh + jj as usize) + ww) * 16usize + wg] = col;
+            }
+            if u % 8usize == 0usize {
+                ds2[wg] = dv2;
+            }
+        }
+        sync_cube();
+        let mut pt = Array::<V4F>::new(8usize);
+        let mut pt2 = Array::<V4F>::new(8usize);
+        #[unroll]
+        for i in 0..8usize {
+            pt[i] = V4F::new(0.0f32);
+            pt2[i] = V4F::new(0.0f32);
+        }
+        for kk in 0..32usize {
+            let a0 = xs[kk * 16usize + ty * 2usize];
+            let a1 = xs[kk * 16usize + ty * 2usize + 1usize];
+            let b = ws[kk * 16usize + tx];
+            #[unroll]
+            for i in 0..4usize {
+                pt[i] = fma(V4F::new(a0.extract(i)), b, pt[i]);
+                pt[4usize + i] = fma(V4F::new(a1.extract(i)), b, pt[4usize + i]);
+            }
+            if gate_up {
+                let b2 = ws2[kk * 16usize + tx];
+                #[unroll]
+                for i in 0..4usize {
+                    pt2[i] = fma(V4F::new(a0.extract(i)), b2, pt2[i]);
+                    pt2[4usize + i] = fma(V4F::new(a1.extract(i)), b2, pt2[4usize + i]);
+                }
+            }
+        }
+        let d = ds[tx];
+        #[unroll]
+        for i in 0..8usize {
+            acc[i] = fma(d, pt[i], acc[i]);
+        }
+        if gate_up {
+            let d2 = ds2[tx];
+            #[unroll]
+            for i in 0..8usize {
+                acc2[i] = fma(d2, pt2[i], acc2[i]);
+            }
+        }
+        sync_cube();
+        kb += 1usize;
+    }
+
+    #[unroll]
+    for i in 0..8usize {
+        let ti = ty * 8usize + i;
+        if ti < count {
+            let mut dst = t0 + ti;
+            if grouped {
+                dst = perm[t0 + ti] as usize;
+            }
+            #[unroll]
+            for j in 0..4usize {
+                let r = r0 + tx * 4usize + j;
+                if r < rows {
+                    let mut v = acc[i].extract(j);
+                    if gate_up {
+                        v = v / (1.0f32 + Exp::exp(-v)) * acc2[i].extract(j);
+                    }
+                    out[dst * rows + r] = v;
+                }
+            }
+        }
+    }
+}
+
+/// `LB_GEMM_V4=1`: the f32 prefill GEMM with 4-wide staging ([`q4_0_gemm_v4_kernel`]).
+pub fn gemm_v4() -> bool {
+    std::env::var("LB_GEMM_V4").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 /// f16 shared-memory row strides for the tensor-core kernel (a multiple of 8 halves: wmma needs a
 /// 16-byte `ldm`; padded so rows spread over banks): a stage of two Q4_0 blocks (64 columns) or one.
 const LDH2: usize = 72;
