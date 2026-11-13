@@ -188,6 +188,10 @@ fn main() -> Result<()> {
         }
         None => None,
     };
+    #[cfg(feature = "gpu")]
+    if let Some(msg) = model.attach_prefill_card_from_env().map_err(|e| anyhow::anyhow!("prefill card: {e}"))? {
+        eprintln!("{msg}");
+    }
     eprintln!(
         "loaded {} in {:.1}s: {} layers, {} experts x top-{}, attn layers {:?}",
         args.model.display(),
@@ -576,6 +580,11 @@ fn ab_prefill(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u
     println!("\ngreedy {} tokens after a {}-token prefill of {:?}", args.greedy_n, ids.len(), args.greedy_prompt);
     println!("host prefill   {:>8.1} prompt tok/s, then {:.2} tok/s decode, sha {} {:?}", ids.len() as f64 / pso, go.len() as f64 / dso, sha16(&text(&go)), text(&go));
     println!("device prefill {:>8.1} prompt tok/s, then {:.2} tok/s decode, sha {} {:?}", ids.len() as f64 / psd, gd.len() as f64 / dsd, sha16(&text(&gd)), text(&gd));
+    if let Some(p) = model.pcard.as_ref() {
+        let st = &p.stats;
+        println!("prefill card: {} chunks; its layers {:.3} s, hops {:.3} s, state copies {:.3} s", st.chunks.load(std::sync::atomic::Ordering::Relaxed),
+            st.card_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, st.hop_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, st.state_copy_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9);
+    }
     println!("continuation token-for-token: {}", if same { "IDENTICAL".to_string() } else { format!("DIFFERENT (first at step {})", go.iter().zip(&gd).position(|(a, b)| a != b).unwrap_or(go.len().min(gd.len()))) });
 
     // last-row prefill timings at fixed lengths (the greedy prompt repeated), device arm, and the

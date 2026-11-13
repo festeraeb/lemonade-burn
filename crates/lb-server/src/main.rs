@@ -681,6 +681,12 @@ fn main() -> Result<()> {
             eprintln!("w2w: {} experts placed on {} host(s), {up} up; placement {} is watched", rt.n_placed(), rt.hosts().len(), p.display());
             w2w = Some(rt);
         }
+        // a prefill card (LB_PREFILL_CARD=<cuda index>): the leading layers of every device prefill
+        // chunk run there (lb-lfm2 device_prefill.rs; LB_DEVICE_PREFILL=1 turns the device prefill on)
+        #[cfg(feature = "gpu")]
+        if let Some(msg) = model.attach_prefill_card_from_env().map_err(|e| anyhow::anyhow!("prefill card: {e}"))? {
+            eprintln!("{msg}");
+        }
         let dir = args.model.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
         let codec = Arc::new(TextCodec::load_with(&dir.join("tokenizer.json"), cfg.bos, ChatStyle::ChatMl, vec![cfg.eos])?);
         let ctx = args.ctx.min(cfg.n_ctx);

@@ -46,6 +46,9 @@ pub struct Lfm2 {
     /// Device copies for the device-resident decode, built on its first token.
     #[cfg(feature = "gpu")]
     pub(crate) dd: std::sync::Mutex<Option<crate::device_decode::Prep>>,
+    /// A second card that runs the leading layers of every device prefill chunk (`device_prefill.rs`).
+    #[cfg(feature = "gpu")]
+    pub pcard: Option<crate::device_prefill::PrefillCard>,
     /// Per-layer hidden-state capture for offline analysis (expert prediction, stand-in
     /// finder; see `docs/EXPERT_PREDICT.md`). Off unless [`Lfm2::set_capture`] turns it on;
     /// it only copies tensors out, so the forward pass computes the same numbers either way.
@@ -161,6 +164,8 @@ impl Lfm2 {
             timings: Arc::new(Timings::default()),
             #[cfg(feature = "gpu")]
             dd: std::sync::Mutex::new(None),
+            #[cfg(feature = "gpu")]
+            pcard: None,
             capture_on: AtomicBool::new(false),
             capture: std::sync::Mutex::new(Vec::new()),
         })
