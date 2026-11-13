@@ -143,6 +143,8 @@ Fork = Kmic-68/llama.cpp `p100-optimizations` (sm_60 only build); stock = upstre
 |---|---|---|---|---|
 | Qwen3.8-27B abliterated IQ3_S (dense), 2x P100 tensor split | stock | 19.3 | 223 | 384 |
 | | fork | **35.1** (1.82x) | 409 | 525 |
+| Qwen3.8-27B abliterated Q6_K (dense, the fork's quant), 2x P100 tensor split | stock | 15.1 | 234 | 392 |
+| | fork | **35.4** (2.34x) | 457 | 543 |
 | LFM2.5-24B-A2B Q4_0 (MoE), 1x P100 | stock | 94.1 | 656 | 1044 |
 | | fork | **134.6** (1.43x) | 943 | 1222 |
 | LFM2.5, 2x P100 tensor split | stock | 68.1 | 1061 | 1584 |
@@ -160,5 +162,10 @@ Findings:
   thing to learn from (activation staged in shared memory, `mmvq` rebuilt around the activation re-read).
 * Our P100 prefill is 76 % of stock, 65 % of the fork; our Turing prefill card reaches the fork's one-P100
   rate with a 2060 and within 10 % of the fork's two-P100 rate with a T10.
+* **MTP** (fork server, Qwen IQ3_S-mtp, 2x P100, temp 0, 512-token answers, `run_mtp.sh`): 34.5 t/s without,
+  48.1 on code, 42.3 on factual text, 39.6 on a story (acceptance 53 / 44 / 40 % of drafts): 1.15-1.4x here,
+  not the 3x of the fork's page (their Q6_K head and settings; ours is the IQ3_S-mtp file).
+* The gain also depends on the QUANT: 1.82x on IQ3_S, 2.34x on Q6_K (the K-quant paths are where the fork
+  did most of its work).
 * So "probe each model" holds: layout (one card / tensor split / prefill card) should be chosen per model
   from a short bench like this one, not fixed.
