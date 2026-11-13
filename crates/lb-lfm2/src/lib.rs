@@ -6,6 +6,8 @@ pub mod dense;
 #[cfg(feature = "gpu")]
 pub mod device_decode;
 #[cfg(feature = "gpu")]
+pub mod device_prefill;
+#[cfg(feature = "gpu")]
 pub mod inbox;
 pub mod knobs;
 pub mod model;

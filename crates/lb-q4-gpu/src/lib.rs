@@ -17,6 +17,7 @@
 //! output per cube with a shared-memory tree.
 
 pub mod decode;
+pub mod gemm;
 pub mod prefill;
 pub mod store;
 pub mod transcode;
@@ -37,7 +38,7 @@ type V4U = Vector<u32, Const<4>>;
 /// f16 bits -> f32, exactly: normal numbers are rebuilt bit for bit (exponent rebased
 /// 15 -> 127, mantissa widened 10 -> 23 bits); subnormals are `man * 2^-24`.
 #[cube]
-fn f16_to_f32(bits: u32) -> f32 {
+pub(crate) fn f16_to_f32(bits: u32) -> f32 {
     let sign = (bits >> 15u32) & 1u32;
     let exp = (bits >> 10u32) & 31u32;
     let man = bits & 1023u32;

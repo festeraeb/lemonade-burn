@@ -35,6 +35,11 @@ pub struct Knobs {
     /// Router logits as one sequential dot per expert (the host's summation order) instead
     /// of a plane reduce: slower, for parity checks. `LB_DD_ROUTER_SEQ=1`; off by default.
     dd_router_seq: AtomicBool,
+    /// Run a multi-token pass (a prompt) device-resident (`device_prefill.rs`): batched kernels,
+    /// the KV cache and conv state written on the device, one read at the end of each chunk.
+    /// `LB_DEVICE_PREFILL=1` at start; off by default until its parity gate has passed on a
+    /// full model (`lfm2-check --ab-prefill`).
+    device_prefill: AtomicBool,
 }
 
 fn env_on(k: &str) -> bool {
@@ -56,6 +61,7 @@ impl Default for Knobs {
             dd_host_moe: AtomicBool::new(env_on("LB_DD_HOST_MOE")),
             e2_device_router: AtomicBool::new(env_or("LB_E2", true)),
             dd_router_seq: AtomicBool::new(env_on("LB_DD_ROUTER_SEQ")),
+            device_prefill: AtomicBool::new(env_on("LB_DEVICE_PREFILL")),
         }
     }
 }
@@ -110,6 +116,14 @@ impl Knobs {
 
     pub fn set_e2_device_router(&self, on: bool) {
         self.e2_device_router.store(on, Ordering::Relaxed);
+    }
+
+    pub fn device_prefill(&self) -> bool {
+        self.device_prefill.load(Ordering::Relaxed)
+    }
+
+    pub fn set_device_prefill(&self, on: bool) {
+        self.device_prefill.store(on, Ordering::Relaxed);
     }
 
     pub fn dd_router_seq(&self) -> bool {

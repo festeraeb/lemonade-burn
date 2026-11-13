@@ -56,8 +56,8 @@ use std::time::Instant;
 /// Device copies of the small per-layer weights and the per-token buffers, built on the first
 /// device token and kept for the model's life.
 pub struct Prep {
-    layers: Vec<LayerPrep>,
-    final_norm: Handle,
+    pub(crate) layers: Vec<LayerPrep>,
+    pub(crate) final_norm: Handle,
     /// The residual stream, `[n_embd]`. Persistent (never scratch), because a host MoE layer's
     /// read recycles the scratch pool in the middle of a token.
     x: Handle,
@@ -71,26 +71,26 @@ pub struct Prep {
     /// The on-device next-layer guess, when `LB_DEVICE_GUESS=1`: routes and weights at slot
     /// `moe_index(target) * k`.
     guess: Option<(Handle, Handle)>,
-    rope: Option<(Handle, usize)>,
+    pub(crate) rope: Option<(Handle, usize)>,
     tp: TokenParams,
     /// Why no token can take this path (a matrix not resident, ...); `None` = it can.
-    blocker: Option<String>,
+    pub(crate) blocker: Option<String>,
     /// MoE layers without a stacked resident layer: the host runs these (`dd_host_moe`) or the
     /// token falls back.
-    host_moe_layers: Vec<usize>,
+    pub(crate) host_moe_layers: Vec<usize>,
     warned: bool,
 }
 
-struct LayerPrep {
-    attn_norm: Handle,
-    ffn_norm: Handle,
-    op: OpPrep,
+pub(crate) struct LayerPrep {
+    pub(crate) attn_norm: Handle,
+    pub(crate) ffn_norm: Handle,
+    pub(crate) op: OpPrep,
     /// Index of this layer's routes in the per-token buffer (MoE layers only).
-    moe_index: Option<usize>,
-    router: Option<(Handle, Handle)>,
+    pub(crate) moe_index: Option<usize>,
+    pub(crate) router: Option<(Handle, Handle)>,
 }
 
-enum OpPrep {
+pub(crate) enum OpPrep {
     Conv { taps: Handle },
     Attn { q_norm: Handle, k_norm: Handle },
 }
@@ -98,11 +98,11 @@ enum OpPrep {
 /// The device copy of a sequence's state: per attention layer K and V `[kvh, cap, hd]`, per
 /// conv layer the rolling state `[l_cache - 1, n_embd]`, valid for positions `0..len`.
 pub struct DevCache {
-    k: Vec<Option<Handle>>,
-    v: Vec<Option<Handle>>,
-    conv: Vec<Option<Handle>>,
-    cap: usize,
-    len: usize,
+    pub(crate) k: Vec<Option<Handle>>,
+    pub(crate) v: Vec<Option<Handle>>,
+    pub(crate) conv: Vec<Option<Handle>>,
+    pub(crate) cap: usize,
+    pub(crate) len: usize,
 }
 
 /// What the static check says about a pass, before any state is touched.
@@ -126,13 +126,13 @@ pub fn decide(blocker: Option<&str>, host_moe_layers: usize, host_moe_allowed: b
     }
 }
 
-enum Head<'a> {
+pub(crate) enum Head<'a> {
     Q6(&'a lb_q4_gpu::GpuQ6KMat),
     Q4(&'a GpuQ4Mat),
 }
 
 impl Prep {
-    fn new(m: &Lfm2, gpu: &Gpu) -> Self {
+    pub(crate) fn new(m: &Lfm2, gpu: &Gpu) -> Self {
         let cfg = m.cfg();
         let (e, k) = (cfg.n_embd, cfg.n_expert_used.max(1));
         let mut blocker: Vec<String> = Vec::new();
@@ -215,12 +215,12 @@ impl Prep {
     }
 }
 
-fn head(m: &Lfm2) -> Option<Head<'_>> {
+pub(crate) fn head(m: &Lfm2) -> Option<Head<'_>> {
     let s = m.w.embd.start;
     m.dense.q6.get(&s).map(Head::Q6).or_else(|| m.dense.resident.get(&s).map(Head::Q4))
 }
 
-fn mat<'a>(m: &'a Lfm2, r: &MatRef) -> &'a GpuQ4Mat {
+pub(crate) fn mat<'a>(m: &'a Lfm2, r: &MatRef) -> &'a GpuQ4Mat {
     m.dense.resident.get(&r.start).expect("checked resident in Prep::new")
 }
 
@@ -265,7 +265,7 @@ pub fn pull_if_stale(m: &Lfm2, cache: &mut Cache) {
 }
 
 /// Upload the host's state for positions `0..cache.len` as the device copy (`cap` = the host's).
-fn push(m: &Lfm2, gpu: &Gpu, cache: &mut Cache) {
+pub(crate) fn push(m: &Lfm2, gpu: &Gpu, cache: &mut Cache) {
     assert_eq!(cache.host_len, cache.len, "pushing a host state that is behind");
     let cfg = m.cfg();
     let (e, l, hd, cap) = (cfg.n_embd, cfg.l_cache, cfg.head_dim(), cache.cap);

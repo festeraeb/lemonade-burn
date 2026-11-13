@@ -94,6 +94,9 @@ pub struct Timings {
     pub dd_tokens: AtomicU64,
     pub dd_ns: AtomicU64,
     pub dd_fallbacks: AtomicU64,
+    /// Prompt tokens that ran device-resident (`device_prefill.rs`) and their wall time.
+    pub dp_tokens: AtomicU64,
+    pub dp_ns: AtomicU64,
 }
 
 /// Mean ms per pass over the passes counted, split at the matmul boundary.
@@ -693,6 +696,14 @@ impl Lfm2 {
         #[cfg(feature = "gpu")]
         if tokens.len() == 1 && self.store.knobs.device_decode() && !self.capture_enabled() {
             if let Some(logits) = crate::device_decode::token(self, tokens[0], cache) {
+                return logits;
+            }
+        }
+        // a prompt (several tokens) device-resident when asked and possible (`device_prefill.rs`);
+        // `None` means it declined before touching any state, so the host path runs as before
+        #[cfg(feature = "gpu")]
+        if tokens.len() > 1 && self.store.knobs.device_prefill() && !self.capture_enabled() {
+            if let Some(logits) = crate::device_prefill::prefill(self, tokens, cache, all_logits) {
                 return logits;
             }
         }

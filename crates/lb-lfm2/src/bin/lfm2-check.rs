@@ -32,6 +32,16 @@ struct Args {
     /// greedy completion of `--greedy-n` tokens per arm from `--greedy-prompt`.
     #[arg(long, default_value_t = false)]
     ab_device: bool,
+    /// A/B the device-resident prefill (`device_prefill.rs`) against the host prompt pass, same
+    /// process, same residency: every `--prompt` in one pass per arm with all logits (top-1 and
+    /// max |logit| difference per position), then the greedy continuation of `--greedy-n` tokens
+    /// from each arm's prefilled state (device decode in both), then last-row prefill timings
+    /// over `--prefill-lens` synthetic prompts (the greedy prompt repeated to each length).
+    #[arg(long, default_value_t = false)]
+    ab_prefill: bool,
+    /// Prompt lengths (tokens) for the `--ab-prefill` timing rows.
+    #[arg(long, value_delimiter = ',', default_value = "128,512,2048")]
+    prefill_lens: Vec<usize>,
     /// X7a: compare the device decode in each listed Q4_0 math (`f32m,f16,dp4a`) against the f32
     /// device decode, same process, same upload (the math is a launch parameter): teacher-forced
     /// top-1 and KLD(f32 || math) per position over `--prompt`s, then a greedy completion of
@@ -201,6 +211,10 @@ fn main() -> Result<()> {
     };
     if args.ab_device {
         return ab_device(&args, &model, &tokenize, codec.as_ref());
+    }
+    #[cfg(feature = "gpu")]
+    if args.ab_prefill {
+        return ab_prefill(&args, &model, &tokenize, codec.as_ref());
     }
     #[cfg(feature = "gpu")]
     if !args.ab_math.is_empty() {
@@ -488,6 +502,107 @@ fn ab_device(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u3
     }
     if let Some(rt) = model.store.remote.as_ref() {
         println!("w2w: {}", rt.status());
+    }
+    Ok(())
+}
+
+/// `--ab-prefill`: device prefill against the host prompt pass (see the flag's doc).
+#[cfg(feature = "gpu")]
+fn ab_prefill(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32>>, codec: Option<&tokenizers::Tokenizer>) -> Result<()> {
+    let cfg = model.cfg();
+    let k = model.knobs();
+    let vocab = cfg.n_vocab;
+    println!("ab-prefill: ubatch {} (LB_PREFILL_UBATCH); host arm = device_prefill off, device arm = on; decode device-resident in both", lb_lfm2::device_prefill::ubatch());
+    let prefill = |ids: &[u32], device: bool, all: bool| -> (Vec<f32>, f64, lb_lfm2::model::Cache) {
+        k.set_device_prefill(device);
+        let mut cache = model.new_cache();
+        let t = Instant::now();
+        let lg = model.forward(ids, &mut cache, all);
+        let v = lg.into_data().try_to_vec::<f32>().expect("f32 logits");
+        (v, t.elapsed().as_secs_f64(), cache)
+    };
+    let argmax = |row: &[f32]| row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32;
+    let (mut positions, mut agree, mut worst) = (0usize, 0usize, 0f32);
+    let mut report = Vec::new();
+    for prompt in &args.prompts {
+        let mut ids = tokenize(prompt)?;
+        if args.bos {
+            ids.insert(0, cfg.bos);
+        }
+        let dp0 = model.timings.dp_tokens.load(std::sync::atomic::Ordering::Relaxed);
+        let (host, hs, _) = prefill(&ids, false, true);
+        let (dev, ds, _) = prefill(&ids, true, true);
+        let ran = model.timings.dp_tokens.load(std::sync::atomic::Ordering::Relaxed) - dp0;
+        println!("\n== {:?} ({} positions; host {:.1} tok/s, device {:.1} tok/s, {} tokens took the device path)", prompt, ids.len(), ids.len() as f64 / hs, ids.len() as f64 / ds, ran);
+        let mut rows = Vec::new();
+        for i in 0..ids.len() {
+            let (h, d) = (&host[i * vocab..(i + 1) * vocab], &dev[i * vocab..(i + 1) * vocab]);
+            let diff = max_abs_diff(h, d);
+            let (th, td) = (argmax(h), argmax(d));
+            worst = worst.max(diff);
+            agree += (th == td) as usize;
+            positions += 1;
+            if th != td || i + 1 == ids.len() || i < 3 {
+                println!("{:>4} host {:>7} device {:>7} {:<3} max|dlogit| {:.3e}", i, th, td, if th == td { "ok" } else { "NO" }, diff);
+            }
+            rows.push(json!({"pos": i, "host": th, "device": td, "max_abs_logit_diff": diff}));
+        }
+        report.push(json!({"prompt": prompt, "n": ids.len(), "host_tok_s": ids.len() as f64 / hs, "device_tok_s": ids.len() as f64 / ds, "device_tokens": ran, "positions": rows}));
+    }
+    println!("\nteacher-forced top-1 host==device over the prompts: {agree}/{positions}; max |logit diff| {worst:.3e}");
+
+    // the continuation from each arm's prefilled state: decode is device-resident in both arms
+    let mut ids = tokenize(&args.greedy_prompt)?;
+    if args.bos {
+        ids.insert(0, cfg.bos);
+    }
+    k.set_device_decode(true);
+    let greedy = |device: bool| -> (Vec<u32>, f64, f64) {
+        let (last, ps, mut cache) = prefill(&ids, device, false);
+        let mut tok = argmax(&last);
+        let mut out = vec![tok];
+        let t = Instant::now();
+        while out.len() < args.greedy_n && tok != cfg.eos {
+            let lg = model.forward(&[tok], &mut cache, false).into_data().try_to_vec::<f32>().expect("f32");
+            tok = argmax(&lg);
+            out.push(tok);
+        }
+        (out, ps, t.elapsed().as_secs_f64())
+    };
+    let (go, pso, dso) = greedy(false);
+    let (gd, psd, dsd) = greedy(true);
+    let text = |v: &[u32]| codec.and_then(|c| c.decode(v, true).ok()).unwrap_or_else(|| format!("{v:?}"));
+    let same = go == gd;
+    println!("\ngreedy {} tokens after a {}-token prefill of {:?}", args.greedy_n, ids.len(), args.greedy_prompt);
+    println!("host prefill   {:>8.1} prompt tok/s, then {:.2} tok/s decode, sha {} {:?}", ids.len() as f64 / pso, go.len() as f64 / dso, sha16(&text(&go)), text(&go));
+    println!("device prefill {:>8.1} prompt tok/s, then {:.2} tok/s decode, sha {} {:?}", ids.len() as f64 / psd, gd.len() as f64 / dsd, sha16(&text(&gd)), text(&gd));
+    println!("continuation token-for-token: {}", if same { "IDENTICAL".to_string() } else { format!("DIFFERENT (first at step {})", go.iter().zip(&gd).position(|(a, b)| a != b).unwrap_or(go.len().min(gd.len()))) });
+
+    // last-row prefill timings at fixed lengths (the greedy prompt repeated), device arm, and the
+    // host arm only up to 512 tokens (it is the slow path being replaced)
+    let mut timing = Vec::new();
+    for &n in &args.prefill_lens {
+        let mut p: Vec<u32> = Vec::with_capacity(n);
+        while p.len() < n {
+            p.extend_from_slice(&ids[1..]);
+        }
+        p.truncate(n);
+        p[0] = cfg.bos;
+        let _ = prefill(&p, true, false); // warm
+        let (dl, ds, _) = prefill(&p, true, false);
+        let (hrate, top_ok) = if n <= 512 {
+            let (hl, hs, _) = prefill(&p, false, false);
+            (Some(n as f64 / hs), Some(argmax(&hl) == argmax(&dl)))
+        } else {
+            (None, None)
+        };
+        println!("prefill {n:>6} tokens: device {:>8.1} tok/s ({:.3} s){}", n as f64 / ds, ds, hrate.map(|r| format!("; host {r:.1} tok/s; last-row top-1 equal: {}", top_ok.unwrap())).unwrap_or_default());
+        timing.push(json!({"n": n, "device_tok_s": n as f64 / ds, "device_s": ds, "host_tok_s": hrate, "top1_equal": top_ok}));
+    }
+    k.set_device_prefill(false);
+    if let Some(p) = &args.report {
+        std::fs::write(p, serde_json::to_string_pretty(&json!({"model": args.model, "ubatch": lb_lfm2::device_prefill::ubatch(), "agree": agree, "positions": positions,
+            "max_abs_logit_diff": worst, "prompts": report, "greedy": {"host": go, "device": gd, "identical": same}, "timing": timing}))?)?;
     }
     Ok(())
 }

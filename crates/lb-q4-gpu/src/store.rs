@@ -937,6 +937,50 @@ impl GpuQ4Mat {
         Ok(gpu.read_all(vec![(out, m * self.rows)])?.remove(0))
     }
 
+    /// Tiled GEMM (`gemm.rs`) for `m` rows of `x`: each weight tile read once per 64 rows.
+    /// The prefill path's choice for large `m`; same result as [`GpuQ4Mat::launch`] to rounding.
+    pub fn launch_gemm(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        self.gemm_with(gpu, None, x, m)
+    }
+
+    /// `silu(x @ gate^T) * (x @ up^T)` through the tiled GEMM, `[m, rows]`.
+    pub fn launch_gemm_gate_up(gpu: &Gpu, gate: &GpuQ4Mat, up: &GpuQ4Mat, x: &Handle, m: usize) -> Handle {
+        assert!(gate.rows == up.rows && gate.cols == up.cols, "gate/up shape mismatch");
+        gate.gemm_with(gpu, Some(up), x, m)
+    }
+
+    fn gemm_with(&self, gpu: &Gpu, up: Option<&GpuQ4Mat>, x: &Handle, m: usize) -> Handle {
+        let n_out = m * self.rows;
+        let out = gpu.scratch(n_out * 4);
+        let dims = gpu.upload_u32(vec![self.rows as u32, self.cols as u32, m as u32, 0]);
+        let (uq, us, nuq, nus) = match up {
+            Some(u) => (u.qs.clone(), u.sc.clone(), u.n_qs, u.n_sc),
+            None => (self.qs.clone(), self.sc.clone(), self.n_qs, self.n_sc),
+        };
+        unsafe {
+            crate::gemm::q4_0_gemm_kernel::launch(
+                &gpu.client,
+                CubeCount::Static(self.rows.div_ceil(crate::gemm::TILE) as u32, m.div_ceil(crate::gemm::TILE) as u32, 1),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(self.qs.clone(), self.n_qs),
+                BufferArg::from_raw_parts(self.sc.clone(), self.n_sc),
+                BufferArg::from_raw_parts(uq, nuq),
+                BufferArg::from_raw_parts(us, nus),
+                BufferArg::from_raw_parts(x.clone(), m * self.cols),
+                // dense: routes / perm / tiles are never read; bind any real buffer
+                BufferArg::from_raw_parts(dims.clone(), 4),
+                BufferArg::from_raw_parts(dims.clone(), 4),
+                BufferArg::from_raw_parts(dims.clone(), 4),
+                BufferArg::from_raw_parts(dims, 4),
+                BufferArg::from_raw_parts(out.clone(), n_out),
+                false,
+                up.is_some(),
+                false,
+            );
+        }
+        out
+    }
+
     /// `silu(x @ gate^T) * (x @ up^T)` in one dispatch (`q4_0_gate_up_silu_kernel`), for a dense
     /// SwiGLU whose gate and up are separate resident matrices of one shape. Returns `[m, rows]`.
     pub fn launch_gate_up_silu(gpu: &Gpu, gate: &GpuQ4Mat, up: &GpuQ4Mat, x: &Handle, m: usize) -> Handle {
@@ -1554,6 +1598,62 @@ impl GpuExpertLayer {
                 BufferArg::from_raw_parts(dn_dims.clone(), 3),
                 BufferArg::from_raw_parts(out.clone(), n_out),
                 gpu.use_plane,
+            );
+        }
+        (out, n_out)
+    }
+
+    /// The layer for a whole prefill chunk through the tiled GEMM (`gemm.rs`): slots grouped by
+    /// expert on the host (`gemm::group_slots` over the chunk's `routes`, uploaded as `perm` and
+    /// `tiles`), each expert's weight tiles read once per 64 of its slots. `routes` is the
+    /// `[expert, token]` buffer the router wrote (`n_slots` pairs), `x` `[n_tokens, n_embd]`.
+    /// Returns `[n_slots, n_embd]` in slot order, as [`GpuExpertLayer::launch_device`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_grouped(&self, gpu: &Gpu, x: &Handle, n_tokens: usize, routes: &Handle, n_slots: usize, perm: &Handle, tiles: &Handle, n_tiles: usize) -> (Handle, usize) {
+        let n_h = n_slots * self.n_ff;
+        let h = gpu.scratch(n_h * 4);
+        let gu = gpu.const_u32(&[self.n_ff as u32, self.n_embd as u32, 0, 0]);
+        let dn = gpu.const_u32(&[self.n_embd as u32, self.n_ff as u32, 0, 0]);
+        unsafe {
+            crate::gemm::q4_0_gemm_kernel::launch(
+                &gpu.client,
+                CubeCount::Static(self.n_ff.div_ceil(crate::gemm::TILE) as u32, n_tiles as u32, 1),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(self.gate.0.clone(), self.gate.1),
+                BufferArg::from_raw_parts(self.gate.2.clone(), self.gate.3),
+                BufferArg::from_raw_parts(self.up.0.clone(), self.up.1),
+                BufferArg::from_raw_parts(self.up.2.clone(), self.up.3),
+                BufferArg::from_raw_parts(x.clone(), n_tokens * self.n_embd),
+                BufferArg::from_raw_parts(routes.clone(), 2 * n_slots),
+                BufferArg::from_raw_parts(perm.clone(), n_slots),
+                BufferArg::from_raw_parts(tiles.clone(), 3 * n_tiles),
+                BufferArg::from_raw_parts(gu, 4),
+                BufferArg::from_raw_parts(h.clone(), n_h),
+                true,
+                true,
+                true,
+            );
+        }
+        let n_out = n_slots * self.n_embd;
+        let out = gpu.scratch(n_out * 4);
+        unsafe {
+            crate::gemm::q4_0_gemm_kernel::launch(
+                &gpu.client,
+                CubeCount::Static(self.n_embd.div_ceil(crate::gemm::TILE) as u32, n_tiles as u32, 1),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(self.down.0.clone(), self.down.1),
+                BufferArg::from_raw_parts(self.down.2.clone(), self.down.3),
+                BufferArg::from_raw_parts(self.down.0.clone(), self.down.1),
+                BufferArg::from_raw_parts(self.down.2.clone(), self.down.3),
+                BufferArg::from_raw_parts(h.clone(), n_h),
+                BufferArg::from_raw_parts(routes.clone(), 2 * n_slots),
+                BufferArg::from_raw_parts(perm.clone(), n_slots),
+                BufferArg::from_raw_parts(tiles.clone(), 3 * n_tiles),
+                BufferArg::from_raw_parts(dn, 4),
+                BufferArg::from_raw_parts(out.clone(), n_out),
+                true,
+                false,
+                false,
             );
         }
         (out, n_out)
