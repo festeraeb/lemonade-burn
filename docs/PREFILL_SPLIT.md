@@ -94,6 +94,13 @@ length; 215/215 top-1, continuation identical. Within a few % of llama.cpp's def
 With `LB_PREFILL_UBATCH=2048` (A2, same card): **512: 557, 2048: 780, 8192: 770 tok/s** (215/215, identical
 continuation); llama.cpp on a P100 at ub 2048: 1025 / 990: about 77 %.
 
+**G4 re-run, the operator's layout (B1, c2): all 40 layers of the prompt on the T10 (tensor cores), decode on
+the P100, ub 2048: PASS.** 512: **1352**, 2048: **1736**, 8192: **1598 tok/s** (5.13 s), against one P100 557 /
+780 / 770 (A2): 2.1-2.4x, and 1.5-1.7x llama.cpp's best P100 prefill. llama.cpp on a T10 (X6) is still
+~2.4x ours (3998 / 4222). Top-1 214/215, max |logit diff| 4.1 (f16 tensor cores); continuation identical
+for 24 tokens, then a near-tie goes the other way ("bottom" vs "seabed mapping"). Hops 1 ms in all, state
+copies 0.11 s. The T10 was borrowed from gemma4-c2 for 20 min (held in the manifest, restored).
+
 ## Next, in order
 1. Larger chunks (`LB_PREFILL_UBATCH=2048`): fills the expert tiles (grouped GEMM 3.0x the rows kernels at
    m=2048 on a P100, 2.2x at 512). Measured as A2.
