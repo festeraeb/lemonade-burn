@@ -29,15 +29,18 @@ fn q4(rng: &mut Rng, rows: usize, cols: usize) -> Vec<u8> {
     wf.chunks_exact(cols).flat_map(|r| quantize_q4_0(r)).collect()
 }
 
-fn close(got: &[f32], want: &[f32], cols: usize, label: &str) {
+/// f32 tiles: rounding only. Tensor cores (`Gpu::tensor_cores`): activations and dequantized
+/// weights are f16, so the bound is relative to the output's scale: max |d| <= 4e-3 * max |want|.
+fn close_on(gpu: &Gpu, got: &[f32], want: &[f32], cols: usize, label: &str) {
     assert_eq!(got.len(), want.len(), "{label}: length");
+    let scale = want.iter().fold(0f32, |a, w| a.max(w.abs()));
     let mut worst = 0f32;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        let tol = 2e-5 * (1.0 + w.abs()) + 2e-6 * cols as f32;
-        assert!((g - w).abs() <= tol, "{label} [{i}]: gemm {g} rows {w}");
+        let tol = if gpu.tensor_cores { 4e-3 * scale.max(1e-3) } else { 2e-5 * (1.0 + w.abs()) + 2e-6 * cols as f32 };
+        assert!((g - w).abs() <= tol, "{label} [{i}]: gemm {g} rows {w} (tensor cores: {})", gpu.tensor_cores);
         worst = worst.max((g - w).abs());
     }
-    eprintln!("{label}: max |gemm - rows| = {worst:e}");
+    eprintln!("{label} ({}): max |gemm - rows| = {worst:e} of max |out| {scale:e}", if gpu.tensor_cores { "tensor cores" } else { "f32 tiles" });
 }
 
 #[test]
@@ -52,12 +55,12 @@ fn dense_gemm_and_fused_gate_up_match_the_rows_kernels() {
         let xh = gpu.upload_f32(&x);
         let want = read(&gpu, &w.launch(&gpu, &xh, m), m * rows);
         let got = read(&gpu, &w.launch_gemm(&gpu, &xh, m), m * rows);
-        close(&got, &want, cols, &format!("dense {rows}x{cols} m={m}"));
+        close_on(&gpu, &got, &want, cols, &format!("dense {rows}x{cols} m={m}"));
         let ub = q4(&mut rng, rows, cols);
         let u = GpuQ4Mat::upload(&gpu, QuantMat::new(GgmlType::Q4_0, rows, cols, &ub)).unwrap();
         let want = read(&gpu, &GpuQ4Mat::launch_gate_up_silu(&gpu, &w, &u, &xh, m), m * rows);
         let got = read(&gpu, &GpuQ4Mat::launch_gemm_gate_up(&gpu, &w, &u, &xh, m), m * rows);
-        close(&got, &want, cols, &format!("gate/up {rows}x{cols} m={m}"));
+        close_on(&gpu, &got, &want, cols, &format!("gate/up {rows}x{cols} m={m}"));
     }
 }
 
@@ -105,5 +108,5 @@ fn grouped_experts_match_the_routed_stacked_layer() {
     assert!(n_tiles > n_exp / 2, "several tiles: {n_tiles}");
     let (got_h, n2) = layer.launch_grouped(&gpu, &xh, m, &rh, slots, &gpu.upload_u32(perm), &gpu.upload_u32(tiles), n_tiles);
     assert_eq!(n, n2);
-    close(&read(&gpu, &got_h, n2), &want, n_ff.max(n_embd), "grouped experts (gate/up/silu -> down) vs routed");
+    close_on(&gpu, &read(&gpu, &got_h, n2), &want, n_ff.max(n_embd), "grouped experts (gate/up/silu -> down) vs routed");
 }

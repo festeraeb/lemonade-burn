@@ -17,6 +17,18 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+/// Launch the prefill GEMM on `$gpu` with the kernel its card takes: the tensor-core form when
+/// [`Gpu::tensor_cores`], else the f32 tiles. Both take the same arguments.
+macro_rules! gemm_launch {
+    ($gpu:expr, $($arg:expr),+ $(,)?) => {
+        if $gpu.tensor_cores {
+            crate::gemm::q4_0_gemm_tc_kernel::launch(&$gpu.client, $($arg),+)
+        } else {
+            crate::gemm::q4_0_gemm_kernel::launch(&$gpu.client, $($arg),+)
+        }
+    };
+}
+
 /// Most free buffers to keep per size. Decode reuses a handful of sizes, so this only caps
 /// pathological growth (a long prefill with many distinct `m`).
 const POOL_PER_SIZE: usize = 64;
@@ -30,6 +42,10 @@ pub struct Gpu {
     pub use_plane: bool,
     /// Plane (warp/wave) size range the driver reports.
     pub plane_size: (u32, u32),
+    /// f16 tensor cores (cmma 16x16x16, f32 accumulate) reported by the runtime and planes of
+    /// 32: the prefill GEMM takes `q4_0_gemm_tc_kernel` (`gemm.rs`). `LB_NO_TC=1` forces the f32
+    /// GEMM on such a card (the A/B switch).
+    pub tensor_cores: bool,
     /// Recycled scratch buffers, keyed by byte size.
     free: Mutex<HashMap<usize, Vec<Handle>>>,
     /// Scratch handed out since the last sync. Reusing one before the GPU has run would
@@ -246,7 +262,14 @@ impl Gpu {
         #[cfg(not(feature = "cuda"))]
         let compute_capability: Option<(u32, u32)> = None;
         let q4_math = Q4Math::pick(compute_capability);
+        let tensor_cores = {
+            use cubecl::ir::{ElemType, FloatKind};
+            let f16 = ElemType::Float(FloatKind::F16);
+            let want = cubecl::ir::features::MmaConfig { a_type: f16, b_type: f16, cd_type: ElemType::Float(FloatKind::F32), m: 16, n: 16, k: 16 };
+            props.features.matmul.cmma.contains(&want) && pmax == 32 && pmin == 32 && std::env::var("LB_NO_TC").map(|v| v.is_empty() || v == "0").unwrap_or(true)
+        };
         Ok(Self {
+            tensor_cores,
             client,
             name: format!("{dev:?}"),
             cube_dim,
@@ -958,8 +981,8 @@ impl GpuQ4Mat {
             None => (self.qs.clone(), self.sc.clone(), self.n_qs, self.n_sc),
         };
         unsafe {
-            crate::gemm::q4_0_gemm_kernel::launch(
-                &gpu.client,
+            gemm_launch!(
+                gpu,
                 CubeCount::Static(self.rows.div_ceil(crate::gemm::TILE) as u32, m.div_ceil(crate::gemm::TILE) as u32, 1),
                 CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(self.qs.clone(), self.n_qs),
@@ -1615,8 +1638,8 @@ impl GpuExpertLayer {
         let gu = gpu.const_u32(&[self.n_ff as u32, self.n_embd as u32, 0, 0]);
         let dn = gpu.const_u32(&[self.n_embd as u32, self.n_ff as u32, 0, 0]);
         unsafe {
-            crate::gemm::q4_0_gemm_kernel::launch(
-                &gpu.client,
+            gemm_launch!(
+                gpu,
                 CubeCount::Static(self.n_ff.div_ceil(crate::gemm::TILE) as u32, n_tiles as u32, 1),
                 CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(self.gate.0.clone(), self.gate.1),
@@ -1637,8 +1660,8 @@ impl GpuExpertLayer {
         let n_out = n_slots * self.n_embd;
         let out = gpu.scratch(n_out * 4);
         unsafe {
-            crate::gemm::q4_0_gemm_kernel::launch(
-                &gpu.client,
+            gemm_launch!(
+                gpu,
                 CubeCount::Static(self.n_embd.div_ceil(crate::gemm::TILE) as u32, n_tiles as u32, 1),
                 CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(self.down.0.clone(), self.down.1),

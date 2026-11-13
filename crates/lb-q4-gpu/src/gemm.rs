@@ -226,6 +226,189 @@ pub fn q4_0_gemm_kernel(
     }
 }
 
+/// f16 shared-memory row stride for the tensor-core kernel: a multiple of 8 halves (wmma needs a
+/// 16-byte `ldm`), padded past 32 so the 64 rows do not all start on one bank.
+const LDH: usize = 40;
+/// f32 staging row stride for the accumulators (a multiple of 4 floats).
+const LDS: usize = 68;
+
+/// The tensor-core form of [`q4_0_gemm_kernel`] (same grid, tiling, grouping and outputs), for
+/// cards with f16 cooperative matrix ops (`cmma` 16x16x16, f32 accumulate: NVIDIA sm_70+; our
+/// fleet's Turing cards). The 64 x 64 tile is 8 warps of 16 x 32: warp `w` owns rows
+/// `16 (w / 2)` and columns `32 (w % 2) .. + 32` as two accumulators (four with `gate_up`).
+///
+/// Numbers differ from the f32 kernel in two ways, both by design: activations are rounded to
+/// f16 before the multiply, and a weight is dequantized to f16 (`(q - 8) * d`) instead of scaling
+/// a per-block f32 partial. Accumulation is f32 throughout. This is the arithmetic llama.cpp's
+/// prefill uses on these cards (dequantize to f16, tensor-core GEMM); its cost is checked by the
+/// model-level KLD gate, not assumed (`docs/PREFILL_SPLIT.md`).
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn q4_0_gemm_tc_kernel(
+    gq: &[u32],
+    gs: &[u32],
+    uq: &[u32],
+    us: &[u32],
+    x: &[f32],
+    routes: &[u32],
+    perm: &[u32],
+    tiles: &[u32],
+    dims: &[u32],
+    out: &mut [f32],
+    #[comptime] grouped: bool,
+    #[comptime] gate_up: bool,
+    #[comptime] src_tok: bool,
+) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let m = dims[2] as usize;
+    let bpr = cols / 32usize;
+    let r0 = CUBE_POS_X as usize * 64usize;
+    let u = UNIT_POS as usize;
+    let warp = (UNIT_POS / PLANE_DIM) as usize;
+    let wm = warp / 2usize;
+    let wn = warp % 2usize;
+
+    let mut t0 = 0usize;
+    let mut count = 64usize;
+    let mut base_block = 0usize;
+    if grouped {
+        let tile = CUBE_POS_Y as usize;
+        let e = tiles[3usize * tile] as usize;
+        t0 = tiles[3usize * tile + 1usize] as usize;
+        count = tiles[3usize * tile + 2usize] as usize;
+        base_block = e * rows * bpr;
+    } else {
+        t0 = CUBE_POS_Y as usize * 64usize;
+        if t0 + 64usize > m {
+            count = m - t0;
+        }
+    }
+
+    let mut xs = Shared::<[half::f16]>::new_aligned_slice(64usize * LDH, 32usize);
+    let mut ws = Shared::<[half::f16]>::new_aligned_slice(64usize * LDH, 32usize);
+    let mut ws2 = Shared::<[half::f16]>::new_aligned_slice(64usize * LDH, 32usize);
+    let mut st = Shared::<[f32]>::new_aligned_slice(64usize * LDS, 32usize);
+
+    let xr = u / 4usize;
+    let part = u % 4usize;
+    let mut src = 0usize;
+    let valid = xr < count;
+    if valid {
+        if grouped {
+            let s = perm[t0 + xr] as usize;
+            if src_tok {
+                src = routes[2usize * s + 1usize] as usize;
+            } else {
+                src = s;
+            }
+        } else {
+            src = t0 + xr;
+        }
+    }
+    let wr = r0 + xr;
+
+    let c0 = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0f32);
+    let c1 = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0f32);
+    let c2 = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0f32);
+    let c3 = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0f32);
+
+    let mut kb = 0usize;
+    while kb < bpr {
+        // x: row xr, columns part*8 .. +8 of this block, rounded to f16
+        let xc = kb * 32usize + part * 8usize;
+        #[unroll]
+        for j in 0..8usize {
+            let mut v = 0.0f32;
+            if valid {
+                v = x[src * cols + xc + j];
+            }
+            xs[xr * LDH + part * 8usize + j] = half::f16::cast_from(v);
+        }
+        // W: row xr of the tile, word `part` of its block, dequantized (q - 8) * d
+        if wr < rows {
+            let gb = base_block + wr * bpr + kb;
+            let w = gq[gb * 4usize + part];
+            let d = f16_to_f32((gs[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+            #[unroll]
+            for j in 0..8u32 {
+                ws[xr * LDH + 4usize * j as usize + part] = half::f16::cast_from((f32::cast_from((w >> (4u32 * j)) & 15u32) - 8.0f32) * d);
+            }
+            if gate_up {
+                let w2 = uq[gb * 4usize + part];
+                let d2 = f16_to_f32((us[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+                #[unroll]
+                for j in 0..8u32 {
+                    ws2[xr * LDH + 4usize * j as usize + part] = half::f16::cast_from((f32::cast_from((w2 >> (4u32 * j)) & 15u32) - 8.0f32) * d2);
+                }
+            }
+        } else {
+            #[unroll]
+            for j in 0..8u32 {
+                ws[xr * LDH + 4usize * j as usize + part] = half::f16::cast_from(0.0f32);
+                if gate_up {
+                    ws2[xr * LDH + 4usize * j as usize + part] = half::f16::cast_from(0.0f32);
+                }
+            }
+        }
+        sync_cube();
+        #[unroll]
+        for ks in 0..2usize {
+            let ao = wm * 16usize * LDH + ks * 16usize;
+            let bo0 = wn * 32usize * LDH + ks * 16usize;
+            let bo1 = (wn * 32usize + 16usize) * LDH + ks * 16usize;
+            let a = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &xs[ao..64usize * LDH], LDH as u32);
+            let b0 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws[bo0..64usize * LDH], LDH as u32);
+            let b1 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws[bo1..64usize * LDH], LDH as u32);
+            cmma::execute(&a, &b0, &c0, &c0);
+            cmma::execute(&a, &b1, &c1, &c1);
+            if gate_up {
+                let b2 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws2[bo0..64usize * LDH], LDH as u32);
+                let b3 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws2[bo1..64usize * LDH], LDH as u32);
+                cmma::execute(&a, &b2, &c2, &c2);
+                cmma::execute(&a, &b3, &c3, &c3);
+            }
+        }
+        sync_cube();
+        kb += 1usize;
+    }
+
+    // accumulators -> shared staging -> each unit's 16 outputs (row u / 4, columns 16 (u % 4) ..)
+    let so = wm * 16usize * LDS + wn * 32usize;
+    cmma::store(&mut st[so..64usize * LDS], &c0, LDS as u32, cmma::MatrixLayout::RowMajor);
+    cmma::store(&mut st[so + 16usize..64usize * LDS], &c1, LDS as u32, cmma::MatrixLayout::RowMajor);
+    sync_cube();
+    let mut g = Array::<f32>::new(16usize);
+    #[unroll]
+    for j in 0..16usize {
+        g[j] = st[xr * LDS + part * 16usize + j];
+    }
+    if gate_up {
+        sync_cube();
+        cmma::store(&mut st[so..64usize * LDS], &c2, LDS as u32, cmma::MatrixLayout::RowMajor);
+        cmma::store(&mut st[so + 16usize..64usize * LDS], &c3, LDS as u32, cmma::MatrixLayout::RowMajor);
+        sync_cube();
+        #[unroll]
+        for j in 0..16usize {
+            let gv = g[j];
+            g[j] = gv / (1.0f32 + Exp::exp(-gv)) * st[xr * LDS + part * 16usize + j];
+        }
+    }
+    if valid {
+        let mut dst = t0 + xr;
+        if grouped {
+            dst = perm[t0 + xr] as usize;
+        }
+        #[unroll]
+        for j in 0..16usize {
+            let r = r0 + part * 16usize + j;
+            if r < rows {
+                out[dst * rows + r] = g[j];
+            }
+        }
+    }
+}
+
 /// Sort a chunk's routed slots by expert: `perm` (slot ids, expert-major, ascending slot within an
 /// expert) and the tiles (`[expert, start, count]`, at most `TILE` slots each). `routes` is the
 /// `[expert, token]` pair list of the chunk.
