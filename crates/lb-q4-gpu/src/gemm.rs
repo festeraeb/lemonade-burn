@@ -473,6 +473,7 @@ pub fn q4_0_gemm_h2_kernel(
     #[comptime] grouped: bool,
     #[comptime] gate_up: bool,
     #[comptime] src_tok: bool,
+    #[comptime] fold: usize,
 ) {
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
@@ -576,50 +577,54 @@ pub fn q4_0_gemm_h2_kernel(
             }
         }
         sync_cube();
-        // part[i * 2 + h]: row i, weight rows (2h, 2h + 1) of this unit's 4 x 4
-        let mut pt = Array::<V2H>::new(8usize);
-        let mut pt2 = Array::<V2H>::new(8usize);
+        // the block in segments of `fold` columns: fp16 partials never span more than that
         #[unroll]
-        for i in 0..8usize {
-            pt[i] = V2H::new(zero);
-            pt2[i] = V2H::new(zero);
-        }
-        for kk in 0..32usize {
-            let mut b01 = V2H::new(ws[(tx * 4usize) * LDP + kk]);
-            b01.insert(1usize, ws[(tx * 4usize + 1usize) * LDP + kk]);
-            let mut b23 = V2H::new(ws[(tx * 4usize + 2usize) * LDP + kk]);
-            b23.insert(1usize, ws[(tx * 4usize + 3usize) * LDP + kk]);
+        for seg in 0..comptime!(32usize / fold) {
+            // part[i * 2 + h]: row i, weight rows (2h, 2h + 1) of this unit's 4 x 4
+            let mut pt = Array::<V2H>::new(8usize);
+            let mut pt2 = Array::<V2H>::new(8usize);
             #[unroll]
-            for i in 0..4usize {
-                let a = V2H::new(xs[(ty * 4usize + i) * LDP + kk]);
-                pt[i * 2usize] = fma(a, b01, pt[i * 2usize]);
-                pt[i * 2usize + 1usize] = fma(a, b23, pt[i * 2usize + 1usize]);
+            for i in 0..8usize {
+                pt[i] = V2H::new(zero);
+                pt2[i] = V2H::new(zero);
             }
-            if gate_up {
-                let mut c01 = V2H::new(ws2[(tx * 4usize) * LDP + kk]);
-                c01.insert(1usize, ws2[(tx * 4usize + 1usize) * LDP + kk]);
-                let mut c23 = V2H::new(ws2[(tx * 4usize + 2usize) * LDP + kk]);
-                c23.insert(1usize, ws2[(tx * 4usize + 3usize) * LDP + kk]);
+            for kk in seg * fold..seg * fold + fold {
+                let mut b01 = V2H::new(ws[(tx * 4usize) * LDP + kk]);
+                b01.insert(1usize, ws[(tx * 4usize + 1usize) * LDP + kk]);
+                let mut b23 = V2H::new(ws[(tx * 4usize + 2usize) * LDP + kk]);
+                b23.insert(1usize, ws[(tx * 4usize + 3usize) * LDP + kk]);
                 #[unroll]
                 for i in 0..4usize {
                     let a = V2H::new(xs[(ty * 4usize + i) * LDP + kk]);
-                    pt2[i * 2usize] = fma(a, c01, pt2[i * 2usize]);
-                    pt2[i * 2usize + 1usize] = fma(a, c23, pt2[i * 2usize + 1usize]);
+                    pt[i * 2usize] = fma(a, b01, pt[i * 2usize]);
+                    pt[i * 2usize + 1usize] = fma(a, b23, pt[i * 2usize + 1usize]);
+                }
+                if gate_up {
+                    let mut c01 = V2H::new(ws2[(tx * 4usize) * LDP + kk]);
+                    c01.insert(1usize, ws2[(tx * 4usize + 1usize) * LDP + kk]);
+                    let mut c23 = V2H::new(ws2[(tx * 4usize + 2usize) * LDP + kk]);
+                    c23.insert(1usize, ws2[(tx * 4usize + 3usize) * LDP + kk]);
+                    #[unroll]
+                    for i in 0..4usize {
+                        let a = V2H::new(xs[(ty * 4usize + i) * LDP + kk]);
+                        pt2[i * 2usize] = fma(a, c01, pt2[i * 2usize]);
+                        pt2[i * 2usize + 1usize] = fma(a, c23, pt2[i * 2usize + 1usize]);
+                    }
                 }
             }
-        }
-        // fold the block's partials into f32, scaled by each weight row's d
-        #[unroll]
-        for i in 0..4usize {
+            // fold the block's partials into f32, scaled by each weight row's d
             #[unroll]
-            for h in 0..2usize {
-                let f = V2F::cast_from(pt[i * 2usize + h]);
-                acc[i * 4usize + 2usize * h] += ds[tx * 4usize + 2usize * h] * f.extract(0usize);
-                acc[i * 4usize + 2usize * h + 1usize] += ds[tx * 4usize + 2usize * h + 1usize] * f.extract(1usize);
-                if gate_up {
-                    let f2 = V2F::cast_from(pt2[i * 2usize + h]);
-                    acc2[i * 4usize + 2usize * h] += ds2[tx * 4usize + 2usize * h] * f2.extract(0usize);
-                    acc2[i * 4usize + 2usize * h + 1usize] += ds2[tx * 4usize + 2usize * h + 1usize] * f2.extract(1usize);
+            for i in 0..4usize {
+                #[unroll]
+                for h in 0..2usize {
+                    let f = V2F::cast_from(pt[i * 2usize + h]);
+                    acc[i * 4usize + 2usize * h] += ds[tx * 4usize + 2usize * h] * f.extract(0usize);
+                    acc[i * 4usize + 2usize * h + 1usize] += ds[tx * 4usize + 2usize * h + 1usize] * f.extract(1usize);
+                    if gate_up {
+                        let f2 = V2F::cast_from(pt2[i * 2usize + h]);
+                        acc2[i * 4usize + 2usize * h] += ds2[tx * 4usize + 2usize * h] * f2.extract(0usize);
+                        acc2[i * 4usize + 2usize * h + 1usize] += ds2[tx * 4usize + 2usize * h + 1usize] * f2.extract(1usize);
+                    }
                 }
             }
         }
@@ -647,6 +652,16 @@ pub fn q4_0_gemm_h2_kernel(
                 }
             }
         }
+    }
+}
+
+/// Columns per fp16 partial in the half2 kernel before it folds to f32: `LB_H2_FOLD` = 8, 16 or
+/// 32 (default 8). Shorter is more accurate and slower.
+pub fn h2_fold() -> usize {
+    match std::env::var("LB_H2_FOLD").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(16) => 16,
+        Some(32) => 32,
+        _ => 8,
     }
 }
 

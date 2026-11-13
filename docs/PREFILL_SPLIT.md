@@ -101,6 +101,14 @@ the P100, ub 2048: PASS.** 512: **1352**, 2048: **1736**, 8192: **1598 tok/s** (
 for 24 tokens, then a near-tie goes the other way ("bottom" vs "seabed mapping"). Hops 1 ms in all, state
 copies 0.11 s. The T10 was borrowed from gemma4-c2 for 20 min (held in the manifest, restored).
 
+**fp16 pipe on the P100 (half2 GEMM, the Kmic-68 fork's idea, own kernel): measured, NOT adopted.** Folding
+a 32-column fp16 partial to f32: kernel 4860 dense / 4592 MoE GFLOP/s (f32 tiles 4096 / 3734), full model
+930 / 904 tok/s at 2k / 8k (f32 780 / 770), but top-1 211/215, max |logit diff| 9.5, continuation differs
+at step 4: **fails G1** (>= 99 %). Fold 16: 4658 / 4099; fold 8: 4369 / 3805 with half the error, i.e. the
+f32 tiles' speed. The fork gets its accuracy from integer (q8) activations, whose products are exact in
+fp16; ours are f16-rounded floats. Kept behind `LB_H2=1` (`LB_H2_FOLD`); the P100 default stays f32.
+Tensor-core stage width (T10): one block per stage 8584 / 10168, two blocks 7338 / 8775 (occupancy).
+
 ## Next, in order
 1. Larger chunks (`LB_PREFILL_UBATCH=2048`): fills the expert tiles (grouped GEMM 3.0x the rows kernels at
    m=2048 on a P100, 2.2x at 512). Measured as A2.
