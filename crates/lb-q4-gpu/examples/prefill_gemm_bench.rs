@@ -42,6 +42,7 @@ fn med(gpu: &Gpu, mut f: impl FnMut()) -> f64 {
 
 fn main() {
     let gpu = Gpu::open().expect("device");
+    eprintln!("{}: tensor_cores={} plane {:?}", gpu.name, gpu.tensor_cores, gpu.plane_size);
     let m: usize = std::env::var("LB_BENCH_M").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
     let mut rng = Rng(7);
     let (rows, cols) = (6144usize, 2048usize);

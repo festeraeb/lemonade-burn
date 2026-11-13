@@ -1,3 +1,11 @@
+**G3, tensor cores: correct, and 3.2-3.9x the f32 tiles.** `gemm_matches_rows` passes on the 2060 to the f16
+bound (worst 3e-4 of scale). **CORRECTION:** the first speed rows here (2060 2131 vs 2129 GFLOP/s, T10 2714
+vs 2684, "no faster") were a **stale example binary**: after adding the tensor-core kernel only the library
+was rebuilt (`cargo build -p lb-q4-gpu` does not rebuild `examples/`), so both arms ran the f32 tiles; the
+Nsight profile showed only `q4_0_gemm_kernel` running in the "tensor-core" arm. Rebuilt, T10, m=2048:
+**dense 8598 GFLOP/s (f32 tiles 2684), MoE layer 10313 (2639)**. P100 f32 tiles: 4092 dense / 3735 MoE.
+The G4 run below did use the tensor cores (its log: "tensor cores yes").
+
 # Device prefill and the prefill/decode split (2026-11-13)
 
 Operator, 2026-11-13: get our CubeCL engine ready to test prefill on the RTX (tensor cores) and
@@ -83,13 +91,14 @@ was attention on the slower-memory card (2060: ~60 % of a P100's bandwidth, 8 of
 17-20x the per-query kernel (P100, one layer over the prompt: 8192 tokens 2094 -> 103 ms). Full model on
 c2's P100 (Gen3 x4 slot, weights resident; ub 512): **512: 552, 2048: 594, 8192: 588 tok/s**, flat with
 length; 215/215 top-1, continuation identical. Within a few % of llama.cpp's default ubatch.
+With `LB_PREFILL_UBATCH=2048` (A2, same card): **512: 557, 2048: 780, 8192: 770 tok/s** (215/215, identical
+continuation); llama.cpp on a P100 at ub 2048: 1025 / 990: about 77 %.
 
 ## Next, in order
 1. Larger chunks (`LB_PREFILL_UBATCH=2048`): fills the expert tiles (grouped GEMM 3.0x the rows kernels at
    m=2048 on a P100, 2.2x at 512). Measured as A2.
-2. Tensor-core GEMM that is actually faster: K tile of several blocks per barrier pair, activations
-   converted to f16 once per chunk (not per tile), double-buffered staging; profile with Nsight Compute on
-   a Turing card before guessing.
+2. Tensor-core GEMM: already 3.2-3.9x the f32 tiles (see the G3 correction); next gains from a K tile of
+   several blocks per barrier pair and activations converted to f16 once per chunk.
 3. Re-run G4 with 1 and 2; overlap the two cards (chunk c+1 on the prefill card while c finishes on the
    decode card).
 
