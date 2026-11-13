@@ -17,6 +17,7 @@
 //! output per cube with a shared-memory tree.
 
 pub mod decode;
+pub mod prefill;
 pub mod store;
 pub mod transcode;
 pub use decode::TokenParams;
