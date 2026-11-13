@@ -97,7 +97,7 @@ length; 215/215 top-1, continuation identical. Within a few % of llama.cpp's def
 * **Tensor parallelism across a P2P pair** (c4 AF+D8 measured 10.2 GB/s P2P): split each matrix's rows over
   both cards so decode reads both cards' HBM at once; the cost is one all-reduce per layer. The way past one
   card's bandwidth for dense models. 67 tok/s on a dense 27B Q4 is ~1 TB/s effective, ~70 % of the pair's peak.
-* **MTP** (multi-token prediction heads, verified next pass): ~1.5-2x decode where the model ships MTP heads
+* **MTP** (multi-token prediction heads, verified next pass): ~1.5-2x decode where the model ships MTP heads. The video ran with thinking low and temperature 0: greedy verification is MTP's best case (a draft is kept whenever it is the top token), and short answers keep the measured tok/s close to pure decode
   (LFM2.5 does not).
 * **6-bit weights** (Q6_K): near-Q8 quality at 6.56 bpw; the Q6_K kernel exists (the LFM2 head); costs ~45 %
   more bytes per token than Q4_0 in bandwidth-bound decode.
