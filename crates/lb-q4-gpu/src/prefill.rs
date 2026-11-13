@@ -253,6 +253,127 @@ pub fn attn_prefill_kernel(q: &[f32], kc: &[f32], vc: &[f32], out: &mut [f32], p
     }
 }
 
+/// Query rows per tiled-attention cube (each with all `group` query heads of one KV head).
+pub const ATTN_BQ: usize = 32;
+/// Key positions staged per tile.
+pub const ATTN_BK: usize = 32;
+
+/// Causal attention for `m` query rows, tiled (flash style). Cube `(kv head kh, query tile)`:
+/// its `group * ATTN_BQ` units are the query heads `kh * group ..` of rows `tile * ATTN_BQ ..`,
+/// unit `u` = head `u / ATTN_BQ`, row `u % ATTN_BQ`. K and V of `ATTN_BK` positions at a time go to
+/// shared memory once and serve every query of the cube (the naive kernel re-reads them per query);
+/// per tile a unit computes its scores, rescales its running sum once, then accumulates.
+/// Same inputs and outputs as [`attn_prefill_kernel`]; the summation order differs, so results agree
+/// to rounding. `p` = `[group, pos0, cap, nh, m]`.
+#[cube(launch)]
+pub fn attn_prefill_tiled_kernel(q: &[f32], kc: &[f32], vc: &[f32], out: &mut [f32], p: &[u32], scale: &[f32], #[comptime] hd: usize) {
+    let group = p[0] as usize;
+    let pos0 = p[1] as usize;
+    let cap = p[2] as usize;
+    let nh = p[3] as usize;
+    let m = p[4] as usize;
+    let kh = CUBE_POS_X as usize;
+    let tile = CUBE_POS_Y as usize;
+    let u = UNIT_POS as usize;
+    let nunits = CUBE_DIM_X as usize;
+    let g = u / ATTN_BQ;
+    let t = tile * ATTN_BQ + u % ATTN_BQ;
+    let head = kh * group + g;
+    let valid = t < m;
+    let qpos = pos0 + t;
+    let sc = scale[0];
+
+    let mut qv = Array::<f32>::new(hd);
+    let mut acc = Array::<f32>::new(hd);
+    #[unroll]
+    for d in 0..hd {
+        let mut v = 0.0f32;
+        if valid {
+            v = q[(t * nh + head) * hd + d];
+        }
+        qv[d] = v;
+        acc[d] = 0.0f32;
+    }
+    let mut mx = f32::new(-3.0e38f32);
+    let mut s = 0.0f32;
+
+    let mut ks = Shared::<[f32]>::new_slice(ATTN_BK * hd);
+    let mut vs = Shared::<[f32]>::new_slice(ATTN_BK * hd);
+    let mut scs = Array::<f32>::new(ATTN_BK);
+    // positions this tile's last valid query can see: 0 ..= pos0 + min(tile_end, m) - 1
+    let mut tend = tile * ATTN_BQ + ATTN_BQ;
+    if tend > m {
+        tend = m;
+    }
+    let kend = pos0 + tend;
+    let mut k0 = 0usize;
+    while k0 < kend {
+        let mut i = u;
+        while i < ATTN_BK * hd {
+            let j = i / hd;
+            let pos = k0 + j;
+            let mut kv = 0.0f32;
+            let mut vv = 0.0f32;
+            if pos < kend {
+                let o = (kh * cap + pos) * hd + i % hd;
+                kv = kc[o];
+                vv = vc[o];
+            }
+            ks[i] = kv;
+            vs[i] = vv;
+            i += nunits;
+        }
+        sync_cube();
+        if valid {
+            let mut tmax = f32::new(-3.0e38f32);
+            #[unroll]
+            for j in 0..ATTN_BK {
+                let mut dot = 0.0f32;
+                #[unroll]
+                for d in 0..hd {
+                    dot += qv[d] * ks[j * hd + d];
+                }
+                let mut sv = f32::new(-3.0e38f32);
+                if k0 + j <= qpos {
+                    sv = dot * sc;
+                }
+                scs[j] = sv;
+                if sv > tmax {
+                    tmax = sv;
+                }
+            }
+            if tmax > mx {
+                let c = Exp::exp(mx - tmax);
+                s *= c;
+                #[unroll]
+                for d in 0..hd {
+                    acc[d] *= c;
+                }
+                mx = tmax;
+            }
+            #[unroll]
+            for j in 0..ATTN_BK {
+                if k0 + j <= qpos {
+                    let e = Exp::exp(scs[j] - mx);
+                    s += e;
+                    #[unroll]
+                    for d in 0..hd {
+                        acc[d] += e * vs[j * hd + d];
+                    }
+                }
+            }
+        }
+        sync_cube();
+        k0 += ATTN_BK;
+    }
+    if valid {
+        #[unroll]
+        for d in 0..hd {
+            out[(t * nh + head) * hd + d] = acc[d] / s;
+        }
+    }
+}
+
 /// The short conv over `m` rows. `bcx` `[m, 3e]` (`[b | c | x]` per row), `conv` taps `[l, e]`,
 /// `state` `[l - 1, e]` (the last `l - 1` values of `b * x` before this chunk; advanced in place
 /// to the last `l - 1` of this chunk), `y` `[m, e]`. One unit per channel, rows in order, the
@@ -532,8 +653,42 @@ impl Gpu {
         qo
     }
 
-    /// Causal attention for `m` rows at `pos0 ..` over the caches; returns `[m, nh * hd]`.
+    /// Causal attention for `m` rows at `pos0 ..` over the caches; returns `[m, nh * hd]`. The tiled
+    /// kernel unless `LB_ATTN_NAIVE=1` (or a shape it does not cover: `group * ATTN_BQ` > 1024 units).
     pub fn attn_prefill(&self, q: &Handle, kc: &Handle, vc: &Handle, (m, pos0, cap): (usize, usize, usize), (nh, kvh, hd): (usize, usize, usize)) -> Handle {
+        let naive = std::env::var("LB_ATTN_NAIVE").is_ok_and(|v| !v.is_empty() && v != "0");
+        if !naive && kvh > 0 && nh % kvh == 0 && (nh / kvh) * ATTN_BQ <= 1024 {
+            return self.attn_prefill_tiled(q, kc, vc, (m, pos0, cap), (nh, kvh, hd));
+        }
+        self.attn_prefill_naive(q, kc, vc, (m, pos0, cap), (nh, kvh, hd))
+    }
+
+    /// [`attn_prefill_tiled_kernel`]: one cube per (KV head, `ATTN_BQ` query rows).
+    pub fn attn_prefill_tiled(&self, q: &Handle, kc: &Handle, vc: &Handle, (m, pos0, cap): (usize, usize, usize), (nh, kvh, hd): (usize, usize, usize)) -> Handle {
+        assert!(kvh > 0 && nh % kvh == 0, "{nh} query heads over {kvh} KV heads");
+        assert!(pos0 + m <= cap, "attention rows {pos0}+{m} past a {cap} cache");
+        let group = nh / kvh;
+        let out = self.scratch(m * nh * hd * 4);
+        let p = self.upload_u32(vec![group as u32, pos0 as u32, cap as u32, nh as u32, m as u32]);
+        unsafe {
+            attn_prefill_tiled_kernel::launch(
+                &self.client,
+                CubeCount::Static(kvh as u32, m.div_ceil(ATTN_BQ) as u32, 1),
+                CubeDim::new_1d((group * ATTN_BQ) as u32),
+                BufferArg::from_raw_parts(q.clone(), m * nh * hd),
+                BufferArg::from_raw_parts(kc.clone(), kvh * cap * hd),
+                BufferArg::from_raw_parts(vc.clone(), kvh * cap * hd),
+                BufferArg::from_raw_parts(out.clone(), m * nh * hd),
+                BufferArg::from_raw_parts(p, 5),
+                BufferArg::from_raw_parts(self.const_f32(&[(hd as f32).powf(-0.5)]), 1),
+                hd,
+            );
+        }
+        out
+    }
+
+    /// [`attn_prefill_kernel`]: one cube per (query head, row); the reference for the tiled kernel.
+    pub fn attn_prefill_naive(&self, q: &Handle, kc: &Handle, vc: &Handle, (m, pos0, cap): (usize, usize, usize), (nh, kvh, hd): (usize, usize, usize)) -> Handle {
         assert!(kvh > 0 && nh % kvh == 0, "{nh} query heads over {kvh} KV heads");
         assert!(pos0 + m <= cap, "attention rows {pos0}+{m} past a {cap} cache");
         let out = self.scratch(m * nh * hd * 4);

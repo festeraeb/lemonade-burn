@@ -212,3 +212,23 @@ fn weighted_sum_rows_equals_per_token_sum() {
     }
     close(&got, &want, 0.0, 0.0, "weighted sum rows");
 }
+
+/// The tiled (flash-style) attention against the per-query kernel it replaces: same caches, same
+/// queries, LFM2's shape (32 query heads over 8 KV heads, head 64), chunks with and without earlier
+/// positions, and row counts that do not fill a tile. Summation order differs: compared to rounding.
+#[test]
+fn tiled_attention_matches_the_per_query_kernel() {
+    let Some(gpu) = gpu() else { return };
+    let mut rng = Rng(77);
+    let (nh, kvh, hd, cap) = (32usize, 8usize, 64usize, 1024usize);
+    let kc0 = vecr(&mut rng, kvh * cap * hd, 1.0);
+    let vc0 = vecr(&mut rng, kvh * cap * hd, 1.0);
+    let (kc, vc) = (gpu.upload_f32(&kc0), gpu.upload_f32(&vc0));
+    for &(pos0, m) in &[(0usize, 1usize), (0, 31), (0, 33), (0, 200), (100, 64), (512, 300), (900, 124)] {
+        let q = vecr(&mut rng, m * nh * hd, 2.0);
+        let qh = gpu.upload_f32(&q);
+        let want = read(&gpu, &gpu.attn_prefill_naive(&qh, &kc, &vc, (m, pos0, cap), (nh, kvh, hd)), m * nh * hd);
+        let got = read(&gpu, &gpu.attn_prefill_tiled(&qh, &kc, &vc, (m, pos0, cap), (nh, kvh, hd)), m * nh * hd);
+        close(&got, &want, 2e-5, 2e-6, &format!("tiled attention pos0={pos0} m={m}"));
+    }
+}
