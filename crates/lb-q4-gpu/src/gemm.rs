@@ -226,22 +226,58 @@ pub fn q4_0_gemm_kernel(
     }
 }
 
-/// f16 shared-memory row stride for the tensor-core kernel: a multiple of 8 halves (wmma needs a
-/// 16-byte `ldm`), padded past 32 so the 64 rows do not all start on one bank.
-const LDH: usize = 40;
+/// f16 shared-memory row strides for the tensor-core kernel (a multiple of 8 halves: wmma needs a
+/// 16-byte `ldm`; padded so rows spread over banks): a stage of two Q4_0 blocks (64 columns) or one.
+const LDH2: usize = 72;
+const LDH1: usize = 40;
 /// f32 staging row stride for the accumulators (a multiple of 4 floats).
 const LDS: usize = 68;
+
+/// `y[i] = f16(x[i])` over `n` values: the tensor-core GEMM's input, converted once per call
+/// instead of once per tile. `p` = `[n]`.
+#[cube(launch)]
+pub fn f32_to_f16_kernel(x: &[f32], y: &mut [half::f16], p: &[u32]) {
+    let n = p[0] as usize;
+    let mut i = ABSOLUTE_POS as usize;
+    let stride = CUBE_COUNT as usize * CUBE_DIM_X as usize;
+    while i < n {
+        y[i] = half::f16::cast_from(x[i]);
+        i += stride;
+    }
+}
+
+/// Dequantize Q4_0 word `word` (0..3) of block `gb` (all 8 of its values: value `4 j + word`) into
+/// row `rr` of a stage, block slot `b` (0 or 1) of the 64 columns. Zeros when `ok` is false.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn stage_w_f16(q: &[u32], s: &[u32], ws: &mut Shared<[half::f16]>, gb: usize, rr: usize, b: usize, word: usize, ok: bool, #[comptime] ldh: usize) {
+    if ok {
+        let w = q[gb * 4usize + word];
+        let d = f16_to_f32((s[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+        #[unroll]
+        for j in 0..8u32 {
+            ws[rr * ldh + b * 32usize + 4usize * j as usize + word] = half::f16::cast_from((f32::cast_from((w >> (4u32 * j)) & 15u32) - 8.0f32) * d);
+        }
+    } else {
+        #[unroll]
+        for j in 0..8u32 {
+            ws[rr * ldh + b * 32usize + 4usize * j as usize + word] = half::f16::cast_from(0.0f32);
+        }
+    }
+}
 
 /// The tensor-core form of [`q4_0_gemm_kernel`] (same grid, tiling, grouping and outputs), for
 /// cards with f16 cooperative matrix ops (`cmma` 16x16x16, f32 accumulate: NVIDIA sm_70+; our
 /// fleet's Turing cards). The 64 x 64 tile is 8 warps of 16 x 32: warp `w` owns rows
 /// `16 (w / 2)` and columns `32 (w % 2) .. + 32` as two accumulators (four with `gate_up`).
+/// A stage is two Q4_0 blocks (64 columns): four tensor-core steps per pair of barriers. The input
+/// `xh` is f16 (converted once per call by [`f32_to_f16_kernel`]).
 ///
 /// Numbers differ from the f32 kernel in two ways, both by design: activations are rounded to
 /// f16 before the multiply, and a weight is dequantized to f16 (`(q - 8) * d`) instead of scaling
 /// a per-block f32 partial. Accumulation is f32 throughout. This is the arithmetic llama.cpp's
 /// prefill uses on these cards (dequantize to f16, tensor-core GEMM); its cost is checked by the
-/// model-level KLD gate, not assumed (`docs/PREFILL_SPLIT.md`).
+/// model-level gates, not assumed (`docs/PREFILL_SPLIT.md`).
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn q4_0_gemm_tc_kernel(
@@ -249,7 +285,7 @@ pub fn q4_0_gemm_tc_kernel(
     gs: &[u32],
     uq: &[u32],
     us: &[u32],
-    x: &[f32],
+    xh: &[half::f16],
     routes: &[u32],
     perm: &[u32],
     tiles: &[u32],
@@ -258,7 +294,10 @@ pub fn q4_0_gemm_tc_kernel(
     #[comptime] grouped: bool,
     #[comptime] gate_up: bool,
     #[comptime] src_tok: bool,
+    #[comptime] stage2: bool,
 ) {
+    let ldh = comptime!(if stage2 { LDH2 } else { LDH1 });
+    let nb = comptime!(if stage2 { 2usize } else { 1usize });
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
     let m = dims[2] as usize;
@@ -285,11 +324,12 @@ pub fn q4_0_gemm_tc_kernel(
         }
     }
 
-    let mut xs = Shared::<[half::f16]>::new_aligned_slice(64usize * LDH, 32usize);
-    let mut ws = Shared::<[half::f16]>::new_aligned_slice(64usize * LDH, 32usize);
-    let mut ws2 = Shared::<[half::f16]>::new_aligned_slice(64usize * LDH, 32usize);
+    let mut xs = Shared::<[half::f16]>::new_aligned_slice(64usize * ldh, 32usize);
+    let mut ws = Shared::<[half::f16]>::new_aligned_slice(64usize * ldh, 32usize);
+    let mut ws2 = Shared::<[half::f16]>::new_aligned_slice(64usize * ldh, 32usize);
     let mut st = Shared::<[f32]>::new_aligned_slice(64usize * LDS, 32usize);
 
+    // staging roles: row xr of the tile, quarter `part` of the stage's 64 columns
     let xr = u / 4usize;
     let part = u % 4usize;
     let mut src = 0usize;
@@ -307,6 +347,9 @@ pub fn q4_0_gemm_tc_kernel(
         }
     }
     let wr = r0 + xr;
+    // the two Q4_0 words this unit dequantizes per stage: block slot pb, words pw and pw + 1
+    let pb = part / 2usize;
+    let pw = (part % 2usize) * 2usize;
 
     let c0 = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0f32);
     let c1 = cmma::Matrix::<f32>::from_value(cmma::MatrixIdent::Accumulator, 16usize, 16usize, 16usize, cmma::MatrixLayout::Undefined, 0.0f32);
@@ -315,62 +358,56 @@ pub fn q4_0_gemm_tc_kernel(
 
     let mut kb = 0usize;
     while kb < bpr {
-        // x: row xr, columns part*8 .. +8 of this block, rounded to f16
-        let xc = kb * 32usize + part * 8usize;
+        // x: row xr, its share of the stage's columns (16 of 64, or 8 of 32); zero past the last block
+        let per = comptime!(nb * 8usize);
+        let xc = kb * 32usize + part * per;
+        let xok = valid && kb + (part * per) / 32usize < bpr;
         #[unroll]
-        for j in 0..8usize {
-            let mut v = 0.0f32;
-            if valid {
-                v = x[src * cols + xc + j];
+        for j in 0..per {
+            let mut v = half::f16::cast_from(0.0f32);
+            if xok {
+                v = xh[src * cols + xc + j];
             }
-            xs[xr * LDH + part * 8usize + j] = half::f16::cast_from(v);
+            xs[xr * ldh + part * per + j] = v;
         }
-        // W: row xr of the tile, word `part` of its block, dequantized (q - 8) * d
-        if wr < rows {
-            let gb = base_block + wr * bpr + kb;
-            let w = gq[gb * 4usize + part];
-            let d = f16_to_f32((gs[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
-            #[unroll]
-            for j in 0..8u32 {
-                ws[xr * LDH + 4usize * j as usize + part] = half::f16::cast_from((f32::cast_from((w >> (4u32 * j)) & 15u32) - 8.0f32) * d);
-            }
+        // W: row xr; with two blocks a unit takes block pb, words pw and pw + 1; with one, word `part`
+        if stage2 {
+            let gb = base_block + wr * bpr + kb + pb;
+            let wok = wr < rows && kb + pb < bpr;
+            stage_w_f16(gq, gs, &mut ws, gb, xr, pb, pw, wok, ldh);
+            stage_w_f16(gq, gs, &mut ws, gb, xr, pb, pw + 1usize, wok, ldh);
             if gate_up {
-                let w2 = uq[gb * 4usize + part];
-                let d2 = f16_to_f32((us[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
-                #[unroll]
-                for j in 0..8u32 {
-                    ws2[xr * LDH + 4usize * j as usize + part] = half::f16::cast_from((f32::cast_from((w2 >> (4u32 * j)) & 15u32) - 8.0f32) * d2);
-                }
+                stage_w_f16(uq, us, &mut ws2, gb, xr, pb, pw, wok, ldh);
+                stage_w_f16(uq, us, &mut ws2, gb, xr, pb, pw + 1usize, wok, ldh);
             }
         } else {
-            #[unroll]
-            for j in 0..8u32 {
-                ws[xr * LDH + 4usize * j as usize + part] = half::f16::cast_from(0.0f32);
-                if gate_up {
-                    ws2[xr * LDH + 4usize * j as usize + part] = half::f16::cast_from(0.0f32);
-                }
+            let gb = base_block + wr * bpr + kb;
+            let wok = wr < rows;
+            stage_w_f16(gq, gs, &mut ws, gb, xr, 0usize, part, wok, ldh);
+            if gate_up {
+                stage_w_f16(uq, us, &mut ws2, gb, xr, 0usize, part, wok, ldh);
             }
         }
         sync_cube();
         #[unroll]
-        for ks in 0..2usize {
-            let ao = wm * 16usize * LDH + ks * 16usize;
-            let bo0 = wn * 32usize * LDH + ks * 16usize;
-            let bo1 = (wn * 32usize + 16usize) * LDH + ks * 16usize;
-            let a = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &xs[ao..64usize * LDH], LDH as u32);
-            let b0 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws[bo0..64usize * LDH], LDH as u32);
-            let b1 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws[bo1..64usize * LDH], LDH as u32);
+        for ks in 0..comptime!(nb * 2usize) {
+            let ao = wm * 16usize * ldh + ks * 16usize;
+            let bo0 = wn * 32usize * ldh + ks * 16usize;
+            let bo1 = (wn * 32usize + 16usize) * ldh + ks * 16usize;
+            let a = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::A, 16usize, 16usize, 16usize, cmma::MatrixLayout::RowMajor, &xs[ao..64usize * ldh], ldh as u32);
+            let b0 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws[bo0..64usize * ldh], ldh as u32);
+            let b1 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws[bo1..64usize * ldh], ldh as u32);
             cmma::execute(&a, &b0, &c0, &c0);
             cmma::execute(&a, &b1, &c1, &c1);
             if gate_up {
-                let b2 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws2[bo0..64usize * LDH], LDH as u32);
-                let b3 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws2[bo1..64usize * LDH], LDH as u32);
+                let b2 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws2[bo0..64usize * ldh], ldh as u32);
+                let b3 = cmma::Matrix::<half::f16>::from_slice(cmma::MatrixIdent::B, 16usize, 16usize, 16usize, cmma::MatrixLayout::ColMajor, &ws2[bo1..64usize * ldh], ldh as u32);
                 cmma::execute(&a, &b2, &c2, &c2);
                 cmma::execute(&a, &b3, &c3, &c3);
             }
         }
         sync_cube();
-        kb += 1usize;
+        kb += nb;
     }
 
     // accumulators -> shared staging -> each unit's 16 outputs (row u / 4, columns 16 (u % 4) ..)
@@ -407,6 +444,12 @@ pub fn q4_0_gemm_tc_kernel(
             }
         }
     }
+}
+
+/// Two Q4_0 blocks per tensor-core stage (`LB_TC_STAGE2=1`) or one (default): two halves the
+/// barriers but needs 45 KB of shared memory a cube, one cube per Turing SM instead of two.
+pub fn tc_stage2() -> bool {
+    std::env::var("LB_TC_STAGE2").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Sort a chunk's routed slots by expert: `perm` (slot ids, expert-major, ascending slot within an

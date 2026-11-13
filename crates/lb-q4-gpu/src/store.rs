@@ -18,13 +18,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Launch the prefill GEMM on `$gpu` with the kernel its card takes: the tensor-core form when
-/// [`Gpu::tensor_cores`], else the f32 tiles. Both take the same arguments.
+/// [`Gpu::tensor_cores`] (its input `$x` of `$n` f32 values converted to f16 first), else the f32
+/// tiles. Every other argument is the same for both.
 macro_rules! gemm_launch {
-    ($gpu:expr, $($arg:expr),+ $(,)?) => {
+    ($gpu:expr, $count:expr, $dim:expr, $gq:expr, $gs:expr, $uq:expr, $us:expr, ($x:expr, $n:expr), $($arg:expr),+ $(,)?) => {
         if $gpu.tensor_cores {
-            crate::gemm::q4_0_gemm_tc_kernel::launch(&$gpu.client, $($arg),+)
+            let xh = $gpu.to_f16(&$x, $n);
+            crate::gemm::q4_0_gemm_tc_kernel::launch(&$gpu.client, $count, $dim, $gq, $gs, $uq, $us, BufferArg::from_raw_parts(xh, $n), $($arg),+, crate::gemm::tc_stage2())
         } else {
-            crate::gemm::q4_0_gemm_kernel::launch(&$gpu.client, $($arg),+)
+            crate::gemm::q4_0_gemm_kernel::launch(&$gpu.client, $count, $dim, $gq, $gs, $uq, $us, BufferArg::from_raw_parts($x.clone(), $n), $($arg),+)
         }
     };
 }
@@ -728,6 +730,22 @@ impl Gpu {
         Ok(())
     }
 
+    /// `x` (`n` f32) as a new f16 scratch buffer (`n` halves), for the tensor-core GEMM's input.
+    pub fn to_f16(&self, x: &Handle, n: usize) -> Handle {
+        let y = self.scratch(n.div_ceil(2) * 4);
+        unsafe {
+            crate::gemm::f32_to_f16_kernel::launch(
+                &self.client,
+                cube_count(n, 256),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(x.clone(), n),
+                BufferArg::from_raw_parts(y.clone(), n),
+                BufferArg::from_raw_parts(self.upload_u32(vec![n as u32]), 1),
+            );
+        }
+        y
+    }
+
     /// Wait for everything submitted so far (a timing fence).
     pub fn sync(&self) -> Result<(), String> {
         cubecl::future::block_on(self.client.sync()).map_err(|e| format!("GPU sync failed: {e:?}"))
@@ -989,7 +1007,7 @@ impl GpuQ4Mat {
                 BufferArg::from_raw_parts(self.sc.clone(), self.n_sc),
                 BufferArg::from_raw_parts(uq, nuq),
                 BufferArg::from_raw_parts(us, nus),
-                BufferArg::from_raw_parts(x.clone(), m * self.cols),
+                (x, m * self.cols),
                 // dense: routes / perm / tiles are never read; bind any real buffer
                 BufferArg::from_raw_parts(dims.clone(), 4),
                 BufferArg::from_raw_parts(dims.clone(), 4),
@@ -1646,7 +1664,7 @@ impl GpuExpertLayer {
                 BufferArg::from_raw_parts(self.gate.2.clone(), self.gate.3),
                 BufferArg::from_raw_parts(self.up.0.clone(), self.up.1),
                 BufferArg::from_raw_parts(self.up.2.clone(), self.up.3),
-                BufferArg::from_raw_parts(x.clone(), n_tokens * self.n_embd),
+                (x, n_tokens * self.n_embd),
                 BufferArg::from_raw_parts(routes.clone(), 2 * n_slots),
                 BufferArg::from_raw_parts(perm.clone(), n_slots),
                 BufferArg::from_raw_parts(tiles.clone(), 3 * n_tiles),
@@ -1668,7 +1686,7 @@ impl GpuExpertLayer {
                 BufferArg::from_raw_parts(self.down.2.clone(), self.down.3),
                 BufferArg::from_raw_parts(self.down.0.clone(), self.down.1),
                 BufferArg::from_raw_parts(self.down.2.clone(), self.down.3),
-                BufferArg::from_raw_parts(h.clone(), n_h),
+                (h, n_h),
                 BufferArg::from_raw_parts(routes.clone(), 2 * n_slots),
                 BufferArg::from_raw_parts(perm.clone(), n_slots),
                 BufferArg::from_raw_parts(tiles.clone(), 3 * n_tiles),
