@@ -559,6 +559,9 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         // guess of the next layer (`x` is this layer's x_mid here)
                         let la = &m.store.la;
                         let x_at = (la.on && la.oracle.is_none()).then(|| { want.push((prep.x.clone(), e * 4)); want.len() - 1 });
+                        // LB_CPU_MISS: the router input comes back too (same sync), for the CPU-served misses
+                        let cpu_miss = knobs.cpu_miss();
+                        let h2_at = cpu_miss.then(|| { want.push((h2.clone(), e * 4)); want.len() - 1 });
                         if deferred {
                             deferred = false;
                             let t = Instant::now();
@@ -638,12 +641,37 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         } else {
                             Vec::new()
                         };
-                        let plan = match c.slru.plan_la(li, &needed, &keep, la.cycle_window, cfg.n_layer) {
+                        // LB_CPU_MISS: a missed expert is copied in only on its Nth miss (LB_CPU_MISS_ADMIT,
+                        // second touch by default); until then the CPU computes it from the host bytes and
+                        // the cache is not touched for it
+                        let t_cpu = Instant::now();
+                        let mut cpu_set: Vec<usize> = Vec::new();
+                        if cpu_miss {
+                            let admit = knobs.cpu_miss_admit();
+                            if c.miss_seen.is_empty() {
+                                c.miss_seen = vec![0u8; cfg.n_layer * cfg.n_expert];
+                            }
+                            for &x in &needed {
+                                if c.slru.slot(li, x).is_some() {
+                                    continue;
+                                }
+                                let seen = &mut c.miss_seen[li * cfg.n_expert + x];
+                                *seen = seen.saturating_add(1);
+                                if admit != 0 && *seen as u32 >= admit {
+                                    *seen = 0;
+                                    stage.cpu_admitted.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    cpu_set.push(x);
+                                }
+                            }
+                        }
+                        let needed_dev: Vec<usize> = needed.iter().copied().filter(|x| !cpu_set.contains(x)).collect();
+                        let plan = match c.slru.plan_la(li, &needed_dev, &keep, la.cycle_window, cfg.n_layer) {
                             Some((p, spared)) => {
                                 stage.la_spared.fetch_add(spared, Ordering::Relaxed);
                                 p
                             }
-                            None => return abandon(m, cache, &format!("layer {li}: {} experts > {} cache slots", needed.len(), c.slru.n_slots())),
+                            None => return abandon(m, cache, &format!("layer {li}: {} experts > {} cache slots", needed_dev.len(), c.slru.n_slots())),
                         };
                         if la.promote > 0 {
                             if let Some(g) = guess.as_ref() {
@@ -690,7 +718,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         let (n_hit, n_fill) = (plan.hits.len(), plan.fills.len());
                         let n_demand = n_fill - n_landed;
                         m.stats.gpu_hits.fetch_add(n_hit as u64, Ordering::Relaxed);
-                        m.stats.on_demand.fetch_add(n_fill as u64, Ordering::Relaxed);
+                        m.stats.on_demand.fetch_add((n_fill + cpu_set.len()) as u64, Ordering::Relaxed);
                         m.stats.on_demand_ns.fetch_add(t_fill.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         stage.layer(li, n_hit, n_landed, n_demand);
                         stage.moe_layers.fetch_add(1, Ordering::Relaxed);
@@ -698,13 +726,38 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                             stage.miss_layers.fetch_add(1, Ordering::Relaxed);
                         }
                         for (i, &x) in ids.iter().enumerate() {
-                            slot_words[2 * (base + i)] = c.phys[c.slru.slot(li, x as usize).expect("planned")];
+                            // a CPU-served expert reads slot 0 (its output is overwritten below)
+                            slot_words[2 * (base + i)] = match c.slru.slot(li, x as usize) {
+                                Some(s) => c.phys[s],
+                                None => {
+                                    debug_assert!(cpu_set.contains(&(x as usize)), "planned");
+                                    c.phys[0]
+                                }
+                            };
                         }
                         gpu.write_u32(&prep.slot_routes, &slot_words);
                         if let Some(f) = fence.take() {
                             c.slots.fence(gpu, &f);
                         }
                         let (outs, _) = c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used);
+                        // the card runs the hits while the CPU computes the misses; each CPU output
+                        // overwrites its route's row of `outs` (stream-ordered after the kernels) before
+                        // the weighted sum, which keeps the ascending-expert-id order
+                        if !cpu_set.is_empty() {
+                            let hv: Vec<f32> = bufs[h2_at.expect("cpu_miss reads h2")].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                            let t_k = Instant::now();
+                            let ys = crate::moe::expert_ffn_batch(&m.w, gate, up, down, &cpu_set, &hv, knobs.cpu_i8());
+                            stage.cpu_kernel_ns.fetch_add(t_k.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            let res: Vec<(usize, Vec<f32>)> = cpu_set.iter().copied().zip(ys).collect();
+                            for (x, y) in res {
+                                let i = ids.iter().position(|&v| v as usize == x).expect("a needed expert is routed");
+                                let row = outs.clone().offset_start((i * e * 4) as u64).offset_end(((k_used - 1 - i) * e * 4) as u64);
+                                gpu.write_f32(&row, &y);
+                            }
+                            stage.cpu_misses.fetch_add(cpu_set.len() as u64, Ordering::Relaxed);
+                            stage.cpu_miss_layers.fetch_add(1, Ordering::Relaxed);
+                            stage.cpu_miss_ns.fetch_add(t_cpu.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
                         let sum = gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots));
                         // landings this layer did not use were wrong guesses: they cost bus, nothing else
                         if let Some(l) = c.landings.as_mut() {

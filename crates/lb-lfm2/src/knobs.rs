@@ -7,7 +7,7 @@
 //! change them.
 
 use crate::moe::MissPolicy;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 /// Settings the model reads live. Defaults match the engine's behaviour before this existed:
 /// `cpu` misses, device repack, batched miss uploads.
@@ -53,6 +53,15 @@ pub struct Knobs {
     /// the router spread over one cube per expert, and the expert-sum order worked out once per cube.
     /// `LB_DD_FAST=1` at start; off by default until its gates have passed. Live.
     dd_fast: AtomicBool,
+    /// Engine step E2, miss policy: a cache miss is computed on the CPU from the host-resident
+    /// GGUF bytes and its output joins the device token, instead of copying the expert to the card.
+    /// The kernel is the exact f32 SIMD one, or the int8 one with `cpu_i8`. `LB_CPU_MISS=1` at
+    /// start; off by default. Live.
+    cpu_miss: AtomicBool,
+    /// With `cpu_miss`: a missed expert is copied into the cache on its Nth miss (second touch by
+    /// default); before that it is computed on the CPU. 0 = never copy (cache frozen at its seed),
+    /// 1 = always copy (no CPU work). `LB_CPU_MISS_ADMIT=N`. Live.
+    cpu_miss_admit: AtomicU32,
 }
 
 fn env_on(k: &str) -> bool {
@@ -78,6 +87,8 @@ impl Default for Knobs {
             cpu_i8: AtomicBool::new(env_on("LB_CPU_I8")),
             dd_graph: AtomicBool::new(env_on("LB_DD_GRAPH")),
             dd_fast: AtomicBool::new(env_or("LB_DD_FAST", true)),
+            cpu_miss: AtomicBool::new(env_on("LB_CPU_MISS")),
+            cpu_miss_admit: AtomicU32::new(std::env::var("LB_CPU_MISS_ADMIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)),
         }
     }
 }
@@ -173,6 +184,22 @@ impl Knobs {
     pub fn set_dd_fast(&self, on: bool) {
         self.dd_fast.store(on, Ordering::Relaxed);
     }
+
+    pub fn cpu_miss(&self) -> bool {
+        self.cpu_miss.load(Ordering::Relaxed)
+    }
+
+    pub fn set_cpu_miss(&self, on: bool) {
+        self.cpu_miss.store(on, Ordering::Relaxed);
+    }
+
+    pub fn cpu_miss_admit(&self) -> u32 {
+        self.cpu_miss_admit.load(Ordering::Relaxed)
+    }
+
+    pub fn set_cpu_miss_admit(&self, n: u32) {
+        self.cpu_miss_admit.store(n, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -199,6 +226,7 @@ mod tests {
             (Knobs::dd_router_seq, Knobs::set_dd_router_seq),
             (Knobs::dd_graph, Knobs::set_dd_graph),
             (Knobs::dd_fast, Knobs::set_dd_fast),
+            (Knobs::cpu_miss, Knobs::set_cpu_miss),
         ] {
             let b = get(&k);
             set(&k, !b);

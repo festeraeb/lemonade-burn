@@ -367,6 +367,15 @@ pub struct StageStats {
     pub la_spared: AtomicU64,
     pub la_promoted: AtomicU64,
     pub la_guess_ns: AtomicU64,
+    /// CPU-computed misses (`LB_CPU_MISS`): experts served on the CPU, layers that had one, host
+    /// time computing them, and time from the router read to the outputs being queued (the layer's
+    /// whole host-side miss cost), and misses admitted to the cache by the second-touch rule.
+    pub cpu_misses: AtomicU64,
+    pub cpu_miss_layers: AtomicU64,
+    pub cpu_miss_ns: AtomicU64,
+    pub cpu_admitted: AtomicU64,
+    /// Of `cpu_miss_ns`, the time inside the expert batch itself (barriers + kernels).
+    pub cpu_kernel_ns: AtomicU64,
     attn: std::sync::Mutex<Vec<bool>>,
 }
 
@@ -407,6 +416,11 @@ impl Default for StageStats {
             la_spared: AtomicU64::new(0),
             la_promoted: AtomicU64::new(0),
             la_guess_ns: AtomicU64::new(0),
+            cpu_misses: AtomicU64::new(0),
+            cpu_miss_layers: AtomicU64::new(0),
+            cpu_miss_ns: AtomicU64::new(0),
+            cpu_admitted: AtomicU64::new(0),
+            cpu_kernel_ns: AtomicU64::new(0),
             attn: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -484,6 +498,11 @@ impl StageStats {
             "la_spared_per_token": per_tok(self.la_spared.load(o)),
             "la_promoted_per_token": per_tok(self.la_promoted.load(o)),
             "la_guess_ms_per_token": per_tok(self.la_guess_ns.load(o)) / 1e6,
+            "cpu_misses_per_token": per_tok(self.cpu_misses.load(o)),
+            "cpu_miss_layers_per_token": per_tok(self.cpu_miss_layers.load(o)),
+            "cpu_miss_ms_per_token": per_tok(self.cpu_miss_ns.load(o)) / 1e6,
+            "cpu_kernel_ms_per_token": per_tok(self.cpu_kernel_ns.load(o)) / 1e6,
+            "cpu_admitted_per_token": per_tok(self.cpu_admitted.load(o)),
         })
     }
 }

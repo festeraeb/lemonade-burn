@@ -19,6 +19,7 @@ pub mod expert;
 pub mod host;
 pub mod model;
 pub mod placement;
+pub mod spin;
 #[cfg(feature = "rdma")]
 pub mod rdma;
 pub mod testgguf;

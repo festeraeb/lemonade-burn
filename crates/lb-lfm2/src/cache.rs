@@ -436,12 +436,14 @@ mod dev {
         pub worker: Option<crate::stage::GuessWorker>,
         /// `LB_LA_ORACLE`: the decode passes of a recorded session and the replay position.
         pub oracle: Option<(Vec<(usize, Vec<usize>)>, usize)>,
+        /// `LB_CPU_MISS`: misses seen per (layer, expert) since it last held a slot, for the admit rule.
+        pub miss_seen: Vec<u8>,
     }
 
     impl ExpertCache {
         pub fn new(slru: Slru, slots: ExpertSlots) -> Self {
             let phys = (0..slru.n_slots() as u32).collect();
-            Self { slru, slots, fills: AtomicU64::new(0), seeds: 0, phys, spares: Vec::new(), landings: None, trace: None, worker: None, oracle: None }
+            Self { slru, slots, fills: AtomicU64::new(0), seeds: 0, phys, spares: Vec::new(), landings: None, trace: None, worker: None, oracle: None, miss_seen: Vec::new() }
         }
 
         /// Record one layer pass for the offline simulator (`LB_LA_TRACE`, off by default).

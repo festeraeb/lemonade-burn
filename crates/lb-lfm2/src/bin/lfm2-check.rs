@@ -98,6 +98,15 @@ struct Args {
     /// experts it places on hosts are computed there for every arm of the run.
     #[arg(long, env = "LB_W2W_PLACEMENT")]
     w2w_placement: Option<PathBuf>,
+    /// With `--gpu`: run the dynamic expert cache (engine step E2, as the server does) with this many
+    /// MiB of expert VRAM instead of a static placement; `--placement-from-scrapes` seeds it.
+    #[arg(long, default_value_t = 0)]
+    cache_mb: usize,
+    /// Teacher-forced reference file over the `--prompt`s (device decode, one token per pass). If the
+    /// file does not exist it is written (full logits of every position); if it exists this run is
+    /// compared with it: top-1 agreement % and max |logit diff|, per prompt and in total.
+    #[arg(long)]
+    tf_ref: Option<PathBuf>,
     /// Actually upload the planned residents to the GPU (LB_WGPU_DEVICE) and run them there
     /// (needs the `gpu` feature); without it the placement is only a counted shadow.
     #[arg(long, default_value_t = false)]
@@ -149,7 +158,7 @@ fn main() -> Result<()> {
             eprintln!("uploaded {n} experts ({:.0} MB, {} stacked layers) in {:.1}s", model.store.bytes as f64 / 1e6, stacked_layers(&model), t.elapsed().as_secs_f32());
         }
     }
-    if let Some(dir) = &args.placement_from_scrapes {
+    if let Some(dir) = args.placement_from_scrapes.as_ref().filter(|_| args.cache_mb == 0) {
         use lb_lfm2::moe::{Histogram, Placement};
         let scrapes = lb_lfm2::moe::read_scrape_dir(dir)?;
         let hist = Histogram::from_scrapes("lfm2.5-24b-a2b", cfg.n_layer, cfg.n_expert, &scrapes);
@@ -178,6 +187,22 @@ fn main() -> Result<()> {
         }
         #[cfg(not(feature = "gpu"))]
         anyhow::bail!("--gpu-dense-mb needs the gpu feature");
+    }
+    #[cfg(feature = "gpu")]
+    if args.cache_mb > 0 && args.gpu {
+        let scrapes = match &args.placement_from_scrapes {
+            Some(dir) => lb_lfm2::moe::read_scrape_dir(dir)?,
+            None => Vec::new(),
+        };
+        let order = lb_lfm2::moe::Histogram::from_scrapes("lfm2", cfg.n_layer, cfg.n_expert, &scrapes).heat_order();
+        let budget = args.cache_mb * 1024 * 1024;
+        let eb = (0..cfg.n_layer).map(|l| model.w.expert_bytes(l)).max().unwrap_or(1).max(1);
+        let seed: Vec<(usize, usize)> = order.iter().take(budget / eb).rev().copied().collect();
+        model.store.la = lb_lfm2::stage::LookaheadCfg::from_env();
+        let la = model.store.la.clone();
+        let (n_slots, bytes) = model.enable_cache_la(budget, 8, la.n_landings(), &seed).map_err(|e| anyhow::anyhow!(e))?;
+        model.knobs().set_dd_host_moe(true);
+        eprintln!("expert cache: {n_slots} slots, {:.0} MiB, seeded {}", bytes as f64 / 1048576.0, seed.len().min(n_slots));
     }
     #[cfg(feature = "gpu")]
     let in_box = match &args.w2w_placement {
@@ -225,6 +250,9 @@ fn main() -> Result<()> {
             (None, None) => anyhow::bail!("give --tokenizer or --oracle"),
         }
     };
+    if let Some(path) = &args.tf_ref {
+        return tf_ref(&args, &model, &tokenize, path);
+    }
     if args.ab_device {
         return ab_device(&args, &model, &tokenize, codec.as_ref());
     }
@@ -434,6 +462,60 @@ fn sha16(text: &str) -> String {
     use sha2::{Digest, Sha256};
     let d = Sha256::digest(text.as_bytes());
     d.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// `--tf-ref`: teacher-forced device decode over the prompts; write the logits, or compare with them.
+fn tf_ref(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32>>, path: &std::path::Path) -> Result<()> {
+    use std::io::{Read, Write};
+    let cfg = model.cfg().clone();
+    let compare = path.exists();
+    let mut file_r = if compare { Some(std::io::BufReader::new(std::fs::File::open(path)?)) } else { None };
+    let mut file_w = if compare { None } else { Some(std::io::BufWriter::new(std::fs::File::create(path)?)) };
+    let (mut pos_all, mut agree_all, mut worst_all, mut kld_sum) = (0usize, 0usize, 0f32, 0f64);
+    let mut rows = Vec::new();
+    for (pi, prompt) in args.prompts.iter().enumerate() {
+        let mut ids = tokenize(prompt)?;
+        if args.bos {
+            ids.insert(0, cfg.bos);
+        }
+        let arm = run_arm(model, &ids, true, false);
+        println!("prompt {pi}: {} positions, {:.2} tok/s, device tokens {} fallbacks {}", ids.len(), ids.len() as f64 / arm.secs, arm.dd_tokens, arm.dd_fallbacks);
+        let (mut agree, mut worst) = (0usize, 0f32);
+        for (i, row) in arm.logits.iter().enumerate() {
+            if let Some(w) = file_w.as_mut() {
+                for v in row {
+                    w.write_all(&v.to_le_bytes())?;
+                }
+            }
+            if let Some(r) = file_r.as_mut() {
+                let mut buf = vec![0u8; row.len() * 4];
+                r.read_exact(&mut buf)?;
+                let refr: Vec<f32> = buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                agree += (argmax(&refr) == arm.top1[i]) as usize;
+                worst = worst.max(max_abs_diff(&refr, row));
+                // KLD(ref || this)
+                let lse = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); m as f64 + v.iter().map(|x| ((x - m) as f64).exp()).sum::<f64>().ln() };
+                let (lr, lt) = (lse(&refr), lse(row));
+                kld_sum += refr.iter().zip(row).map(|(a, b)| { let p = ((*a as f64) - lr).exp(); p * ((*a as f64 - lr) - (*b as f64 - lt)) }).sum::<f64>();
+            }
+        }
+        if compare {
+            println!("  top-1 == reference {agree}/{} ({:.2} %), max |logit diff| {worst:.3e}", ids.len(), 100.0 * agree as f64 / ids.len() as f64);
+            rows.push(json!({"prompt": pi, "positions": ids.len(), "agree": agree, "max_abs_logit_diff": worst}));
+        }
+        pos_all += ids.len();
+        agree_all += agree;
+        worst_all = worst_all.max(worst);
+    }
+    if compare {
+        println!("TOTAL top-1 == reference {agree_all}/{pos_all} ({:.2} %), max |logit diff| {worst_all:.3e}, mean KLD(ref||this) {:.3e}", 100.0 * agree_all as f64 / pos_all as f64, kld_sum / pos_all as f64);
+        if let Some(rp) = &args.report {
+            std::fs::write(rp, serde_json::to_string_pretty(&json!({"positions": pos_all, "agree": agree_all, "agree_pct": 100.0 * agree_all as f64 / pos_all as f64, "max_abs_logit_diff": worst_all, "mean_kld": kld_sum / pos_all as f64, "per_prompt": rows}))?)?;
+        }
+    } else {
+        println!("reference written: {pos_all} positions to {}", path.display());
+    }
+    Ok(())
 }
 
 /// `--ab-device`: the parity gates of `docs/DEVICE_DECODE_PLAN.md` D1, old path vs device path,

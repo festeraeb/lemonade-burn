@@ -463,6 +463,23 @@ pub fn expert_ffn_i8(w: &Weights, gate: &ExpertMats, up: &ExpertMats, down: &Exp
     lb_expert_host::expert::swiglu_i8(w.mat(&gate.expert(e)), w.mat(&up.expert(e)), w.mat(&down.expert(e)), x, m)
 }
 
+/// [`expert_ffn`] on the exact SIMD kernel (`lb_gguf::kernels_f32x`): the CPU-miss arm that keeps f32 activations.
+pub fn expert_ffn_f32x(w: &Weights, gate: &ExpertMats, up: &ExpertMats, down: &ExpertMats, e: usize, x: &[f32], m: usize) -> Vec<f32> {
+    lb_expert_host::expert::swiglu_f32x(w.mat(&gate.expert(e)), w.mat(&up.expert(e)), w.mat(&down.expert(e)), x, m)
+}
+
+/// The CPU-miss batch: experts `ids` of one layer on one activation row, on the spinning pool
+/// (`lb_expert_host::spin`), exact f32 kernel or int8 (`i8`). Weights that are not all Q4_0 take the
+/// rayon path of [`expert_ffn`] / [`expert_ffn_i8`].
+pub fn expert_ffn_batch(w: &Weights, gate: &ExpertMats, up: &ExpertMats, down: &ExpertMats, ids: &[usize], x: &[f32], i8: bool) -> Vec<Vec<f32>> {
+    let mats: Vec<_> = ids.iter().map(|&e| (w.mat(&gate.expert(e)), w.mat(&up.expert(e)), w.mat(&down.expert(e)))).collect();
+    let q4 = mats.iter().all(|(g, u, d)| g.ty == lb_gguf::GgmlType::Q4_0 && u.ty == lb_gguf::GgmlType::Q4_0 && d.ty == lb_gguf::GgmlType::Q4_0);
+    if q4 && !mats.is_empty() {
+        return lb_expert_host::spin::swiglu_batch(lb_expert_host::spin::global(), &mats, x, i8);
+    }
+    ids.iter().map(|&e| if i8 { expert_ffn_i8(w, gate, up, down, e, x, 1) } else { expert_ffn(w, gate, up, down, e, x, 1) }).collect()
+}
+
 /// MoE FFN for `m` tokens: route each token, group tokens by expert, run each expert once
 /// on its tokens, and add the weighted outputs. Returns `[m, n_embd]` and the routes.
 #[allow(clippy::too_many_arguments)]
