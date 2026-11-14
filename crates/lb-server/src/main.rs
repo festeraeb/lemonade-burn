@@ -248,8 +248,36 @@ fn prompt_cache_tail() -> usize {
     std::env::var("LB_PROMPT_CACHE_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
 }
 
+/// Run a short throwaway sequence before the first request, so one-time costs (device kernels
+/// are compiled on first use) are paid at start-up and not inside the first user's wait.
+/// `LB_WARMUP` = prompt tokens to run (default 96; 0 = off).
+fn warm_up<D: Decoder>(model: &D) {
+    let n: usize = std::env::var("LB_WARMUP").ok().and_then(|v| v.parse().ok()).unwrap_or(96);
+    if n == 0 {
+        return;
+    }
+    let t = Instant::now();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let n = n.min(model.max_context().saturating_sub(4)).max(2);
+        let toks = vec![model.bos(); n];
+        let mut cache = model.new_cache();
+        let cut = n - (n / 3).max(1);
+        model.forward(&toks[..cut], &mut cache, false);
+        let _ = model.checkpoint(&mut cache);
+        model.forward(&toks[cut..], &mut cache, false);
+        for _ in 0..2 {
+            model.forward(&[model.bos()], &mut cache, false);
+        }
+    }));
+    match res {
+        Ok(()) => eprintln!("lemonade-burn-server: warm-up of {n} tokens took {:.1}s", t.elapsed().as_secs_f64()),
+        Err(_) => eprintln!("lemonade-burn-server: warm-up failed (ignored); the first request pays the one-time costs"),
+    }
+}
+
 fn worker<D: Decoder>(model: D, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
     let mut session: Option<Session<D>> = None;
+    warm_up(&model);
     while let Ok(job) = rx.recv() {
         // the session is taken out for the job: a panic mid-pass leaves none behind
         let prev = if prompt_cache_on() { session.take() } else { None };
