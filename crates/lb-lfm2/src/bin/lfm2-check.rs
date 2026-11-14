@@ -59,6 +59,9 @@ struct Args {
     /// then `--ab-rounds` A-B-B-A blocks of `--greedy-n` greedy tokens (sha + tok/s per arm).
     #[arg(long, default_value_t = false)]
     ab_graph: bool,
+    /// Knobs switched on in the B arm of `--ab-graph` (arm A has all of them off): `graph`, `fast`.
+    #[arg(long, value_delimiter = ',', default_value = "graph")]
+    b_knobs: Vec<String>,
     /// Prompt for the greedy part of `--ab-device` (c4_e2e.sh's by default).
     #[arg(long, default_value = "Explain in two sentences why a sonar return from a hard sand bottom differs from one over silt.")]
     greedy_prompt: String,
@@ -719,11 +722,19 @@ fn ab_math(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32>
     Ok(())
 }
 
+/// The `--b-knobs` list on (`on`) or off.
+#[cfg(feature = "gpu")]
+fn set_b_knobs(model: &Lfm2, list: &[String], on: bool) {
+    let k = model.knobs();
+    k.set_dd_graph(on && list.iter().any(|s| s == "graph"));
+    k.set_dd_fast(on && list.iter().any(|s| s == "fast"));
+}
+
 /// `--launch-trace`: what one decode token launches. Prefill the greedy prompt, warm a few device
-/// tokens, then (1) one token in count mode, (2) several in sync mode where every launch is followed
-/// by a device wait (its time = queue + device + the sync round trip; the floor of an empty launch,
-/// measured here, is subtracted to estimate the device time), (3) a plain timed run giving the wall
-/// time per token and how much of it is spent issuing (everything before the read-back).
+/// tokens, then (1) count mode: launches per token and the host time between launches (queue),
+/// (2) device-time mode: every launch bracketed by two CUDA events, nothing waited on in between,
+/// (3) a plain timed run giving the wall time per token and how much of it is spent issuing
+/// (everything before the read-back).
 #[cfg(feature = "gpu")]
 fn launch_trace(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32>>) -> Result<()> {
     use std::collections::BTreeMap;
@@ -735,6 +746,8 @@ fn launch_trace(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec
         ids.insert(0, cfg.bos);
     }
     model.knobs().set_device_decode(true);
+    // `--b-knobs fast` traces the token with the fast kernels; the graph is never on in a trace
+    set_b_knobs(model, &args.b_knobs, true);
     model.knobs().set_dd_graph(false);
     let mut cache = model.new_cache();
     let mut next = argmax(&logits_row(model.forward(&ids, &mut cache, false)));
@@ -858,9 +871,9 @@ fn ab_graph(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32
         if args.bos {
             ids.insert(0, cfg.bos);
         }
-        model.knobs().set_dd_graph(false);
+        set_b_knobs(model, &args.b_knobs, false);
         let base = run_arm(model, &ids, true, false);
-        model.knobs().set_dd_graph(true);
+        set_b_knobs(model, &args.b_knobs, true);
         let c0 = model.timings.dd_graph_replays.load(Relaxed);
         let arm = run_arm(model, &ids, true, false);
         let replays = model.timings.dd_graph_replays.load(Relaxed) - c0;
@@ -886,7 +899,7 @@ fn ab_graph(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32
     let mut shas: [Vec<String>; 2] = [Vec::new(), Vec::new()];
     for block in 0..args.ab_rounds {
         for (k, &arm) in [false, true, true, false].iter().enumerate() {
-            model.knobs().set_dd_graph(arm);
+            set_b_knobs(model, &args.b_knobs, arm);
             let (r0, c0) = (model.timings.dd_graph_replays.load(Relaxed), model.timings.dd_graph_captures.load(Relaxed));
             let (g, _, secs, dd) = greedy_arm(model, &ids, args.greedy_n, true, cfg.eos);
             let sha = sha16(&text(&g));
@@ -903,10 +916,10 @@ fn ab_graph(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32
     let same = shas[0].iter().chain(shas[1].iter()).all(|x| Some(x) == shas[0].first());
     println!("greedy decode: launches {ma:.2} tok/s, graph {mb:.2} tok/s, ratio {:.3}x; all {} shas equal: {same} ({})", mb / ma, shas[0].len() + shas[1].len(), shas[0].first().cloned().unwrap_or_default());
     report.push(json!({"kind": "summary", "launch_tok_s": ma, "graph_tok_s": mb, "ratio": mb / ma, "all_shas_equal": same, "sha": shas[0].first()}));
-    model.knobs().set_dd_graph(false);
+    set_b_knobs(model, &args.b_knobs, false);
     model.knobs().set_device_decode(false);
     if let Some(p) = &args.report {
-        std::fs::write(p, serde_json::to_string_pretty(&json!({"model": args.model, "device": gpu.name, "cc": gpu.compute_capability, "rows": report}))?)?;
+        std::fs::write(p, serde_json::to_string_pretty(&json!({"model": args.model, "device": gpu.name, "cc": gpu.compute_capability, "b_knobs": args.b_knobs, "rows": report}))?)?;
     }
     Ok(())
 }

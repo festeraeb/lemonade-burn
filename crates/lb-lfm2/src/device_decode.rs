@@ -74,6 +74,8 @@ pub struct Prep {
     pub(crate) rope: Option<(Handle, usize)>,
     /// Bumped whenever `rope` is rebuilt (a graph recorded against the old table is stale).
     rope_gen: u64,
+    /// Router scratch for the split router (`LB_DD_FAST`): probs and score, `n_expert` f32 each.
+    rscratch: (Handle, Handle),
     /// The captured token (`LB_DD_GRAPH`), for the sequence whose `DevCache::gen` it names.
     graph: Option<GraphSlot>,
     tp: TokenParams,
@@ -243,6 +245,7 @@ impl Prep {
             guess: std::env::var("LB_DEVICE_GUESS").is_ok_and(|v| !v.is_empty() && v != "0").then(|| (gpu.upload_u32(vec![0u32; 2 * n_slots]), gpu.upload_f32(&vec![0f32; n_slots]))),
             rope: None,
             rope_gen: 0,
+            rscratch: (gpu.upload_f32(&vec![0f32; cfg.n_expert.max(1)]), gpu.upload_f32(&vec![0f32; cfg.n_expert.max(1)])),
             graph: None,
             tp: TokenParams::new(gpu, 0, 1, 1),
             blocker,
@@ -421,6 +424,10 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     let mut y: Option<Handle> = None;
     // fused glue launches (`LB_DD_FUSE=0` keeps one kernel per step): norm+router, sum+next norm
     let fuse = m.store.remote.is_none() && std::env::var("LB_DD_FUSE").map(|v| !v.is_empty() && v != "0").unwrap_or(true);
+    // LB_DD_FAST: the router over one cube per expert, the expert sum's slot order once per cube
+    let fast = knobs.dd_fast();
+    let fast_router = fast && gpu.router_split_ok(knobs.dd_router_seq());
+    let fast_sum = fast && k_used <= 16;
     let mut pend: Option<(Handle, usize)> = None;
     let mut dev_moe = 0u64;
     let mut inbox_layers = 0u64;
@@ -455,7 +462,8 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             }
             let h = match pend.take() {
                 // the previous layer's expert sum, folded into this pre-norm's launch
-                Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &lp.attn_norm, (k_used, e, base, prep.n_slots), eps),
+            Some((outs, base)) if fast_sum => gpu.sum_add_rms_norm_ord(&outs, &prep.weights, &prep.routes, &prep.x, &lp.attn_norm, (k_used, e, base, prep.n_slots), eps),
+            Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &lp.attn_norm, (k_used, e, base, prep.n_slots), eps),
                 None => gpu.add_rms_norm(&prep.x, y.as_ref(), &lp.attn_norm, e, eps),
             };
             let op_out = match (&layer.op, &lp.op) {
@@ -485,7 +493,13 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             let h2 = if fused {
                 let (rh, bh) = lp.router.as_ref().expect("checked");
                 let base = lp.moe_index.expect("checked") * k_used;
-                gpu.add_rms_norm_route(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, base, prep.n_slots), knobs.dd_router_seq())
+                if fast_router {
+                    let h2 = gpu.add_rms_norm(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps);
+                    gpu.router_topk_split(&h2, rh, bh, &prep.rscratch, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots));
+                    h2
+                } else {
+                    gpu.add_rms_norm_route(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, base, prep.n_slots), knobs.dd_router_seq())
+                }
             } else {
                 gpu.add_rms_norm(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps)
             };
@@ -770,7 +784,8 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             }
         }
         let hf = match pend.take() {
-            Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &prep.final_norm, (k_used, e, base, prep.n_slots), eps),
+        Some((outs, base)) if fast_sum => gpu.sum_add_rms_norm_ord(&outs, &prep.weights, &prep.routes, &prep.x, &prep.final_norm, (k_used, e, base, prep.n_slots), eps),
+        Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &prep.final_norm, (k_used, e, base, prep.n_slots), eps),
             None => gpu.add_rms_norm(&prep.x, y.as_ref(), &prep.final_norm, e, eps),
         };
         let logits_h = match head(m).expect("checked in Prep::new") {
