@@ -44,6 +44,15 @@ pub struct Knobs {
     /// instead of the f32 reference: faster, slightly different arithmetic. `LB_CPU_I8=1` at
     /// start; off by default until its accuracy gate has passed.
     cpu_i8: AtomicBool,
+    /// Replay a device decode token as one captured CUDA graph (`device_decode.rs`, cubecl-cuda's
+    /// `start_capture` / `Graph::replay`) instead of issuing its ~390 launches one by one. Same
+    /// kernels, same arguments, same order: the logits are bit-identical. `LB_DD_GRAPH=1` at
+    /// start; off by default until its gates have passed. Live.
+    dd_graph: AtomicBool,
+    /// Device-time cuts in the decode token that keep every result bit for bit (`device_decode.rs`):
+    /// the router spread over one cube per expert, and the expert-sum order worked out once per cube.
+    /// `LB_DD_FAST=1` at start; off by default until its gates have passed. Live.
+    dd_fast: AtomicBool,
 }
 
 fn env_on(k: &str) -> bool {
@@ -67,6 +76,8 @@ impl Default for Knobs {
             dd_router_seq: AtomicBool::new(env_on("LB_DD_ROUTER_SEQ")),
             device_prefill: AtomicBool::new(env_on("LB_DEVICE_PREFILL")),
             cpu_i8: AtomicBool::new(env_on("LB_CPU_I8")),
+            dd_graph: AtomicBool::new(env_on("LB_DD_GRAPH")),
+            dd_fast: AtomicBool::new(env_on("LB_DD_FAST")),
         }
     }
 }
@@ -146,6 +157,22 @@ impl Knobs {
     pub fn set_dd_router_seq(&self, on: bool) {
         self.dd_router_seq.store(on, Ordering::Relaxed);
     }
+
+    pub fn dd_graph(&self) -> bool {
+        self.dd_graph.load(Ordering::Relaxed)
+    }
+
+    pub fn set_dd_graph(&self, on: bool) {
+        self.dd_graph.store(on, Ordering::Relaxed);
+    }
+
+    pub fn dd_fast(&self) -> bool {
+        self.dd_fast.load(Ordering::Relaxed)
+    }
+
+    pub fn set_dd_fast(&self, on: bool) {
+        self.dd_fast.store(on, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +197,8 @@ mod tests {
             (Knobs::device_decode as fn(&Knobs) -> bool, Knobs::set_device_decode as fn(&Knobs, bool)),
             (Knobs::dd_host_moe, Knobs::set_dd_host_moe),
             (Knobs::dd_router_seq, Knobs::set_dd_router_seq),
+            (Knobs::dd_graph, Knobs::set_dd_graph),
+            (Knobs::dd_fast, Knobs::set_dd_fast),
         ] {
             let b = get(&k);
             set(&k, !b);

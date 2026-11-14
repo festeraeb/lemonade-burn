@@ -85,6 +85,8 @@ enum Change {
     DeviceDecode(bool),
     DdHostMoe(bool),
     DdRouterSeq(bool),
+    DdFast(bool),
+    DdGraph(bool),
     ScrapeDir(Option<PathBuf>),
     ScrapeModelId(String),
     ScrapeClassId(String),
@@ -156,6 +158,10 @@ impl Tunables {
                 "description": "inside a device-resident token, run a MoE layer that is not resident on the host path (one sync for that layer) instead of giving the whole token to the old path"}));
             v.push(json!({"name": "dd_router_seq", "value": k.dd_router_seq(), "type": "bool", "scope": "live", "source": "LB_DD_ROUTER_SEQ",
                 "description": "device router logits as one sequential dot per expert (the host's summation order) instead of a plane reduce; slower, for parity checks"}));
+            v.push(json!({"name": "dd_fast", "value": k.dd_fast(), "type": "bool", "scope": "live", "source": "LB_DD_FAST",
+                "description": "device decode: the router spread over one cube per expert and the expert-sum order worked out once per cube; bit-identical logits, fewer device microseconds a token"}));
+            v.push(json!({"name": "dd_graph", "value": k.dd_graph(), "type": "bool", "scope": "live", "source": "LB_DD_GRAPH",
+                "description": "device decode: replay a token as one captured CUDA graph (cuda runtime, all layers resident); bit-identical logits; measured no faster on a P100 (the token is device bound)"}));
         }
         if let Some(s) = &self.live.scraper {
             v.push(json!({"name": "scrape_dir", "value": s.dir().map(|p| p.to_string_lossy().into_owned()), "type": "path|null", "scope": "live", "source": "NAUTIBURN_SCRAPE_DIR",
@@ -209,6 +215,14 @@ impl Tunables {
             "dd_router_seq" => {
                 knobs.ok_or_else(not_lfm2)?;
                 as_bool(value).map(Change::DdRouterSeq)
+            }
+            "dd_fast" => {
+                knobs.ok_or_else(not_lfm2)?;
+                as_bool(value).map(Change::DdFast)
+            }
+            "dd_graph" => {
+                knobs.ok_or_else(not_lfm2)?;
+                as_bool(value).map(Change::DdGraph)
             }
             "scrape_dir" => {
                 scraper.ok_or_else(not_lfm2)?;
@@ -274,6 +288,14 @@ impl Tunables {
                     self.live.knobs.as_ref().expect("validated").set_dd_router_seq(b);
                     json!(b)
                 }
+                Change::DdFast(b) => {
+                    self.live.knobs.as_ref().expect("validated").set_dd_fast(b);
+                    json!(b)
+                }
+                Change::DdGraph(b) => {
+                    self.live.knobs.as_ref().expect("validated").set_dd_graph(b);
+                    json!(b)
+                }
                 Change::ScrapeDir(d) => {
                     let s = self.live.scraper.as_ref().expect("validated");
                     s.set_dir(d);
@@ -336,7 +358,7 @@ mod tests {
         if std::env::var_os("LB_DEVICE_DECODE").is_none() {
             assert_eq!(entry(&d, "device_decode")["value"], true, "on unless LB_DEVICE_DECODE=0");
         }
-        for live in ["miss_policy", "host_repack", "batch_miss", "device_decode", "dd_host_moe", "dd_router_seq", "scrape_dir", "scrape_model_id", "scrape_class_id", "default_max_tokens"] {
+        for live in ["miss_policy", "host_repack", "batch_miss", "device_decode", "dd_host_moe", "dd_router_seq", "dd_fast", "dd_graph", "scrape_dir", "scrape_model_id", "scrape_class_id", "default_max_tokens"] {
             assert_eq!(entry(&d, live)["scope"], "live", "{live}");
         }
         for fixed in ["model", "gpu", "gpu_dense_mb", "placement_from_scrapes", "ctx", "cuda_device", "wgpu_device", "no_register", "pinned_pool_mb", "q4_cube", "q4_rows", "q4_xshared", "q4_xshared_max_cols", "expert_layers", "conv_block"] {

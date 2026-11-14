@@ -98,6 +98,8 @@ pub struct Gpu {
     q4_math: AtomicU32,
     /// CUDA compute capability `(major, minor)` of the card, when the cuda runtime is open.
     pub compute_capability: Option<(u32, u32)>,
+    /// Diagnostic launch trace (`trace.rs`), off unless a caller starts it.
+    pub trace: crate::trace::Trace,
 }
 
 /// `LB_Q4_ROWS`: 4 (default), 8, or 1 for the one-row kernels; anything else is the default.
@@ -307,6 +309,7 @@ impl Gpu {
             xshared_max_cols: std::env::var("LB_Q4_XSHARED_MAX_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
             q4_math: AtomicU32::new(q4_math.code()),
             compute_capability,
+            trace: Default::default(),
         })
     }
 
@@ -757,6 +760,38 @@ impl Gpu {
         y
     }
 
+    /// Start a launch trace: `device` brackets every launch with events (device time per launch).
+    pub fn trace_start(&self, device: bool) {
+        self.trace.start(device);
+        if device {
+            self.trace.set_window(self.client.profile_start().ok());
+        }
+    }
+
+    /// Stop the trace and take its rows (closes the open event window, waits for the device).
+    pub fn trace_take(&self) -> Vec<crate::trace::Row> {
+        if let Some(w) = self.trace.take_window() {
+            self.client.profile_abandon(w);
+        }
+        self.trace.take()
+    }
+
+    /// Trace hook, called right after a kernel launch is queued (`trace.rs`): free when off.
+    #[inline]
+    pub fn tr(&self, name: &'static str, tag: usize) {
+        if self.trace.is_on() {
+            let dur = if self.trace.sync_mode() {
+                // close the window that opened before this launch, open the next one
+                let d = self.trace.take_window().and_then(|w| self.client.profile_end(w).ok());
+                self.trace.set_window(self.client.profile_start().ok());
+                d
+            } else {
+                None
+            };
+            self.trace.push(name, tag, dur);
+        }
+    }
+
     /// Wait for everything submitted so far (a timing fence).
     pub fn sync(&self) -> Result<(), String> {
         cubecl::future::block_on(self.client.sync()).map_err(|e| format!("GPU sync failed: {e:?}"))
@@ -774,6 +809,19 @@ impl Gpu {
         };
         self.in_flight.lock().expect("scratch pool").push((bytes, h.clone()));
         h
+    }
+
+    /// Take every scratch handle handed out since the last recycle, without recycling them: a
+    /// captured graph keeps writing these exact buffers on every replay, so they must never go
+    /// back to the pool (`device_decode.rs`, `LB_DD_GRAPH`).
+    pub fn take_in_flight(&self) -> Vec<Handle> {
+        std::mem::take(&mut *self.in_flight.lock().expect("scratch pool")).into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// The device stream the calling thread's work goes to (cubecl gives every OS thread its own).
+    /// A captured graph replays on the stream it was recorded on, so it is only valid for this key.
+    pub fn stream_key(&self) -> u64 {
+        cubecl_environment::stream::StreamId::current().value
     }
 
     /// Return every scratch buffer handed out since the last sync. Only safe once the
@@ -958,6 +1006,7 @@ impl GpuQ4Mat {
                     gpu.q4_math(),
                 );
             }
+            gpu.tr("q4_matvec", self.rows);
             return out;
         }
         unsafe {
@@ -1090,6 +1139,7 @@ impl Gpu {
                 self.q4_math(),
             );
         }
+        self.tr("gate_up_silu", gate.rows);
     }
 
     /// The short-conv middle for one token on device buffers: `bcx` is `in_proj`'s output
@@ -1110,6 +1160,7 @@ impl Gpu {
                 BufferArg::from_raw_parts(self.const_u32(&[e as u32, l as u32]), 2),
             );
         }
+        self.tr("conv_decode", e);
         y
     }
 
@@ -1317,6 +1368,7 @@ impl GpuQ6KMat {
                 gpu.use_plane,
             );
         }
+        gpu.tr("q6_matvec", self.rows);
         out
     }
 
@@ -1594,6 +1646,7 @@ impl GpuExpertLayer {
                     gpu.q4_math(),
                 );
             }
+            gpu.tr("expert_gate_up", n_h);
             let n_out = slots * self.n_embd;
             let out = gpu.scratch(n_out * 4);
             unsafe {
@@ -1614,6 +1667,7 @@ impl GpuExpertLayer {
                     gpu.q4_math(),
                 );
             }
+            gpu.tr("expert_down", n_out);
             return (out, n_out);
         }
         unsafe {
