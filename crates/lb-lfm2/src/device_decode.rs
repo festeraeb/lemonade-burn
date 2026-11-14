@@ -443,6 +443,9 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     let stage = &m.stats.stage;
     let vocab = cfg.n_vocab;
     let t_issue = Instant::now();
+    // LB_E2_PROFILE=<file>: one JSON line a token: per MoE layer [layer, misses, sync wait us, host busy us since the last sync, bytes read]
+    let mut prof: Vec<[u64; 5]> = Vec::new();
+    let mut last_ret = t_issue;
     let logits: Handle = if replaying {
         match prep.graph.as_ref().map(|g| &g.state) {
             Some(GraphState::Ready(r)) => r.logits.clone(),
@@ -574,12 +577,16 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         // the host learns this layer's routes: the one sync a layer that a miss served
                         // from host memory cannot avoid
                         let t_read = Instant::now();
+                        let busy_us = t_read.duration_since(last_ret).as_micros() as u64;
                         let mut bufs = match gpu.read_raw_keep(want) {
                             Ok(b) => b,
                             Err(err) => return abandon(m, cache, &format!("MoE layer {li} routes read: {err}")),
                         };
                         stage.h2_read_ns.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         stage.host_syncs.fetch_add(1, Ordering::Relaxed);
+                        last_ret = Instant::now();
+                        let prof_wait = t_read.elapsed().as_micros() as u64;
+                        let prof_bytes: u64 = bufs.iter().map(|b| b.len() as u64).sum();
                         let u32s = |b: &[u8]| b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<u32>>();
                         let routes_now = u32s(&bufs[0]);
                         let ids: Vec<u32> = (0..k_used).map(|i| routes_now[2 * (base + i)]).collect();
@@ -716,6 +723,9 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                             c.count_fill();
                         }
                         let (n_hit, n_fill) = (plan.hits.len(), plan.fills.len());
+                        if prof_on() {
+                            prof.push([li as u64, (n_fill + cpu_set.len()) as u64, prof_wait, busy_us, prof_bytes]);
+                        }
                         let n_demand = n_fill - n_landed;
                         m.stats.gpu_hits.fetch_add(n_hit as u64, Ordering::Relaxed);
                         m.stats.on_demand.fetch_add((n_fill + cpu_set.len()) as u64, Ordering::Relaxed);
@@ -827,6 +837,9 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                 },
             };
             y = if pend.is_some() { None } else { Some(ffn_out) };
+        }
+        if prof_on() {
+            prof_write(&prof, t_issue.elapsed().as_micros() as u64);
         }
         // the last layer's job is for no layer: take its answer so it does not meet the next token's
         if deferred {
@@ -1066,5 +1079,21 @@ mod tests {
         assert_eq!(decide(None, 22, true), Decision::Device { host_moe_layers: 22 });
         // a blocker (a dense matrix or the head missing) always falls back, whatever the knob
         assert!(matches!(decide(Some("the head is not resident"), 0, true), Decision::Fallback(w) if w.contains("head")));
+    }
+}
+
+fn prof_file() -> &'static Option<std::sync::Mutex<std::fs::File>> {
+    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    F.get_or_init(|| std::env::var("LB_E2_PROFILE").ok().filter(|p| !p.is_empty()).and_then(|p| std::fs::File::create(p).ok()).map(std::sync::Mutex::new))
+}
+
+fn prof_on() -> bool {
+    prof_file().is_some()
+}
+
+fn prof_write(layers: &[[u64; 5]], issue_us: u64) {
+    use std::io::Write;
+    if let Some(f) = prof_file() {
+        let _ = writeln!(f.lock().expect("profile"), "{}", serde_json::json!({"layers": layers, "issue_to_last_sync_us": issue_us}));
     }
 }
