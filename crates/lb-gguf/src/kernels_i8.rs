@@ -18,6 +18,8 @@ use crate::kernels::QuantMat;
 use crate::types::GgmlType;
 use half::f16;
 use rayon::prelude::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 /// An activation row quantized to i8 in blocks of 32.
 #[derive(Clone, Debug)]
@@ -124,6 +126,31 @@ pub fn dot_q4_0_i8_at(level: SimdLevel, row: &[u8], a: &ActQ8) -> f32 {
     }
 }
 
+/// One 32-value block (`b`) of `row` accumulated into `acc`: adds `d * a.scale[b] * isum`
+/// spread over the 8 lanes, where `isum` is the exact integer dot of [`isum_q4_0_block`].
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_block_avx2(acc: __m256, row: &[u8], a: &ActQ8, b: usize) -> __m256 {
+    let blk = &row[b * 18..b * 18 + 18];
+    let d = f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+    let nib = _mm_loadu_si128(blk.as_ptr().add(2).cast::<__m128i>());
+    // Byte j holds value j in its low nibble and value j + 16 in its high nibble:
+    // concatenate low nibbles then high nibbles into 32 bytes in value order 0..32.
+    let lo = _mm_and_si128(nib, _mm_set1_epi8(0x0f));
+    let hi = _mm_and_si128(_mm_srli_epi16(nib, 4), _mm_set1_epi8(0x0f));
+    let nib_u = _mm256_set_m128i(hi, lo);
+    let q = _mm256_loadu_si256(a.q.as_ptr().add(b * 32).cast::<__m256i>());
+    // sum(nibble * q) over byte pairs (max 15 * 127 * 2 = 3810, fits i16), then pair-sum to 8 i32 lanes.
+    let prod = _mm256_maddubs_epi16(nib_u, q);
+    let sum = _mm256_madd_epi16(prod, _mm256_set1_epi16(1));
+    // Subtract the -8 offset term: 8 * sum(q), computed the same way.
+    let q8 = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(8), q), _mm256_set1_epi16(1));
+    let isum = _mm256_sub_epi32(sum, q8);
+    let s = _mm256_set1_ps(d * a.scale[b]);
+    _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum), s, acc)
+}
+
 /// AVX2 kernel for one Q4_0 row. Same result contract as [`dot_q4_0_i8_scalar`].
 ///
 /// # Safety
@@ -131,8 +158,30 @@ pub fn dot_q4_0_i8_at(level: SimdLevel, row: &[u8], a: &ActQ8) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn dot_q4_0_i8_avx2(row: &[u8], a: &ActQ8) -> f32 {
-    // TODO(forge E2a): AVX2 body. Until then this is the scalar kernel.
-    dot_q4_0_i8_scalar(row, a)
+    debug_assert_eq!(row.len() / 18 * 32, a.q.len());
+    let nb = row.len() / 18;
+    // Four independent accumulators: the per-block fmadd chain is the latency
+    // bottleneck, so spread consecutive blocks over four of them.
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut b = 0;
+    while b + 4 <= nb {
+        acc0 = unsafe { dot_block_avx2(acc0, row, a, b) };
+        acc1 = unsafe { dot_block_avx2(acc1, row, a, b + 1) };
+        acc2 = unsafe { dot_block_avx2(acc2, row, a, b + 2) };
+        acc3 = unsafe { dot_block_avx2(acc3, row, a, b + 3) };
+        b += 4;
+    }
+    let mut acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    while b < nb {
+        acc = unsafe { dot_block_avx2(acc, row, a, b) };
+        b += 1;
+    }
+    let mut lanes = [0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    lanes.iter().sum()
 }
 
 /// AVX-512 (F + BW) kernel for one Q4_0 row. Same result contract as [`dot_q4_0_i8_scalar`].
@@ -142,8 +191,59 @@ pub unsafe fn dot_q4_0_i8_avx2(row: &[u8], a: &ActQ8) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 pub unsafe fn dot_q4_0_i8_avx512(row: &[u8], a: &ActQ8) -> f32 {
-    // TODO(forge E2a): AVX-512 body. Until then this is the scalar kernel.
-    dot_q4_0_i8_scalar(row, a)
+    debug_assert_eq!(row.len() / 18 * 32, a.q.len());
+    let nb = row.len() / 18;
+    // Two 256-bit accumulators: in each 512-bit isum step lanes 0..8 are block b
+    // and lanes 8..16 are block b + 1, so the float stage runs at full 256-bit
+    // rate (no 512-bit cvt/fmadd, and each block's scale is a plain broadcast).
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut b = 0;
+    // Two blocks (64 values) per step in one __m512i.
+    while b + 2 <= nb {
+        let blk0 = &row[b * 18..b * 18 + 18];
+        let blk1 = &row[(b + 1) * 18..(b + 1) * 18 + 18];
+        let d0 = f16::from_le_bytes([blk0[0], blk0[1]]).to_f32();
+        let d1 = f16::from_le_bytes([blk1[0], blk1[1]]).to_f32();
+        let n0 = _mm_loadu_si128(blk0.as_ptr().add(2).cast::<__m128i>());
+        let n1 = _mm_loadu_si128(blk1.as_ptr().add(2).cast::<__m128i>());
+        let v0 = _mm256_set_m128i(
+            _mm_and_si128(_mm_srli_epi16(n0, 4), _mm_set1_epi8(0x0f)),
+            _mm_and_si128(n0, _mm_set1_epi8(0x0f)),
+        );
+        let v1 = _mm256_set_m128i(
+            _mm_and_si128(_mm_srli_epi16(n1, 4), _mm_set1_epi8(0x0f)),
+            _mm_and_si128(n1, _mm_set1_epi8(0x0f)),
+        );
+        let nib = _mm512_inserti64x4(_mm512_castsi256_si512(v0), v1, 1);
+        let q0 = _mm256_loadu_si256(a.q.as_ptr().add(b * 32).cast::<__m256i>());
+        let q1 = _mm256_loadu_si256(a.q.as_ptr().add(b * 32 + 32).cast::<__m256i>());
+        let q = _mm512_inserti64x4(_mm512_castsi256_si512(q0), q1, 1);
+        let prod = _mm512_maddubs_epi16(nib, q);
+        let sum = _mm512_madd_epi16(prod, _mm512_set1_epi16(1));
+        let q8 = _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_set1_epi8(8), q), _mm512_set1_epi16(1));
+        let isum = _mm512_sub_epi32(sum, q8);
+        acc0 = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm512_castsi512_si256(isum)),
+            _mm256_set1_ps(d0 * a.scale[b]),
+            acc0,
+        );
+        acc1 = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm512_extracti64x4_epi64(isum, 1)),
+            _mm256_set1_ps(d1 * a.scale[b + 1]),
+            acc1,
+        );
+        b += 2;
+    }
+    let mut acc = _mm256_add_ps(acc0, acc1);
+    // Odd last block on the 256-bit path.
+    while b < nb {
+        acc = unsafe { dot_block_avx2(acc, row, a, b) };
+        b += 1;
+    }
+    let mut lanes = [0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    lanes.iter().sum()
 }
 
 /// `out[r] = W[r, :] . x` for one activation row, Q4_0 weights, rows split across rayon threads.
