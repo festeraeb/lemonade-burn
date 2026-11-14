@@ -100,9 +100,9 @@ pub struct Gpu {
     pub compute_capability: Option<(u32, u32)>,
 }
 
-/// Widest row the I8 math stages: 80 bytes of shared memory per 32 columns (the 11776-wide dense
-/// down is 29.5 KB of the 48).
-pub const I8_MAX_COLS: usize = 12288;
+/// Widest row the I8 math stages: 80 bytes of shared memory per 32 columns. The 11776-wide dense
+/// down (29.5 KB, restaged by every cube) ran 1.8x SLOWER than f32 in rows_bench, so it stays f32.
+pub const I8_MAX_COLS: usize = 4096;
 
 /// `LB_Q4_ROWS`: 4 (default), 8, or 1 for the one-row kernels; anything else is the default.
 /// Measured 2026-11-07 (docs/WORK_LOG.md): 1.29x end to end in the device decode on a P100,

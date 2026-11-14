@@ -114,7 +114,7 @@ fn rel_err(got: &[f32], want: &[f32]) -> f64 {
 fn device_matvec_matches_cpu_i8_scalar() {
     let Some(gpu) = gpu() else { return };
     let mut rng = Rng(91);
-    for &(rows, cols) in &[(1536usize, 2048usize), (2048, 1536), (6144, 2048), (512, 2048), (2048, 11776), (11776, 2048), (2048, 2048), (36, 64), (8, 32)] {
+    for &(rows, cols) in &[(1536usize, 2048usize), (2048, 1536), (6144, 2048), (512, 2048), (2048, 4096), (11776, 2048), (2048, 2048), (36, 64), (8, 32)] {
         let w = q4(&mut rng, rows, cols);
         let mat = GpuQ4Mat::upload(&gpu, QuantMat::new(GgmlType::Q4_0, rows, cols, &w)).unwrap();
         // gate input: uniform activations (the spec's < 1 % of norm); `outlier` input (every 97th value
