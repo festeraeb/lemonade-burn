@@ -685,7 +685,9 @@ fn ab_math(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32>
     let mut arms = vec![Q4Math::F32];
     arms.extend(maths.iter().copied().filter(|&m| m != Q4Math::F32));
     for round in 0..args.ab_rounds {
-        for &m in &arms {
+        // odd rounds run the arms in reverse, so two rounds read A-B-B-A and drift hits both alike
+        let order: Vec<Q4Math> = if round % 2 == 1 { arms.iter().rev().copied().collect() } else { arms.clone() };
+        for &m in &order {
             gpu.set_q4_math(m);
             let (g, _, secs, dd) = greedy_arm(model, &ids, args.greedy_n, true, cfg.eos);
             let sha = sha16(&text(&g));

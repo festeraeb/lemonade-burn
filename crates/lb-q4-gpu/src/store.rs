@@ -100,6 +100,10 @@ pub struct Gpu {
     pub compute_capability: Option<(u32, u32)>,
 }
 
+/// Widest row the I8 math stages: 80 bytes of shared memory per 32 columns (the 11776-wide dense
+/// down is 29.5 KB of the 48).
+pub const I8_MAX_COLS: usize = 12288;
+
 /// `LB_Q4_ROWS`: 4 (default), 8, or 1 for the one-row kernels; anything else is the default.
 /// Measured 2026-11-07 (docs/WORK_LOG.md): 1.29x end to end in the device decode on a P100,
 /// 1.16x / 1.31x on the GTX 1070's distinct-expert stream (wgpu / cuda).
@@ -134,10 +138,13 @@ pub enum Q4Math {
     F16,
     /// int8 activations + `dp4a` on the nibbles (sm_61+ / Turing: dp4a; fp16 is slow on sm_61).
     Dp4a,
+    /// K1: int8 activations quantised once per cube into shared memory, exact packed-integer
+    /// products (no dp4a, no fp16; see the K1 notes in lib.rs). `LB_DD_I8=1` or `LB_Q4_MATH=i8`.
+    I8,
 }
 
 impl Q4Math {
-    pub const ALL: [Q4Math; 4] = [Q4Math::F32, Q4Math::F32Magic, Q4Math::F16, Q4Math::Dp4a];
+    pub const ALL: [Q4Math; 5] = [Q4Math::F32, Q4Math::F32Magic, Q4Math::F16, Q4Math::Dp4a, Q4Math::I8];
 
     pub fn code(self) -> u32 {
         match self {
@@ -145,6 +152,7 @@ impl Q4Math {
             Q4Math::F32Magic => crate::Q4_MATH_F32M,
             Q4Math::F16 => crate::Q4_MATH_F16,
             Q4Math::Dp4a => crate::Q4_MATH_DP4A,
+            Q4Math::I8 => crate::Q4_MATH_I8,
         }
     }
 
@@ -153,6 +161,7 @@ impl Q4Math {
             crate::Q4_MATH_F32M => Q4Math::F32Magic,
             crate::Q4_MATH_F16 => Q4Math::F16,
             crate::Q4_MATH_DP4A => Q4Math::Dp4a,
+            crate::Q4_MATH_I8 => Q4Math::I8,
             _ => Q4Math::F32,
         }
     }
@@ -163,6 +172,7 @@ impl Q4Math {
             Q4Math::F32Magic => "f32m",
             Q4Math::F16 => "f16",
             Q4Math::Dp4a => "dp4a",
+            Q4Math::I8 => "i8",
         }
     }
 
@@ -173,6 +183,7 @@ impl Q4Math {
             "f32m" | "magic" => Some(Q4Math::F32Magic),
             "f16" | "half" => Some(Q4Math::F16),
             "dp4a" | "int8" => Some(Q4Math::Dp4a),
+            "i8" | "q8" => Some(Q4Math::I8),
             _ => None,
         }
     }
@@ -198,10 +209,13 @@ impl Q4Math {
     /// `LB_Q4_MATH`: unset or `f32` -> the reference (the default: every published sha was made
     /// with it); `auto` -> [`Q4Math::for_card`]; or `f32m`, `f16`, `dp4a` by name.
     pub fn pick(cc: Option<(u32, u32)>) -> Self {
+        if std::env::var("LB_DD_I8").is_ok_and(|v| !v.is_empty() && v != "0") {
+            return Q4Math::I8;
+        }
         match std::env::var("LB_Q4_MATH") {
             Ok(v) if v.trim().eq_ignore_ascii_case("auto") => Self::for_card(cc),
             Ok(v) => Self::parse(&v).unwrap_or_else(|| {
-                eprintln!("lb-q4-gpu: LB_Q4_MATH={v:?} not understood (f32|f32m|f16|dp4a|auto), using f32");
+                eprintln!("lb-q4-gpu: LB_Q4_MATH={v:?} not understood (f32|f32m|f16|dp4a|i8|auto), using f32");
                 Q4Math::F32
             }),
             Err(_) => Q4Math::F32,
@@ -352,6 +366,28 @@ impl Gpu {
     fn rows_for(&self, rows: usize) -> Option<usize> {
         let r = self.q4_rows();
         (self.use_plane && (r == 4 || r == 8) && rows % r == 0).then_some(r)
+    }
+
+    /// The math code to launch a rows kernel with. `I8` stages the activation row per cube, so it
+    /// needs every group of a cube to read one input row (`uniform`: one input row, or a routed
+    /// launch whose rows-per-slot fill whole cubes) and a row that fits (`I8_MAX_COLS`); any other
+    /// launch (prefill chunks, odd shapes) runs the f32 reference instead.
+    fn math_for(&self, uniform: bool, cols: usize) -> u32 {
+        let m = self.q4_math();
+        if m == crate::Q4_MATH_I8 && !(uniform && cols % 32 == 0 && cols <= I8_MAX_COLS) {
+            return crate::Q4_MATH_F32;
+        }
+        m
+    }
+
+    /// `(xshared, xlen)` kernel arguments for a launch with `math`: the I8 math stages `cols / 32`
+    /// quantised blocks, the others the f32 row when `xsh`.
+    fn x_stage(math: u32, xsh: bool, cols: usize) -> (bool, usize) {
+        if math == crate::Q4_MATH_I8 {
+            (false, cols / 32)
+        } else {
+            (xsh, if xsh { cols / 4 } else { 1 })
+        }
     }
 
     /// Whether the rows kernel stages `x` in shared memory: one input row, narrow enough.
@@ -938,7 +974,8 @@ impl GpuQ4Mat {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
         if let Some(r) = gpu.rows_for(self.rows) {
-            let xsh = gpu.xshared_for(m, self.cols);
+            let math = gpu.math_for(m == 1, self.cols);
+            let (xsh, xlen) = Gpu::x_stage(math, gpu.xshared_for(m, self.cols), self.cols);
             unsafe {
                 q4_0_matvec_rows_kernel::launch(
                     &gpu.client,
@@ -953,9 +990,9 @@ impl GpuQ4Mat {
                     BufferArg::from_raw_parts(out.clone(), n_out),
                     r,
                     xsh,
-                    if xsh { self.cols / 4 } else { 1 },
+                    xlen,
                     false,
-                    gpu.q4_math(),
+                    math,
                 );
             }
             return out;
@@ -1069,7 +1106,8 @@ impl Gpu {
     fn gate_up_rows(&self, gate: &GpuQ4Mat, up: &GpuQ4Mat, x: &Handle, m: usize, h: &Handle) {
         let r = self.rows_for(gate.rows).expect("caller checked");
         let n_h = m * gate.rows;
-        let xsh = self.xshared_for(m, gate.cols);
+        let math = self.math_for(m == 1, gate.cols);
+        let (xsh, xlen) = Gpu::x_stage(math, self.xshared_for(m, gate.cols), gate.cols);
         unsafe {
             q4_0_gate_up_silu_rows_kernel::launch(
                 &self.client,
@@ -1085,9 +1123,9 @@ impl Gpu {
                 BufferArg::from_raw_parts(h.clone(), n_h),
                 r,
                 xsh,
-                if xsh { gate.cols / 4 } else { 1 },
+                xlen,
                 false,
-                self.q4_math(),
+                math,
             );
         }
     }
@@ -1573,7 +1611,9 @@ impl GpuExpertLayer {
         let h = gpu.scratch(n_h * 4);
         if let (Some(r), Some(_)) = (gpu.rows_for(self.n_ff), gpu.rows_for(self.n_embd)) {
             // every slot of a decode token reads token 0, so x can sit in shared memory
-            let xsh = gpu.xshared_for(n_tokens, self.n_embd);
+            let ppc = gpu.per_cube();
+            let gmath = gpu.math_for(n_tokens == 1 && (self.n_ff / r) % ppc == 0, self.n_embd);
+            let (xsh, xlen) = Gpu::x_stage(gmath, gpu.xshared_for(n_tokens, self.n_embd), self.n_embd);
             unsafe {
                 q4_0_gate_up_silu_rows_kernel::launch(
                     &gpu.client,
@@ -1589,13 +1629,15 @@ impl GpuExpertLayer {
                     BufferArg::from_raw_parts(h.clone(), n_h),
                     r,
                     xsh,
-                    if xsh { self.n_embd / 4 } else { 1 },
+                    xlen,
                     true,
-                    gpu.q4_math(),
+                    gmath,
                 );
             }
             let n_out = slots * self.n_embd;
             let out = gpu.scratch(n_out * 4);
+            let dmath = gpu.math_for((self.n_embd / r) % ppc == 0, self.n_ff);
+            let (_, dlen) = Gpu::x_stage(dmath, false, self.n_ff);
             unsafe {
                 q4_0_matvec_rows_kernel::launch(
                     &gpu.client,
@@ -1609,9 +1651,9 @@ impl GpuExpertLayer {
                     BufferArg::from_raw_parts(out.clone(), n_out),
                     r,
                     false,
-                    1,
+                    dlen,
                     true,
-                    gpu.q4_math(),
+                    dmath,
                 );
             }
             return (out, n_out);

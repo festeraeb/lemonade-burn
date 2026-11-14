@@ -811,6 +811,8 @@ pub const Q4_MATH_F32: u32 = 0;
 pub const Q4_MATH_F32M: u32 = 1;
 pub const Q4_MATH_F16: u32 = 2;
 pub const Q4_MATH_DP4A: u32 = 3;
+/// Exact integer math with the activation row quantised ONCE per cube (see the I8 notes below).
+pub const Q4_MATH_I8: u32 = 4;
 
 type V2H = Vector<half::f16, Const<2>>;
 type V2F = Vector<f32, Const<2>>;
@@ -836,6 +838,33 @@ fn nib_pair_h2(pair: u32, s: u32) -> V2H {
     V2H::reinterpret(t) - V2H::new(half::f16::new(1032.0f32))
 }
 
+
+// ---- K1: staged int8 activations, exact packed-integer products (`Q4_MATH_I8`) ----
+//
+// The DP4A math above quantises each block of the activation inside every lane, once per row
+// group, so the same 32 values are re-read, re-scaled and re-rounded by every plane of every cube,
+// and on an sm_60 card `dp4a` is a byte-unpack polyfill besides. Here the cube quantises the
+// activation row once, up front, into shared memory, and the lanes only read finished words.
+//
+// Staged layout, per 32-value block, five 16-byte vectors (stride 5 vectors = 20 words, which
+// is conflict-free for a quarter-warp of 16-byte shared loads: the 8 lanes of a phase start at
+// banks 0, 20, 8, 28, 16, 4, 24, 12):
+//   vectors 0..3 (j = 0..3), component k:  `(q[4j + k + 16] as i32) + ((q[4j + k] as i32) << 16)`
+//   vector 4: component 0 = sum of the block's 32 quants (i32), component 1 = the block scale
+//             (f32 bits, absmax / 127), the rest unused.
+// The quants are `round(x * 127 / absmax)`, the arithmetic of `lb_gguf::kernels_i8`.
+//
+// Product trick (no dp4a, no fp16): the weight word `w_k` holds, at nibble j and nibble j + 4,
+// the nibbles `n1` (value 4j+k) and `n2` (value 4j+k+16), 16 bits apart. `(w_k >> 4j) & 0x000F000F`
+// is `n1 + n2 * 2^16`; one 32-bit multiply with the staged word `b + a * 2^16` (a = q[4j+k],
+// b = q[4j+k+16]) gives `n1*b + (n1*a + n2*b) * 2^16 (mod 2^32)`. The top half is the two
+// products we want, the low half is a stray `n1*b`. Summing 8 such words (j in a pair, k in 0..4)
+// keeps |stray| <= 15 * 127 * 8 = 15240 < 2^15 and |wanted| <= 2 * 15 * 127 * 8 = 30480 < 2^15,
+// so `(S + 2^15) >> 16` (arithmetic) is the wanted sum EXACTLY: two integers in one multiply, and
+// two folds per block (16 multiplies). The block integer is then `sum - 8 * sumq` (the Q4_0
+// offset, applied once per block instead of per weight), times `d_w * d_x` in f32. The bound is
+// proved by exhaustive extremes in `tests/i8_math.rs` (host emulation of this exact word math).
+
 /// `r` row partials of one plane's lane: rows `0..r` start at global blocks `gb0 + i * bpr`, the
 /// activation row at vector `x4_0` (in `xs` when `xshared`). Written into `acc[0..r]`.
 /// `math` is one of the `Q4_MATH_*` constants (see above).
@@ -846,6 +875,7 @@ fn q4_rows_acc(
     sc: &[u32],
     x: &[V4F],
     xs: &Shared<[V4F]>,
+    xq: &Shared<[V4U]>,
     gb0: usize,
     bpr: usize,
     x4_0: usize,
@@ -856,7 +886,9 @@ fn q4_rows_acc(
     #[comptime] xshared: bool,
     #[comptime] math: u32,
 ) {
-    if comptime!(math == Q4_MATH_F16 || math == Q4_MATH_DP4A) {
+    if comptime!(math == Q4_MATH_I8) {
+        q4_rows_acc_i8(qs, sc, xq, gb0, bpr, lane, width, acc, r);
+    } else if comptime!(math == Q4_MATH_F16 || math == Q4_MATH_DP4A) {
         q4_rows_acc_lowp(qs, sc, x, xs, gb0, bpr, x4_0, lane, width, acc, r, xshared, math);
     } else {
         q4_rows_acc_f32(qs, sc, x, xs, gb0, bpr, x4_0, lane, width, acc, r, xshared, math);
@@ -1063,6 +1095,96 @@ fn q4_rows_acc_lowp(
     }
 }
 
+/// Quantise `nblk` blocks of the activation row at vector `x4_0` into the staged layout (see the K1
+/// notes). One unit per block, looping; ends on a barrier.
+#[cube]
+fn stage_q8(x: &[V4F], xq: &mut Shared<[V4U]>, x4_0: usize, nblk: usize) {
+    let mut b = UNIT_POS as usize;
+    while b < nblk {
+        let mut xv = Array::<V4F>::new(8usize);
+        let xb = x4_0 + b * 8usize;
+        #[unroll]
+        for j in 0..8usize {
+            xv[j] = x[xb + j];
+        }
+        let amax = block_absmax(&xv);
+        let mut inv = 0.0f32;
+        if amax > 0.0f32 {
+            inv = 127.0f32 / amax;
+        }
+        let dx = amax / 127.0f32;
+        let mut qx = Array::<V4I>::new(8usize);
+        let mut sq = V4I::new(0i32);
+        #[unroll]
+        for j in 0..8usize {
+            qx[j] = V4I::cast_from((xv[j] * V4F::new(inv)).round());
+            sq += qx[j];
+        }
+        let sumq = sq.extract(0usize) + sq.extract(1usize) + sq.extract(2usize) + sq.extract(3usize);
+        #[unroll]
+        for j in 0..4usize {
+            xq[b * 5usize + j] = V4U::reinterpret((qx[j] << V4I::new(16i32)) + qx[j + 4usize]);
+        }
+        let mut meta = V4U::new(0u32);
+        meta.insert(0usize, u32::reinterpret(sumq));
+        meta.insert(1usize, u32::reinterpret(dx));
+        xq[b * 5usize + 4usize] = meta;
+        b += CUBE_DIM_X as usize;
+    }
+    sync_cube();
+}
+
+/// `Q4_MATH_I8`: `r` row partials of one plane's lane from the staged activation (K1 notes).
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn q4_rows_acc_i8(qs: &[V4U], sc: &[u32], xq: &Shared<[V4U]>, gb0: usize, bpr: usize, lane: usize, width: usize, acc: &mut Array<f32>, #[comptime] r: usize) {
+    #[unroll]
+    for i in 0..r {
+        acc[i] = 0.0f32;
+    }
+    let mut b = lane;
+    while b < bpr {
+        let mut q = Array::<V4U>::new(r);
+        let mut d = Array::<u32>::new(r);
+        #[unroll]
+        for i in 0..r {
+            let gb = gb0 + i * bpr + b;
+            q[i] = qs[gb];
+            d[i] = (sc[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32;
+        }
+        let xb = b * 5usize;
+        let mut xw = Array::<V4U>::new(4usize);
+        #[unroll]
+        for j in 0..4usize {
+            xw[j] = xq[xb + j];
+        }
+        let meta = xq[xb + 4usize];
+        let sumq = i32::reinterpret(meta.extract(0usize));
+        let dx = f32::reinterpret(meta.extract(1usize));
+        #[unroll]
+        for i in 0..r {
+            let w = q[i];
+            let mut tot = 0i32;
+            #[unroll]
+            for h in 0..2u32 {
+                let mut s = 0u32;
+                #[unroll]
+                for jj in 0..2u32 {
+                    let j = 2u32 * h + jj;
+                    #[unroll]
+                    for k in 0..4usize {
+                        let wm = (w.extract(k) >> (4u32 * j)) & 0x000f_000fu32;
+                        s += wm * xw[j as usize].extract(k);
+                    }
+                }
+                tot += i32::reinterpret(s + 0x8000u32) >> 16i32;
+            }
+            acc[i] += f16_to_f32(d[i]) * dx * f32::cast_from(tot - 8i32 * sumq);
+        }
+        b += width;
+    }
+}
+
 /// Reduce `acc[c*4 .. c*4+4]` across the plane in one `plane_sum`; the 4 totals, valid in every lane.
 #[cube]
 fn plane_sum4(acc: &Array<f32>, c: usize) -> V4F {
@@ -1107,8 +1229,15 @@ fn q4_0_matvec_rows_kernel(
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
     let bpr = cols / 32usize;
-    let mut xs = Shared::<[V4F]>::new_slice(xlen);
-    if xshared {
+    let xs_len = comptime!(if math == Q4_MATH_I8 { 1usize } else { xlen });
+    let xq_len = comptime!(if math == Q4_MATH_I8 { 5usize * xlen } else { 1usize });
+    let mut xs = Shared::<[V4F]>::new_slice(xs_len);
+    let mut xq = Shared::<[V4U]>::new_slice(xq_len);
+    if comptime!(math == Q4_MATH_I8) {
+        // the host launches I8 only when every group of a cube reads the same input row (`xlen` = blocks)
+        let t0 = (CUBE_POS as usize * (CUBE_DIM_X as usize / PLANE_DIM as usize) * r) / rows;
+        stage_q8(x, &mut xq, t0 * cols / 4usize, xlen);
+    } else if xshared {
         stage_x(x, &mut xs, cols / 4usize);
     }
     let width = PLANE_DIM as usize;
@@ -1128,7 +1257,7 @@ fn q4_0_matvec_rows_kernel(
             let e = routes[2usize * (dims[2] as usize + t)] as usize;
             gb0 += e * rows * bpr;
         }
-        q4_rows_acc(qs, sc, x, &xs, gb0, bpr, t * cols / 4usize, lane, width, &mut acc, r, xshared, math);
+        q4_rows_acc(qs, sc, x, &xs, &xq, gb0, bpr, t * cols / 4usize, lane, width, &mut acc, r, xshared, math);
         #[unroll]
         for c in 0..r / 4 {
             let v = plane_sum4(&acc, c);
@@ -1166,8 +1295,19 @@ fn q4_0_gate_up_silu_rows_kernel(
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
     let bpr = cols / 32usize;
-    let mut xs = Shared::<[V4F]>::new_slice(xlen);
-    if xshared {
+    let xs_len = comptime!(if math == Q4_MATH_I8 { 1usize } else { xlen });
+    let xq_len = comptime!(if math == Q4_MATH_I8 { 5usize * xlen } else { 1usize });
+    let mut xs = Shared::<[V4F]>::new_slice(xs_len);
+    let mut xq = Shared::<[V4U]>::new_slice(xq_len);
+    if comptime!(math == Q4_MATH_I8) {
+        // the host launches I8 only when every group of a cube reads the same input row (`xlen` = blocks)
+        let t0 = (CUBE_POS as usize * (CUBE_DIM_X as usize / PLANE_DIM as usize) * r) / rows;
+        let mut tok0 = t0;
+        if routed {
+            tok0 = routes[2usize * (dims[2] as usize + t0) + 1usize] as usize;
+        }
+        stage_q8(x, &mut xq, tok0 * cols / 4usize, xlen);
+    } else if xshared {
         stage_x(x, &mut xs, cols / 4usize);
     }
     let width = PLANE_DIM as usize;
@@ -1190,8 +1330,8 @@ fn q4_0_gate_up_silu_rows_kernel(
             gb0 += routes[2usize * (base + t)] as usize * rows * bpr;
             tok = routes[2usize * (base + t) + 1usize] as usize;
         }
-        q4_rows_acc(gq, gs, x, &xs, gb0, bpr, tok * cols / 4usize, lane, width, &mut ag, r, xshared, math);
-        q4_rows_acc(uq, us, x, &xs, gb0, bpr, tok * cols / 4usize, lane, width, &mut au, r, xshared, math);
+        q4_rows_acc(gq, gs, x, &xs, &xq, gb0, bpr, tok * cols / 4usize, lane, width, &mut ag, r, xshared, math);
+        q4_rows_acc(uq, us, x, &xs, &xq, gb0, bpr, tok * cols / 4usize, lane, width, &mut au, r, xshared, math);
         #[unroll]
         for c in 0..r / 4 {
             let vg = plane_sum4(&ag, c);
