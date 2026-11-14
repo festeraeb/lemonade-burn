@@ -77,7 +77,7 @@ impl Default for Knobs {
             device_prefill: AtomicBool::new(env_on("LB_DEVICE_PREFILL")),
             cpu_i8: AtomicBool::new(env_on("LB_CPU_I8")),
             dd_graph: AtomicBool::new(env_on("LB_DD_GRAPH")),
-            dd_fast: AtomicBool::new(env_on("LB_DD_FAST")),
+            dd_fast: AtomicBool::new(env_or("LB_DD_FAST", true)),
         }
     }
 }
