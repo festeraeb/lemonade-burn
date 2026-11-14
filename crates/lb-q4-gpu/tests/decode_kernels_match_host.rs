@@ -400,3 +400,56 @@ fn fused_norm_router_and_sum_norm_are_bit_identical_to_the_separate_kernels() {
     assert_eq!(bits(&read(&gpu, &hb, n)), bits(&read(&gpu, &ha, n)), "sum+norm: h");
     assert_eq!(bits(&read(&gpu, &xb, n)), bits(&read(&gpu, &xa, n)), "sum+norm: x");
 }
+
+/// The `LB_DD_FAST` kernels against the ones they replace, on f32 bits: the router split over one
+/// cube per expert (several random routers, plus a tie in the scores), and the expert sum with its
+/// slot order worked out once per cube. Same arithmetic in the same order: nothing may differ.
+#[test]
+fn split_router_and_ordered_sum_are_bit_identical_to_the_single_cube_kernels() {
+    let Some(gpu) = gpu() else { return };
+    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+    let (n, n_exp, k, n_slots, base, eps) = (2048usize, 64usize, 4usize, 12usize, 4usize, 1e-5f32);
+    if !gpu.router_split_ok(false) {
+        eprintln!("skipped: no plane ops (no split router on this device)");
+        return;
+    }
+    for seed in [7u64, 8, 9, 10] {
+        let mut rng = Rng(seed);
+        let h: Vec<f32> = (0..n).map(|_| rng.unit() * 2.0).collect();
+        let mut router: Vec<f32> = (0..n_exp * n).map(|_| rng.unit() * 0.05).collect();
+        let mut bias: Vec<f32> = (0..n_exp).map(|_| rng.unit() * 0.01).collect();
+        if seed == 10 {
+            // two identical experts: the rank rule must send the tie to the lower id, as before
+            let (a, b) = (5usize, 40usize);
+            let row: Vec<f32> = router[a * n..(a + 1) * n].to_vec();
+            router[b * n..(b + 1) * n].copy_from_slice(&row);
+            bias[b] = bias[a];
+        }
+        let (hh, rh, bh) = (gpu.upload_f32(&h), gpu.upload_f32(&router), gpu.upload_f32(&bias));
+        let (ra, wa) = (gpu.upload_u32(vec![7; 2 * n_slots]), gpu.upload_f32(&vec![-1.0; n_slots]));
+        gpu.router_topk(&hh, &rh, &bh, &ra, &wa, (n_exp, k, n, base, n_slots), false);
+        let (rb, wb) = (gpu.upload_u32(vec![7; 2 * n_slots]), gpu.upload_f32(&vec![-1.0; n_slots]));
+        let scratch = (gpu.upload_f32(&vec![0.0; n_exp]), gpu.upload_f32(&vec![0.0; n_exp]));
+        gpu.router_topk_split(&hh, &rh, &bh, &scratch, &rb, &wb, (n_exp, k, n, base, n_slots));
+        assert_eq!(gpu.read_u32(&rb, 2 * n_slots).unwrap(), gpu.read_u32(&ra, 2 * n_slots).unwrap(), "seed {seed}: routes");
+        assert_eq!(bits(&read(&gpu, &wb, n_slots)), bits(&read(&gpu, &wa, n_slots)), "seed {seed}: weights");
+    }
+    let mut rng = Rng(55);
+    let x: Vec<f32> = (0..n).map(|_| rng.unit() * 3.0).collect();
+    let w: Vec<f32> = (0..n).map(|_| 0.5 + rng.unit()).collect();
+    let outs: Vec<f32> = (0..k * n).map(|_| rng.unit() * 10.0).collect();
+    let weights: Vec<f32> = (0..n_slots).map(|_| 0.1 + rng.unit().abs()).collect();
+    for ids in [[41u32, 2, 63, 17], [0, 1, 2, 3], [63, 62, 61, 60], [9, 30, 4, 22]] {
+        let mut routes = vec![0u32; 2 * n_slots];
+        for (i, e) in ids.iter().enumerate() {
+            routes[2 * (base + i)] = *e;
+        }
+        let (oh, wth, rth, wh) = (gpu.upload_f32(&outs), gpu.upload_f32(&weights), gpu.upload_u32(routes), gpu.upload_f32(&w));
+        let xa = gpu.upload_f32(&x);
+        let ha = gpu.sum_add_rms_norm(&oh, &wth, &rth, &xa, &wh, (k, n, base, n_slots), eps);
+        let xb = gpu.upload_f32(&x);
+        let hb = gpu.sum_add_rms_norm_ord(&oh, &wth, &rth, &xb, &wh, (k, n, base, n_slots), eps);
+        assert_eq!(bits(&read(&gpu, &hb, n)), bits(&read(&gpu, &ha, n)), "{ids:?}: h");
+        assert_eq!(bits(&read(&gpu, &xb, n)), bits(&read(&gpu, &xa, n)), "{ids:?}: x");
+    }
+}
