@@ -11,6 +11,7 @@ pub mod device_prefill;
 pub mod inbox;
 pub mod knobs;
 pub mod model;
+pub mod prefix;
 pub mod moe;
 pub mod remote;
 pub mod stage;

@@ -111,7 +111,7 @@ struct Job {
 #[derive(Debug)]
 enum Gen {
     Text(String),
-    Done { finish_reason: &'static str, prompt_tokens: usize, completion_tokens: usize, prefill_s: f64, decode_s: f64 },
+    Done { finish_reason: &'static str, prompt_tokens: usize, cached_tokens: usize, completion_tokens: usize, prefill_s: f64, decode_s: f64 },
     Error(String),
 }
 
@@ -148,10 +148,20 @@ pub trait Decoder: Send + 'static {
     fn kernel_name(&self) -> &'static str;
     /// Called after each request (scrape flush, profiling); default nothing.
     fn after_request(&self, _prompt: &[u32]) {}
+    /// A state the sequence can later be rewound to (prompt-prefix reuse). `None`: not supported.
+    type Checkpoint: Send;
+    fn checkpoint(&self, _cache: &mut Self::Cache) -> Option<Self::Checkpoint> {
+        None
+    }
+    /// Rewind `cache` to `cp`. False: the cache can no longer be used.
+    fn rewind(&self, _cache: &mut Self::Cache, _cp: &Self::Checkpoint) -> bool {
+        false
+    }
 }
 
 impl Decoder for BitNet {
     type Cache = lb_model::model::KvCache;
+    type Checkpoint = ();
     fn new_cache(&self) -> Self::Cache {
         BitNet::new_cache(self)
     }
@@ -171,8 +181,27 @@ impl Decoder for BitNet {
 
 impl Decoder for lb_lfm2::Lfm2 {
     type Cache = lb_lfm2::Cache;
+    type Checkpoint = lb_lfm2::prefix::Checkpoint;
     fn new_cache(&self) -> Self::Cache {
         lb_lfm2::Lfm2::new_cache(self)
+    }
+    fn checkpoint(&self, cache: &mut Self::Cache) -> Option<Self::Checkpoint> {
+        match lb_lfm2::Lfm2::checkpoint(self, cache) {
+            Ok(cp) => Some(cp),
+            Err(e) => {
+                eprintln!("lb-server: prompt cache checkpoint failed ({e}); this turn will not be reusable");
+                None
+            }
+        }
+    }
+    fn rewind(&self, cache: &mut Self::Cache, cp: &Self::Checkpoint) -> bool {
+        match lb_lfm2::Lfm2::rewind(self, cache, cp) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("lb-server: prompt cache rewind failed ({e}); running the whole prompt");
+                false
+            }
+        }
     }
     fn forward(&self, tokens: &[u32], cache: &mut Self::Cache, all_logits: bool) -> Tensor<2> {
         lb_lfm2::Lfm2::forward(self, tokens, cache, all_logits)
@@ -197,9 +226,31 @@ impl Decoder for lb_lfm2::Lfm2 {
     }
 }
 
+/// The last conversation's state, kept between requests so a prompt that starts the same way
+/// runs only its new part (`LB_PROMPT_CACHE=0` turns this off).
+struct Session<D: Decoder> {
+    cache: D::Cache,
+    /// Every token run through `cache`, in order (prompt and answer tokens).
+    seq: Vec<u32>,
+    /// Checkpoints at earlier positions of `seq`, ascending (one per prompt end).
+    cps: Vec<(usize, D::Checkpoint)>,
+}
+
+/// Checkpoints kept per conversation (the oldest go first).
+const MAX_CHECKPOINTS: usize = 16;
+
+fn prompt_cache_on() -> bool {
+    std::env::var("LB_PROMPT_CACHE").map(|v| v != "0").unwrap_or(true)
+}
+
 fn worker<D: Decoder>(model: D, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
+    let mut session: Option<Session<D>> = None;
     while let Ok(job) = rx.recv() {
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&model, &codec, &job)));
+        // the session is taken out for the job: a panic mid-pass leaves none behind
+        let prev = if prompt_cache_on() { session.take() } else { None };
+        session = None;
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&model, &codec, &job, prev)));
+        let res = res.map(|s| session = s);
         if let Err(e) = res {
             let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
             let _ = job.tx.send(Gen::Error(format!("generation panicked: {msg}")));
@@ -207,12 +258,39 @@ fn worker<D: Decoder>(model: D, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Jo
     }
 }
 
-fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
+fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job, prev: Option<Session<D>>) -> Option<Session<D>> {
     let to_vec = |t: burn::tensor::Tensor<2>| t.into_data().try_to_vec::<f32>().expect("logits");
-    let mut cache = model.new_cache();
     let mut sampler = Sampler::new(job.params.clone());
     let t0 = Instant::now();
-    let logits = to_vec(model.forward(&job.prompt, &mut cache, false));
+    // reuse the kept conversation's state for the part of the prompt it shares
+    let mut reused: Option<(D::Cache, Vec<u32>, Vec<(usize, D::Checkpoint)>)> = None;
+    if let Some(mut s) = prev {
+        let common = lb_lfm2::prefix::common_prefix(&s.seq, &job.prompt);
+        let pos: Vec<usize> = s.cps.iter().map(|(p, _)| *p).collect();
+        match lb_lfm2::prefix::reuse_point(&pos, s.seq.len(), job.prompt.len(), common) {
+            Some((_, None)) => reused = Some((s.cache, s.seq, s.cps)),
+            Some((at, Some(i))) => {
+                if model.rewind(&mut s.cache, &s.cps[i].1) {
+                    s.seq.truncate(at);
+                    s.cps.truncate(i + 1);
+                    reused = Some((s.cache, s.seq, s.cps));
+                }
+            }
+            None => {}
+        }
+    }
+    let (mut cache, mut seq, mut cps) = reused.unwrap_or_else(|| (model.new_cache(), Vec::new(), Vec::new()));
+    let cached_tokens = seq.len();
+    let logits = to_vec(model.forward(&job.prompt[cached_tokens..], &mut cache, false));
+    seq.extend_from_slice(&job.prompt[cached_tokens..]);
+    if prompt_cache_on() && cps.last().is_none_or(|(p, _)| *p < seq.len()) {
+        if let Some(cp) = model.checkpoint(&mut cache) {
+            cps.push((seq.len(), cp));
+            if cps.len() > MAX_CHECKPOINTS {
+                cps.remove(0);
+            }
+        }
+    }
     let prefill_s = t0.elapsed().as_secs_f64();
     let mut next = sampler.sample(&logits);
     let mut dec = StreamDecoder::new();
@@ -232,7 +310,7 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
             Ok(piece) => text.push_str(&piece),
             Err(e) => {
                 let _ = job.tx.send(Gen::Error(e.to_string()));
-                return;
+                return Some(Session { cache, seq, cps });
             }
         }
         if let Some(pos) = job.stop.iter().filter_map(|s| text.find(s.as_str())).min() {
@@ -251,7 +329,7 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
         }
         if safe > sent {
             if job.tx.send(Gen::Text(text[sent..safe].to_string())).is_err() {
-                return; // client went away
+                return Some(Session { cache, seq, cps }); // client went away
             }
             sent = safe;
         }
@@ -259,6 +337,7 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
             break;
         }
         let l = to_vec(model.forward(&[next], &mut cache, false));
+        seq.push(next);
         next = sampler.sample(&l);
     }
     if text.len() > sent {
@@ -268,10 +347,12 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job) {
     let _ = job.tx.send(Gen::Done {
         finish_reason: finish,
         prompt_tokens: job.prompt.len(),
+        cached_tokens,
         completion_tokens: n,
         prefill_s,
         decode_s: t1.elapsed().as_secs_f64(),
     });
+    Some(Session { cache, seq, cps })
 }
 
 #[derive(Deserialize)]
@@ -388,7 +469,7 @@ async fn respond(st: Arc<AppState>, req: ChatReq, prompt: Vec<u32>, chat: bool) 
         loop {
             match rx.recv().await {
                 Some(Gen::Text(t)) => text.push_str(&t),
-                Some(Gen::Done { finish_reason, prompt_tokens, completion_tokens, prefill_s, decode_s }) => {
+                Some(Gen::Done { finish_reason, prompt_tokens, cached_tokens, completion_tokens, prefill_s, decode_s }) => {
                     let choice = if chat {
                         json!({"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish_reason})
                     } else {
@@ -397,9 +478,10 @@ async fn respond(st: Arc<AppState>, req: ChatReq, prompt: Vec<u32>, chat: bool) 
                     return Json(json!({
                         "id": id, "object": if chat {"chat.completion"} else {"text_completion"}, "created": created, "model": model,
                         "choices": [choice],
-                        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens},
-                        "timings": {"prompt_s": prefill_s, "predicted_s": decode_s,
-                                    "prompt_per_second": prompt_tokens as f64 / prefill_s.max(1e-9),
+                        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens,
+                                  "prompt_tokens_details": {"cached_tokens": cached_tokens}},
+                        "timings": {"prompt_s": prefill_s, "predicted_s": decode_s, "cache_n": cached_tokens, "prompt_n": prompt_tokens - cached_tokens,
+                                    "prompt_per_second": (prompt_tokens - cached_tokens) as f64 / prefill_s.max(1e-9),
                                     "predicted_per_second": completion_tokens as f64 / decode_s.max(1e-9)}
                     }))
                     .into_response();
@@ -443,9 +525,10 @@ fn stream_events(
             let r = rx.as_mut()?;
             match r.recv().await {
                 Some(Gen::Text(t)) => queue.push_back(Event::default().data(chunk(json!({"content": t}), Value::Null).to_string())),
-                Some(Gen::Done { finish_reason, prompt_tokens, completion_tokens, .. }) => {
+                Some(Gen::Done { finish_reason, prompt_tokens, cached_tokens, completion_tokens, .. }) => {
                     let mut last = chunk(json!({}), json!(finish_reason));
-                    last["usage"] = json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens});
+                    last["usage"] = json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens,
+                                           "prompt_tokens_details": {"cached_tokens": cached_tokens}});
                     queue.push_back(Event::default().data(last.to_string()));
                     queue.push_back(Event::default().data("[DONE]"));
                     rx = None;

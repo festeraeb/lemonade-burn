@@ -410,11 +410,11 @@ impl Lfm2 {
         }
     }
 
-    fn to_vec(t: Tensor<2>) -> Vec<f32> {
+    pub(crate) fn to_vec(t: Tensor<2>) -> Vec<f32> {
         t.into_data().try_to_vec::<f32>().unwrap()
     }
 
-    fn from_vec(&self, v: Vec<f32>, rows: usize, cols: usize) -> Tensor<2> {
+    pub(crate) fn from_vec(&self, v: Vec<f32>, rows: usize, cols: usize) -> Tensor<2> {
         Tensor::from_data(TensorData::new(v, [rows, cols]), &self.device)
     }
 
