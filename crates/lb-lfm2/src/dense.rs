@@ -306,12 +306,13 @@ mod tests {
     /// counted as a candidate.
     #[test]
     fn types_without_a_kernel_sort_last_and_do_not_count() {
-        let q8 = mat(GgmlType::Q8_0, 99_000_000, 0);
+        // F32 has no kernel and is never transcoded (a quantized type such as Q8_0 is, since X7b)
+        let f = mat(GgmlType::F32, 99_000_000, 0);
         let q4 = mat(GgmlType::Q4_0, 1_000, 1);
-        let mut v = vec![&q8, &q4];
+        let mut v = vec![&f, &q4];
         v.sort_by(|a, b| DenseStore::by_return(a, b));
-        assert_eq!(v[0].start, 1, "the Q4_0 matrix is worth more than any byte count of Q8_0");
-        assert_eq!(DenseStore::saving_per_byte(GgmlType::Q8_0), 0.0);
+        assert_eq!(v[0].start, 1, "the Q4_0 matrix is worth more than any byte count of F32");
+        assert_eq!(DenseStore::saving_per_byte(GgmlType::F32), 0.0);
     }
 
     /// Q6_K takes 320 device bytes per 256 values against the file's 210, so a budget check
@@ -322,7 +323,8 @@ mod tests {
         let head = MatRef { rows: 128_000, cols: 2048, ..head };
         assert_eq!(DenseStore::device_bytes(&head), 128_000 * 8 * 320);
         assert!(DenseStore::device_bytes(&head) > head.len, "device copy is larger than the file's");
-        let q4 = mat(GgmlType::Q4_0, 13_570_000, 1);
+        // the device size comes from the shape (a transcoded type has a different file size)
+        let q4 = MatRef { rows: 2048, cols: 1024, ..mat(GgmlType::Q4_0, 2048 * 32 * 18, 1) };
         assert_eq!(DenseStore::device_bytes(&q4), q4.len, "Q4_0 repacks to the same size");
     }
 }
