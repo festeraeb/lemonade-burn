@@ -65,9 +65,52 @@ impl Lfm2 {
     }
 
     /// Put `cache` back at `cp.pos` (which must not be past the cache's position). The KV rows
-    /// of `0..cp.pos` are kept; the conv history is restored from the checkpoint. The device
-    /// copy, if any, is dropped and re-uploaded from the host by the next device pass.
+    /// of `0..cp.pos` are kept where they are; the conv history is restored from the checkpoint.
+    /// A device copy that covers `cp.pos` stays (only its small conv buffers are replaced), so a
+    /// rewind costs no KV read-back and no re-upload; otherwise this is [`Lfm2::rewind_full`].
     pub fn rewind(&self, cache: &mut Cache, cp: &Checkpoint) -> Result<(), String> {
+        if cp.pos > cache.len {
+            return Err(format!("checkpoint at {} is past the sequence's {}", cp.pos, cache.len));
+        }
+        #[cfg(feature = "gpu")]
+        {
+            let keep = cache.dev.as_ref().is_some_and(|d| d.len >= cp.pos && d.cap == cache.cap) && self.store.gpu.is_some();
+            if keep {
+                let cfg = self.cfg();
+                let (e, l) = (cfg.n_embd, cfg.l_cache);
+                let gpu = self.store.gpu.as_ref().expect("checked");
+                let host_ok = cache.host_len >= cp.pos;
+                for (li, layer) in self.w.layers.iter().enumerate() {
+                    if let Operator::Conv { in_proj, .. } = &layer.op {
+                        let rows = cp.conv[li].clone().unwrap_or_else(|| vec![0f32; (l - 1) * e]);
+                        if let Some(block) = self.dense.conv.get(&in_proj.start) {
+                            block.set_state(gpu, &rows)?;
+                            self.dense.mark_conv_clean(in_proj.start);
+                        }
+                        let d = cache.dev.as_mut().expect("checked");
+                        if d.conv[li].is_some() {
+                            d.conv[li] = Some(gpu.upload_f32(&rows));
+                        }
+                        if host_ok {
+                            cache.conv[li] = cp.conv[li].as_ref().map(|v| self.from_vec(v.clone(), l - 1, e));
+                        }
+                    }
+                }
+                cache.dev.as_mut().expect("checked").len = cp.pos;
+                cache.len = cp.pos;
+                // a host that was behind stays behind (the device is the truth); a current one is
+                // current at the new position
+                cache.host_len = cache.host_len.min(cp.pos);
+                return Ok(());
+            }
+        }
+        self.rewind_full(cache, cp)
+    }
+
+    /// [`Lfm2::rewind`] through the host: the KV rows are read back if the device was ahead, the
+    /// conv history is restored on the host, and the device copy is dropped (the next device
+    /// pass re-uploads it).
+    pub fn rewind_full(&self, cache: &mut Cache, cp: &Checkpoint) -> Result<(), String> {
         if cp.pos > cache.len {
             return Err(format!("checkpoint at {} is past the sequence's {}", cp.pos, cache.len));
         }

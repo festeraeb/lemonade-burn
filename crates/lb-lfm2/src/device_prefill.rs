@@ -409,8 +409,19 @@ pub fn prefill(m: &Lfm2, tokens: &[u32], cache: &mut Cache, all_logits: bool) ->
     let pos0 = cache.len;
     let total = pos0 + n;
 
-    // transactional: the host holds everything before pos0, so a failure can drop the device copy
-    pull_if_stale(m, cache);
+    // Transactional. With the host current, a failure just drops the device copy. With the host
+    // behind (decode tokens ran on the device) and no growth needed, reading the whole KV cache
+    // back first would cost more than a short prompt pass does, so only the conv history is
+    // saved (small); `fail` then pulls the KV rows, which a failed pass leaves intact below
+    // `pos0`, and restores the conv history from the saved copy.
+    cache.lazy = None;
+    if cache.host_len < cache.len {
+        let keep = total <= cache.cap && cache.dev.as_ref().is_some_and(|d| d.cap == cache.cap && d.len == pos0);
+        match if keep { m.checkpoint(cache).ok() } else { None } {
+            Some(cp) => cache.lazy = Some(cp),
+            None => pull_if_stale(m, cache),
+        }
+    }
     m.ensure_cap(cache, total);
     let fresh = cache.dev.as_ref().is_none_or(|d| d.cap != cache.cap || d.len != pos0);
     if fresh {
@@ -543,6 +554,7 @@ pub fn prefill(m: &Lfm2, tokens: &[u32], cache: &mut Cache, all_logits: bool) ->
         d.len = total;
     }
     cache.len = total;
+    cache.lazy = None;
     let t = &m.timings;
     t.dp_tokens.fetch_add(n as u64, Ordering::Relaxed);
     t.dp_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -554,6 +566,12 @@ pub fn prefill(m: &Lfm2, tokens: &[u32], cache: &mut Cache, all_logits: bool) ->
 /// (pulled at the start), so the host path can redo the prompt from `cache.len`. A prefill card's
 /// state was marked invalid when the prompt started, so it is re-copied next time.
 fn fail(m: &Lfm2, cache: &mut Cache, why: &str) -> Option<Tensor<2>> {
+    if let Some(cp) = cache.lazy.take() {
+        // the pass began with the host behind: bring the KV rows over now and restore the conv history
+        if let Err(e) = m.rewind_full(cache, &cp) {
+            panic!("device prefill: {why}; restoring the sequence also failed: {e}");
+        }
+    }
     assert!(cache.host_len >= cache.len, "device prefill: {why}, with the host behind: cannot continue");
     eprintln!("lb-lfm2: device prefill abandoned ({why}); the host path runs the prompt");
     cache.dev = None;

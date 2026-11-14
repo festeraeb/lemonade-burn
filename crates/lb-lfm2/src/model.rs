@@ -141,6 +141,10 @@ pub struct Cache {
     /// device-resident decode tokens, which advance only the device copy (`dev`); the next host
     /// pass reads it back first (`device_decode::pull_if_stale`).
     pub host_len: usize,
+    /// Conv history saved at the start of a device prompt pass that began with the host behind
+    /// (`device_prefill.rs`): what a failed pass needs to put the sequence back without the host
+    /// having read the whole KV cache first.
+    pub lazy: Option<crate::prefix::Checkpoint>,
     /// The device copy of this sequence's KV cache and conv state (device-resident decode).
     #[cfg(feature = "gpu")]
     pub dev: Option<crate::device_decode::DevCache>,
@@ -405,6 +409,7 @@ impl Lfm2 {
             len: 0,
             cap: 0,
             host_len: 0,
+            lazy: None,
             #[cfg(feature = "gpu")]
             dev: None,
         }
