@@ -573,6 +573,7 @@ impl Gpu {
                 y.is_some(),
             );
         }
+        self.tr("add_rms_norm", n);
         h
     }
 
@@ -619,6 +620,7 @@ impl Gpu {
                 hd,
             );
         }
+        self.tr("qk_norm_rope", nh);
         qo
     }
 
@@ -646,6 +648,7 @@ impl Gpu {
                 ATTN_LANES,
             );
         }
+        self.tr("attn_decode", nh);
         out
     }
 
@@ -671,6 +674,7 @@ impl Gpu {
                 seq || !self.use_plane,
             );
         }
+        self.tr("router_topk", n_expert);
     }
 
     /// The FFN pre-norm and the router in one launch ([`add_rms_norm_route_kernel`]): `x += y`,
@@ -699,6 +703,7 @@ impl Gpu {
                 seq || !self.use_plane,
             );
         }
+        self.tr("add_rms_norm_route", n);
         h
     }
 
@@ -723,6 +728,7 @@ impl Gpu {
                 BufferArg::from_raw_parts(self.const_f32(&[eps]), 1),
             );
         }
+        self.tr("sum_add_rms_norm", n);
         h
     }
 
@@ -744,6 +750,7 @@ impl Gpu {
                 BufferArg::from_raw_parts(p, 3),
             );
         }
+        self.tr("weighted_sum", n);
         y
     }
 }

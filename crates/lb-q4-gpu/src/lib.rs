@@ -20,6 +20,7 @@ pub mod decode;
 pub mod gemm;
 pub mod prefill;
 pub mod store;
+pub mod trace;
 pub mod transcode;
 pub use decode::TokenParams;
 pub use store::{pick_cube_device, ExpertSlots, Gpu, Q4Math, SideStream, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat, GpuQ8Mat};
@@ -28,6 +29,8 @@ pub mod pinned;
 #[cfg(feature = "cuda")]
 pub mod registered;
 pub use cubecl::server as cubecl_server;
+/// A captured CUDA graph (`Gpu::client.stop_capture()`), replayed by `device_decode.rs`.
+pub use cubecl::client::Graph as CubeGraph;
 
 use cubecl::prelude::*;
 use lb_gguf::QuantMat;

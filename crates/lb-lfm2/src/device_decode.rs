@@ -72,6 +72,10 @@ pub struct Prep {
     /// `moe_index(target) * k`.
     guess: Option<(Handle, Handle)>,
     pub(crate) rope: Option<(Handle, usize)>,
+    /// Bumped whenever `rope` is rebuilt (a graph recorded against the old table is stale).
+    rope_gen: u64,
+    /// The captured token (`LB_DD_GRAPH`), for the sequence whose `DevCache::gen` it names.
+    graph: Option<GraphSlot>,
     tp: TokenParams,
     /// Why no token can take this path (a matrix not resident, ...); `None` = it can.
     pub(crate) blocker: Option<String>,
@@ -79,6 +83,32 @@ pub struct Prep {
     /// token falls back.
     pub(crate) host_moe_layers: Vec<usize>,
     warned: bool,
+}
+
+/// A token recorded as a CUDA graph for one sequence's device state.
+struct GraphSlot {
+    gen: u64,
+    rope_gen: u64,
+    stream: u64,
+    state: GraphState,
+}
+
+enum GraphState {
+    /// `graph_prepare` was called and the token that followed ran normally (the warm-up the
+    /// capture window needs: kernels compiled, scratch buffers allocated).
+    Prepared,
+    /// Recorded: replaying it is the token.
+    Ready(ReadyGraph),
+    /// The capture was refused (logged once); this sequence runs un-graphed.
+    Failed,
+}
+
+struct ReadyGraph {
+    graph: lb_q4_gpu::CubeGraph,
+    logits: Handle,
+    /// The scratch buffers the recording was given: the graph writes these exact buffers on every
+    /// replay, so they are held here and never go back to the scratch pool.
+    _held: Vec<Handle>,
 }
 
 pub(crate) struct LayerPrep {
@@ -103,7 +133,12 @@ pub struct DevCache {
     pub(crate) conv: Vec<Option<Handle>>,
     pub(crate) cap: usize,
     pub(crate) len: usize,
+    /// Which upload this is (`push` makes a new one): the handles are only the same buffers while
+    /// the generation is.
+    pub(crate) gen: u64,
 }
+
+static DEV_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// What the static check says about a pass, before any state is touched.
 #[derive(Debug, PartialEq, Eq)]
@@ -207,6 +242,8 @@ impl Prep {
             slot_routes: gpu.upload_u32(vec![0u32; 2 * n_slots]),
             guess: std::env::var("LB_DEVICE_GUESS").is_ok_and(|v| !v.is_empty() && v != "0").then(|| (gpu.upload_u32(vec![0u32; 2 * n_slots]), gpu.upload_f32(&vec![0f32; n_slots]))),
             rope: None,
+            rope_gen: 0,
+            graph: None,
             tp: TokenParams::new(gpu, 0, 1, 1),
             blocker,
             host_moe_layers,
@@ -269,7 +306,7 @@ pub(crate) fn push(m: &Lfm2, gpu: &Gpu, cache: &mut Cache) {
     assert_eq!(cache.host_len, cache.len, "pushing a host state that is behind");
     let cfg = m.cfg();
     let (e, l, hd, cap) = (cfg.n_embd, cfg.l_cache, cfg.head_dim(), cache.cap);
-    let mut dev = DevCache { k: vec![None; cfg.n_layer], v: vec![None; cfg.n_layer], conv: vec![None; cfg.n_layer], cap, len: cache.len };
+    let mut dev = DevCache { k: vec![None; cfg.n_layer], v: vec![None; cfg.n_layer], conv: vec![None; cfg.n_layer], cap, len: cache.len, gen: DEV_GEN.fetch_add(1, Ordering::Relaxed) };
     for li in 0..cfg.n_layer {
         let kvh = cfg.kv_heads[li];
         if kvh > 0 {
@@ -325,6 +362,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     }
     if prep.rope.as_ref().is_none_or(|(_, rows)| *rows < cache.cap) {
         prep.rope = Some((gpu.upload_f32(&rope_table(cfg.rope_theta, hd, cache.cap)), cache.cap));
+        prep.rope_gen += 1;
     }
     let (rope, rope_rows) = prep.rope.as_ref().map(|(h, r)| (h.clone(), *r)).expect("just built");
     prep.tp.set(gpu, pos0, total, cache.cap);
@@ -333,6 +371,40 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
         let d = cache.dev.as_ref().expect("just pushed");
         (d.k.clone(), d.v.clone(), d.conv.clone())
     };
+
+    // LB_DD_GRAPH: this token as one CUDA graph. Eligible only when it is nothing but launches: every
+    // MoE layer a resident stack on this card, no remote tier, no staging ring, no in-box cards,
+    // no host-run layers. Sequence per device state: the token after `graph_prepare` runs normally
+    // (warm-up), the next one is recorded (the window records launches and runs none of them) and
+    // replayed, every later one only writes its inputs and replays.
+    let graph_ok = knobs.dd_graph()
+        && prep.host_moe_layers.is_empty()
+        && m.store.remote.is_none()
+        && m.store.inbox.is_none()
+        && m.store.ring.lock().expect("stage ring").is_none()
+        && m.w.layers.iter().enumerate().all(|(li, l)| !matches!(l.ffn, Ffn::Moe { .. }) || m.store.layers.contains_key(&li));
+    let gen = cache.dev.as_ref().map(|d| d.gen).unwrap_or(0);
+    let stream = gpu.stream_key();
+    let mut capturing = false;
+    let mut replaying = false;
+    if graph_ok {
+        if prep.graph.as_ref().is_some_and(|g| g.gen != gen || g.rope_gen != prep.rope_gen || g.stream != stream) {
+            // the old graph (and the scratch it holds) goes first: destroying it syncs the stream
+            prep.graph = None;
+        }
+        match prep.graph.as_ref().map(|g| &g.state) {
+            None => match gpu.client.graph_prepare() {
+                Ok(()) => prep.graph = Some(GraphSlot { gen, rope_gen: prep.rope_gen, stream, state: GraphState::Prepared }),
+                Err(e) => {
+                    eprintln!("lb-lfm2: LB_DD_GRAPH: graph_prepare refused ({e:?}); tokens run un-graphed");
+                    prep.graph = Some(GraphSlot { gen, rope_gen: prep.rope_gen, stream, state: GraphState::Failed });
+                }
+            },
+            Some(GraphState::Prepared) => capturing = true,
+            Some(GraphState::Ready(_)) => replaying = true,
+            Some(GraphState::Failed) => {}
+        }
+    }
 
     // the staging ring (`stage.rs`): a new token makes everything it holds stale
     let mut ring_guard = m.store.ring.lock().expect("stage ring");
@@ -362,333 +434,378 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     // a guess job on the worker, to be picked up and issued before the next layer's read
     let mut deferred = false;
     let stage = &m.stats.stage;
-    for (li, layer) in m.w.layers.iter().enumerate() {
-        let lp = &prep.layers[li];
-        let h = match pend.take() {
-            // the previous layer's expert sum, folded into this pre-norm's launch
-            Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &lp.attn_norm, (k_used, e, base, prep.n_slots), eps),
-            None => gpu.add_rms_norm(&prep.x, y.as_ref(), &lp.attn_norm, e, eps),
-        };
-        let op_out = match (&layer.op, &lp.op) {
-            (Operator::Conv { in_proj, out_proj, .. }, OpPrep::Conv { taps }) => {
-                let bcx = mat(m, in_proj).launch(gpu, &h, 1);
-                let state = dev_conv[li].as_ref().expect("conv layer state");
-                let yy = gpu.conv_decode(&bcx, taps, state, e, l);
-                mat(m, out_proj).launch(gpu, &yy, 1)
+    let vocab = cfg.n_vocab;
+    let t_issue = Instant::now();
+    let logits: Handle = if replaying {
+        match prep.graph.as_ref().map(|g| &g.state) {
+            Some(GraphState::Ready(r)) => r.logits.clone(),
+            _ => unreachable!("replaying without a ready graph"),
+        }
+    } else {
+        if capturing {
+            if let Err(err) = gpu.client.start_capture() {
+                return graph_refused(m, cache, tok, guard, ring_guard, &format!("start_capture: {err:?}"));
             }
-            (Operator::Attn { q, k, v, o, .. }, OpPrep::Attn { q_norm, k_norm }) => {
-                let kvh = cfg.kv_heads[li];
-                let (qh, kh, vh) = (mat(m, q).launch(gpu, &h, 1), mat(m, k).launch(gpu, &h, 1), mat(m, v).launch(gpu, &h, 1));
-                let (kc, vc) = (dev_k[li].as_ref().expect("k cache"), dev_v[li].as_ref().expect("v cache"));
-                let qo = gpu.qk_norm_rope(&qh, &kh, &vh, q_norm, k_norm, &rope, rope_rows, kc, vc, &prep.tp, (nh, kvh, hd), eps);
-                let att = gpu.attn_decode(&qo, kc, vc, &prep.tp, (nh, kvh, hd));
-                mat(m, o).launch(gpu, &att, 1)
+        }
+        for (li, layer) in m.w.layers.iter().enumerate() {
+            let lp = &prep.layers[li];
+            if gpu.trace.is_on() {
+                let op = if matches!(layer.op, Operator::Conv { .. }) { "conv" } else { "attn" };
+                gpu.trace.label(&format!("L{li}:{op}/{}", if matches!(layer.ffn, Ffn::Moe { .. }) { "moe" } else { "dense" }));
             }
-            _ => unreachable!("layer {li}: operator and its device copy disagree"),
-        };
-        // a stacked MoE layer on this card: its router runs in the pre-norm's launch (`fuse`)
-        let fused = fuse
-            && matches!(&layer.ffn, Ffn::Moe { .. })
-            && lp.moe_index.is_some()
-            && lp.router.is_some()
-            && m.store.layers.contains_key(&li)
-            && !m.store.inbox.as_ref().is_some_and(|ib| ib.card_of(li).is_some());
-        let h2 = if fused {
-            let (rh, bh) = lp.router.as_ref().expect("checked");
-            let base = lp.moe_index.expect("checked") * k_used;
-            gpu.add_rms_norm_route(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, base, prep.n_slots), knobs.dd_router_seq())
-        } else {
-            gpu.add_rms_norm(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps)
-        };
-        let ffn_out = match &layer.ffn {
-            Ffn::Dense { gate, up, down } => {
-                let hh = GpuQ4Mat::launch_gate_up_silu(gpu, mat(m, gate), mat(m, up), &h2, 1);
-                mat(m, down).launch(gpu, &hh, 1)
-            }
-            // work-to-weights inside the box (`inbox.rs`): the layer lives on another card of this
-            // process; the activation goes card to card and the routes, experts and sum run there
-            // with the one-card kernels; nothing is read on the host
-            Ffn::Moe { .. } if !remote_on && lp.moe_index.is_some() && m.store.inbox.as_ref().is_some_and(|ib| ib.card_of(li).is_some()) => {
-                let ib = m.store.inbox.as_ref().expect("checked");
-                let card = ib.card_of(li).expect("checked");
-                let base = lp.moe_index.expect("checked") * k_used;
-                let h2b = gpu.copy_to(&h2, &card.gpu);
-                let (rh, bh) = card.routers.get(&li).expect("router uploaded with the layer");
-                card.gpu.router_topk(&h2b, rh, bh, &card.routes, &card.weights, (n_exp, k_used, e, base, prep.n_slots), knobs.dd_router_seq());
-                let (outs, _) = card.layers[&li].launch_device(&card.gpu, &h2b, 1, &card.routes, prep.n_slots, base, k_used);
-                let yb = card.gpu.weighted_sum(&outs, &card.weights, &card.routes, (k_used, e, base, prep.n_slots));
-                let y = card.gpu.copy_to(&yb, gpu);
-                keep.push(y.clone());
-                inbox_layers += 1;
-                y
-            }
-            Ffn::Moe { router, bias, gate, up, down } => match (if remote_on { None } else { m.store.layers.get(&li) }, lp.moe_index, &lp.router) {
-                (Some(stack), Some(mi), Some((rh, bh))) => {
-                    let base = mi * k_used;
-                    if !fused {
-                        gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), knobs.dd_router_seq());
-                    }
-                    let (outs, _) = stack.launch_device(gpu, &h2, 1, &prep.routes, prep.n_slots, base, k_used);
-                    dev_moe += 1;
-                    if fused {
-                        // the sum runs in the next pre-norm's launch
-                        pend = Some((outs.clone(), base));
-                        outs
-                    } else {
-                        gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots))
-                    }
+            let h = match pend.take() {
+                // the previous layer's expert sum, folded into this pre-norm's launch
+                Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &lp.attn_norm, (k_used, e, base, prep.n_slots), eps),
+                None => gpu.add_rms_norm(&prep.x, y.as_ref(), &lp.attn_norm, e, eps),
+            };
+            let op_out = match (&layer.op, &lp.op) {
+                (Operator::Conv { in_proj, out_proj, .. }, OpPrep::Conv { taps }) => {
+                    let bcx = mat(m, in_proj).launch(gpu, &h, 1);
+                    let state = dev_conv[li].as_ref().expect("conv layer state");
+                    let yy = gpu.conv_decode(&bcx, taps, state, e, l);
+                    mat(m, out_proj).launch(gpu, &yy, 1)
                 }
-                (None, Some(mi), Some((rh, bh))) if e2 => {
-                    let base = mi * k_used;
-                    let seq = knobs.dd_router_seq();
-                    gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), seq);
-                    // the guess of the next MoE layer, from the same residual stream (`x` is this
-                    // layer's x_mid here): its router on its own FFN pre-norm
-                    let mut want = vec![(prep.routes.clone(), prep.n_slots * 8)];
-                    if let (Some((gr, gw)), Some(next)) = (prep.guess.as_ref(), prep.layers.get(li + 1)) {
-                        if let (Some(nmi), Some((nr, nb))) = (next.moe_index, next.router.as_ref()) {
-                            let hn = gpu.add_rms_norm(&prep.x, None, &next.ffn_norm, e, eps);
-                            gpu.router_topk(&hn, nr, nb, gr, gw, (n_exp, k_used, e, nmi * k_used, prep.n_slots), seq);
-                            want.push((gr.clone(), prep.n_slots * 8));
+                (Operator::Attn { q, k, v, o, .. }, OpPrep::Attn { q_norm, k_norm }) => {
+                    let kvh = cfg.kv_heads[li];
+                    let (qh, kh, vh) = (mat(m, q).launch(gpu, &h, 1), mat(m, k).launch(gpu, &h, 1), mat(m, v).launch(gpu, &h, 1));
+                    let (kc, vc) = (dev_k[li].as_ref().expect("k cache"), dev_v[li].as_ref().expect("v cache"));
+                    let qo = gpu.qk_norm_rope(&qh, &kh, &vh, q_norm, k_norm, &rope, rope_rows, kc, vc, &prep.tp, (nh, kvh, hd), eps);
+                    let att = gpu.attn_decode(&qo, kc, vc, &prep.tp, (nh, kvh, hd));
+                    mat(m, o).launch(gpu, &att, 1)
+                }
+                _ => unreachable!("layer {li}: operator and its device copy disagree"),
+            };
+            // a stacked MoE layer on this card: its router runs in the pre-norm's launch (`fuse`)
+            let fused = fuse
+                && matches!(&layer.ffn, Ffn::Moe { .. })
+                && lp.moe_index.is_some()
+                && lp.router.is_some()
+                && m.store.layers.contains_key(&li)
+                && !m.store.inbox.as_ref().is_some_and(|ib| ib.card_of(li).is_some());
+            let h2 = if fused {
+                let (rh, bh) = lp.router.as_ref().expect("checked");
+                let base = lp.moe_index.expect("checked") * k_used;
+                gpu.add_rms_norm_route(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, base, prep.n_slots), knobs.dd_router_seq())
+            } else {
+                gpu.add_rms_norm(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps)
+            };
+            let ffn_out = match &layer.ffn {
+                Ffn::Dense { gate, up, down } => {
+                    let hh = GpuQ4Mat::launch_gate_up_silu(gpu, mat(m, gate), mat(m, up), &h2, 1);
+                    mat(m, down).launch(gpu, &hh, 1)
+                }
+                // work-to-weights inside the box (`inbox.rs`): the layer lives on another card of this
+                // process; the activation goes card to card and the routes, experts and sum run there
+                // with the one-card kernels; nothing is read on the host
+                Ffn::Moe { .. } if !remote_on && lp.moe_index.is_some() && m.store.inbox.as_ref().is_some_and(|ib| ib.card_of(li).is_some()) => {
+                    let ib = m.store.inbox.as_ref().expect("checked");
+                    let card = ib.card_of(li).expect("checked");
+                    let base = lp.moe_index.expect("checked") * k_used;
+                    let h2b = gpu.copy_to(&h2, &card.gpu);
+                    let (rh, bh) = card.routers.get(&li).expect("router uploaded with the layer");
+                    card.gpu.router_topk(&h2b, rh, bh, &card.routes, &card.weights, (n_exp, k_used, e, base, prep.n_slots), knobs.dd_router_seq());
+                    let (outs, _) = card.layers[&li].launch_device(&card.gpu, &h2b, 1, &card.routes, prep.n_slots, base, k_used);
+                    let yb = card.gpu.weighted_sum(&outs, &card.weights, &card.routes, (k_used, e, base, prep.n_slots));
+                    let y = card.gpu.copy_to(&yb, gpu);
+                    keep.push(y.clone());
+                    inbox_layers += 1;
+                    y
+                }
+                Ffn::Moe { router, bias, gate, up, down } => match (if remote_on { None } else { m.store.layers.get(&li) }, lp.moe_index, &lp.router) {
+                    (Some(stack), Some(mi), Some((rh, bh))) => {
+                        let base = mi * k_used;
+                        if !fused {
+                            gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), knobs.dd_router_seq());
                         }
-                    }
-                    // E3: the residual stream comes back with the routes (same sync) for the host's
-                    // guess of the next layer (`x` is this layer's x_mid here)
-                    let la = &m.store.la;
-                    let x_at = (la.on && la.oracle.is_none()).then(|| { want.push((prep.x.clone(), e * 4)); want.len() - 1 });
-                    if deferred {
-                        deferred = false;
-                        let t = Instant::now();
-                        let mut g2 = m.store.cache.lock().expect("expert cache");
-                        let c2 = g2.as_mut().expect("checked above");
-                        let gs = c2.worker.as_ref().map(|w| w.recv()).unwrap_or_default();
-                        stage.la_guess_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        la_issue(m, gpu, c2, &gs);
-                    }
-                    // the host learns this layer's routes: the one sync a layer that a miss served
-                    // from host memory cannot avoid
-                    let t_read = Instant::now();
-                    let mut bufs = match gpu.read_raw_keep(want) {
-                        Ok(b) => b,
-                        Err(err) => return abandon(m, cache, &format!("MoE layer {li} routes read: {err}")),
-                    };
-                    stage.h2_read_ns.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    stage.host_syncs.fetch_add(1, Ordering::Relaxed);
-                    let u32s = |b: &[u8]| b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<u32>>();
-                    let routes_now = u32s(&bufs[0]);
-                    let ids: Vec<u32> = (0..k_used).map(|i| routes_now[2 * (base + i)]).collect();
-                    if let Some(g) = guessed.take() {
-                        stage.guess_named.fetch_add(g.iter().filter(|e| ids.contains(e)).count() as u64, Ordering::Relaxed);
-                        stage.guess_total.fetch_add(k_used as u64, Ordering::Relaxed);
-                    }
-                    if let (Some(b), Some(nmi)) = (bufs.get(1), prep.layers.get(li + 1).and_then(|n| n.moe_index)) {
-                        let g = u32s(b);
-                        guessed = Some((0..k_used).map(|i| g[2 * (nmi * k_used + i)]).collect());
-                    }
-                    let mut needed: Vec<usize> = ids.iter().map(|&x| x as usize).collect();
-                    needed.sort_unstable();
-                    // E3: the host guess of the next MoE layers, from the state before this layer's
-                    // experts run (`docs/ENGINE_E3_LOOKAHEAD.md`)
-                    // with the worker the guess is picked up after the launches (`pending`)
-                    let mut pending = false;
-                    let mut guesses: Vec<crate::stage::Guess> = Vec::new();
-                    if let Some(i) = x_at {
-                        let t = Instant::now();
-                        let worker = m.store.cache.lock().expect("expert cache").as_ref().and_then(|c| c.worker.as_ref().map(|w| { w.send(li, std::mem::take(&mut bufs[i])); }));
-                        if worker.is_some() {
-                            pending = true;
+                        let (outs, _) = stack.launch_device(gpu, &h2, 1, &prep.routes, prep.n_slots, base, k_used);
+                        dev_moe += 1;
+                        if fused {
+                            // the sum runs in the next pre-norm's launch
+                            pend = Some((outs.clone(), base));
+                            outs
                         } else {
-                            let x_mid: Vec<f32> = bufs[i].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                            guesses.extend((1..=la.pf_depth).filter_map(|d| crate::stage::predict(&m.w, li + d, &x_mid, la.n_guess)));
+                            gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots))
                         }
-                        stage.la_guess_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }
-                    let t_fill = Instant::now();
-                    let mut guard = m.store.cache.lock().expect("expert cache");
-                    let c = guard.as_mut().expect("checked above");
-                    // LB_LA_ORACLE: the recorded next pass replaces the guess (diagnostic, no host cost)
-                    if let Some((passes, i)) = c.oracle.as_mut() {
-                        let cur = *i;
-                        *i += 1;
-                        guesses = (1..=la.pf_depth)
-                            .filter_map(|d| passes.get(cur + d).filter(|(l, _)| *l == li + d).map(|(l, ex)| crate::stage::Guess { layer: *l, experts: ex.clone(), margin: 0.0, scores: vec![1.0; ex.len()], ref_score: 0.0 }))
-                            .collect();
-                    }
-                    let guess = guesses.first().cloned();
-                    c.trace_pass("d", li, pos0, &needed, guess.as_ref());
-                    // this sync finished every repack queued before it: their landing buffers are free
-                    if let Some(l) = c.landings.as_mut() {
-                        l.book.reclaim();
-                    }
-                    // keep guard: what the coming layers are predicted to need is not evicted now
-                    let keep: Vec<(usize, usize)> = if la.keep {
-                        let mut v: Vec<(usize, usize)> = guess.iter().flat_map(|g| g.experts.iter().map(|&x| (g.layer, x))).collect();
-                        if la.keep_depth > 1 {
-                            let x_mid: Vec<f32> = x_at.map(|i| bufs[i].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()).unwrap_or_default();
-                            for d in 2..=la.keep_depth {
-                                if let Some(g) = crate::stage::predict(&m.w, li + d, &x_mid, la.n_guess) {
-                                    v.extend(g.experts.iter().map(|&x| (g.layer, x)));
-                                }
+                    (None, Some(mi), Some((rh, bh))) if e2 => {
+                        let base = mi * k_used;
+                        let seq = knobs.dd_router_seq();
+                        gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), seq);
+                        // the guess of the next MoE layer, from the same residual stream (`x` is this
+                        // layer's x_mid here): its router on its own FFN pre-norm
+                        let mut want = vec![(prep.routes.clone(), prep.n_slots * 8)];
+                        if let (Some((gr, gw)), Some(next)) = (prep.guess.as_ref(), prep.layers.get(li + 1)) {
+                            if let (Some(nmi), Some((nr, nb))) = (next.moe_index, next.router.as_ref()) {
+                                let hn = gpu.add_rms_norm(&prep.x, None, &next.ffn_norm, e, eps);
+                                gpu.router_topk(&hn, nr, nb, gr, gw, (n_exp, k_used, e, nmi * k_used, prep.n_slots), seq);
+                                want.push((gr.clone(), prep.n_slots * 8));
                             }
                         }
-                        v
-                    } else {
-                        Vec::new()
-                    };
-                    let plan = match c.slru.plan_la(li, &needed, &keep, la.cycle_window, cfg.n_layer) {
-                        Some((p, spared)) => {
-                            stage.la_spared.fetch_add(spared, Ordering::Relaxed);
-                            p
-                        }
-                        None => return abandon(m, cache, &format!("layer {li}: {} experts > {} cache slots", needed.len(), c.slru.n_slots())),
-                    };
-                    if la.promote > 0 {
-                        if let Some(g) = guess.as_ref() {
-                            for &x in &g.experts {
-                                if c.slru.promote(g.layer, x, la.promote > 1) {
-                                    stage.la_promoted.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-                    let mut n_landed = 0;
-                    let mut fence: Option<Handle> = None;
-                    for &(x, s) in &plan.fills {
-                        let raw = |r: &MatRef| m.w.mat(r).bytes;
-                        // a miss the prefetch already copied in: repack from the landing buffer, the
-                        // bus already paid
-                        if let Some(l) = c.landings.as_mut() {
-                            if let Some(i) = l.book.consume(li, x) {
-                                let sent = l.sentinels[i].take().expect("a landing in flight has its sentinel");
-                                match l.spare[i].take() {
-                                    // the spare slot already holds the expert: it becomes this slot, and
-                                    // the slot it replaces becomes a spare
-                                    Some(p) => {
-                                        let old = c.phys[s] as usize;
-                                        c.phys[s] = p as u32;
-                                        c.spares.push(old);
-                                        fence = Some(sent);
-                                    }
-                                    None => c.slots.repack_landed(gpu, c.phys[s] as usize, &l.buffers[i], &sent),
-                                }
-                                n_landed += 1;
-                                if li < crate::stage::MAX_LAYERS {
-                                    stage.useful[li].fetch_add(1, Ordering::Relaxed);
-                                }
-                                c.count_fill();
-                                continue;
-                            }
-                        }
-                        if let Err(err) = c.slots.fill(gpu, c.phys[s] as usize, [raw(&gate.expert(x)), raw(&up.expert(x)), raw(&down.expert(x))]) {
-                            return abandon(m, cache, &format!("layer {li} slot fill: {err}"));
-                        }
-                        c.count_fill();
-                    }
-                    let (n_hit, n_fill) = (plan.hits.len(), plan.fills.len());
-                    let n_demand = n_fill - n_landed;
-                    m.stats.gpu_hits.fetch_add(n_hit as u64, Ordering::Relaxed);
-                    m.stats.on_demand.fetch_add(n_fill as u64, Ordering::Relaxed);
-                    m.stats.on_demand_ns.fetch_add(t_fill.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    stage.layer(li, n_hit, n_landed, n_demand);
-                    stage.moe_layers.fetch_add(1, Ordering::Relaxed);
-                    if n_demand > 0 {
-                        stage.miss_layers.fetch_add(1, Ordering::Relaxed);
-                    }
-                    for (i, &x) in ids.iter().enumerate() {
-                        slot_words[2 * (base + i)] = c.phys[c.slru.slot(li, x as usize).expect("planned")];
-                    }
-                    gpu.write_u32(&prep.slot_routes, &slot_words);
-                    if let Some(f) = fence.take() {
-                        c.slots.fence(gpu, &f);
-                    }
-                    let (outs, _) = c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used);
-                    let sum = gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots));
-                    // landings this layer did not use were wrong guesses: they cost bus, nothing else
-                    if let Some(l) = c.landings.as_mut() {
-                        let raw_b = c.slots.raw_expert_bytes() as u64;
-                        let expired = l.book.expire_through(li);
-                        for &i in &expired {
-                            l.sentinels[i] = None;
-                            if let Some(p) = l.spare[i].take() {
-                                c.spares.push(p);
-                            }
-                        }
-                        let n = expired.len() as u64;
-                        if n > 0 && li < crate::stage::MAX_LAYERS {
-                            stage.wasted[li].fetch_add(n, Ordering::Relaxed);
-                            stage.wasted_bytes.fetch_add(n * raw_b, Ordering::Relaxed);
-                        }
-                        if pending && la.defer {
-                            // the job is picked up just before the next layer's read: the worker gets
-                            // this layer's launches and the next operator's to finish in
-                            deferred = true;
-                        } else if pending {
+                        // E3: the residual stream comes back with the routes (same sync) for the host's
+                        // guess of the next layer (`x` is this layer's x_mid here)
+                        let la = &m.store.la;
+                        let x_at = (la.on && la.oracle.is_none()).then(|| { want.push((prep.x.clone(), e * 4)); want.len() - 1 });
+                        if deferred {
+                            deferred = false;
                             let t = Instant::now();
-                            if let Some(w) = c.worker.as_ref() {
-                                guesses = w.recv();
+                            let mut g2 = m.store.cache.lock().expect("expert cache");
+                            let c2 = g2.as_mut().expect("checked above");
+                            let gs = c2.worker.as_ref().map(|w| w.recv()).unwrap_or_default();
+                            stage.la_guess_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            la_issue(m, gpu, c2, &gs);
+                        }
+                        // the host learns this layer's routes: the one sync a layer that a miss served
+                        // from host memory cannot avoid
+                        let t_read = Instant::now();
+                        let mut bufs = match gpu.read_raw_keep(want) {
+                            Ok(b) => b,
+                            Err(err) => return abandon(m, cache, &format!("MoE layer {li} routes read: {err}")),
+                        };
+                        stage.h2_read_ns.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        stage.host_syncs.fetch_add(1, Ordering::Relaxed);
+                        let u32s = |b: &[u8]| b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<u32>>();
+                        let routes_now = u32s(&bufs[0]);
+                        let ids: Vec<u32> = (0..k_used).map(|i| routes_now[2 * (base + i)]).collect();
+                        if let Some(g) = guessed.take() {
+                            stage.guess_named.fetch_add(g.iter().filter(|e| ids.contains(e)).count() as u64, Ordering::Relaxed);
+                            stage.guess_total.fetch_add(k_used as u64, Ordering::Relaxed);
+                        }
+                        if let (Some(b), Some(nmi)) = (bufs.get(1), prep.layers.get(li + 1).and_then(|n| n.moe_index)) {
+                            let g = u32s(b);
+                            guessed = Some((0..k_used).map(|i| g[2 * (nmi * k_used + i)]).collect());
+                        }
+                        let mut needed: Vec<usize> = ids.iter().map(|&x| x as usize).collect();
+                        needed.sort_unstable();
+                        // E3: the host guess of the next MoE layers, from the state before this layer's
+                        // experts run (`docs/ENGINE_E3_LOOKAHEAD.md`)
+                        // with the worker the guess is picked up after the launches (`pending`)
+                        let mut pending = false;
+                        let mut guesses: Vec<crate::stage::Guess> = Vec::new();
+                        if let Some(i) = x_at {
+                            let t = Instant::now();
+                            let worker = m.store.cache.lock().expect("expert cache").as_ref().and_then(|c| c.worker.as_ref().map(|w| { w.send(li, std::mem::take(&mut bufs[i])); }));
+                            if worker.is_some() {
+                                pending = true;
+                            } else {
+                                let x_mid: Vec<f32> = bufs[i].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                guesses.extend((1..=la.pf_depth).filter_map(|d| crate::stage::predict(&m.w, li + d, &x_mid, la.n_guess)));
                             }
                             stage.la_guess_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
-                    }
-                    if !deferred {
-                        la_issue(m, gpu, c, &guesses);
-                    }
-                    sum
-                }
-                _ => {
-                    // not resident as a stack: the old host path for this layer, one sync. With
-                    // the staging ring the same read also brings back the residual stream after
-                    // this layer's operator (`x`, updated in place by `add_rms_norm`), the input
-                    // of the next layer's guess.
-                    let t_read = Instant::now();
-                    let read = if ring_guard.is_some() { gpu.read_raw(vec![(h2, e * 4), (prep.x.clone(), e * 4)]) } else { gpu.read_raw(vec![(h2, e * 4)]) };
-                    let mut bufs = match read {
-                        Ok(b) => b,
-                        Err(err) => {
-                            drop(ring_guard);
-                            return abandon(m, cache, &format!("host MoE layer {li} read: {err}"));
+                        let t_fill = Instant::now();
+                        let mut guard = m.store.cache.lock().expect("expert cache");
+                        let c = guard.as_mut().expect("checked above");
+                        // LB_LA_ORACLE: the recorded next pass replaces the guess (diagnostic, no host cost)
+                        if let Some((passes, i)) = c.oracle.as_mut() {
+                            let cur = *i;
+                            *i += 1;
+                            guesses = (1..=la.pf_depth)
+                                .filter_map(|d| passes.get(cur + d).filter(|(l, _)| *l == li + d).map(|(l, ex)| crate::stage::Guess { layer: *l, experts: ex.clone(), margin: 0.0, scores: vec![1.0; ex.len()], ref_score: 0.0 }))
+                                .collect();
                         }
-                    };
-                    m.stats.stage.h2_read_ns.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    let f32v = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
-                    let hv = f32v(&bufs[0]);
-                    let rc = match ring_guard.as_mut() {
-                        Some(ring) => {
-                            let x_mid = f32v(&bufs.pop().expect("x read with h2"));
-                            let t = Instant::now();
-                            let next = if m.store.stage.slots > 0 { crate::stage::predict(&m.w, li + 1, &x_mid, m.store.stage.slots) } else { None };
-                            m.stats.stage.issue_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            Some(crate::stage::RingCall { ring, gpu, w: &m.w, cfg: &m.store.stage, stats: &m.stats.stage, next })
+                        let guess = guesses.first().cloned();
+                        c.trace_pass("d", li, pos0, &needed, guess.as_ref());
+                        // this sync finished every repack queued before it: their landing buffers are free
+                        if let Some(l) = c.landings.as_mut() {
+                            l.book.reclaim();
                         }
-                        None => None,
-                    };
-                    let (out, routes) = moe_ffn_with(&m.w, router, bias, gate, up, down, &hv, 1, &m.store, li, &m.stats, rc);
-                    host_routes.push((li, routes.into_iter().next().expect("one token, one route")));
-                    let hnd = gpu.upload_f32(&out);
-                    keep.push(hnd.clone());
-                    hnd
+                        // keep guard: what the coming layers are predicted to need is not evicted now
+                        let keep: Vec<(usize, usize)> = if la.keep {
+                            let mut v: Vec<(usize, usize)> = guess.iter().flat_map(|g| g.experts.iter().map(|&x| (g.layer, x))).collect();
+                            if la.keep_depth > 1 {
+                                let x_mid: Vec<f32> = x_at.map(|i| bufs[i].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()).unwrap_or_default();
+                                for d in 2..=la.keep_depth {
+                                    if let Some(g) = crate::stage::predict(&m.w, li + d, &x_mid, la.n_guess) {
+                                        v.extend(g.experts.iter().map(|&x| (g.layer, x)));
+                                    }
+                                }
+                            }
+                            v
+                        } else {
+                            Vec::new()
+                        };
+                        let plan = match c.slru.plan_la(li, &needed, &keep, la.cycle_window, cfg.n_layer) {
+                            Some((p, spared)) => {
+                                stage.la_spared.fetch_add(spared, Ordering::Relaxed);
+                                p
+                            }
+                            None => return abandon(m, cache, &format!("layer {li}: {} experts > {} cache slots", needed.len(), c.slru.n_slots())),
+                        };
+                        if la.promote > 0 {
+                            if let Some(g) = guess.as_ref() {
+                                for &x in &g.experts {
+                                    if c.slru.promote(g.layer, x, la.promote > 1) {
+                                        stage.la_promoted.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                        let mut n_landed = 0;
+                        let mut fence: Option<Handle> = None;
+                        for &(x, s) in &plan.fills {
+                            let raw = |r: &MatRef| m.w.mat(r).bytes;
+                            // a miss the prefetch already copied in: repack from the landing buffer, the
+                            // bus already paid
+                            if let Some(l) = c.landings.as_mut() {
+                                if let Some(i) = l.book.consume(li, x) {
+                                    let sent = l.sentinels[i].take().expect("a landing in flight has its sentinel");
+                                    match l.spare[i].take() {
+                                        // the spare slot already holds the expert: it becomes this slot, and
+                                        // the slot it replaces becomes a spare
+                                        Some(p) => {
+                                            let old = c.phys[s] as usize;
+                                            c.phys[s] = p as u32;
+                                            c.spares.push(old);
+                                            fence = Some(sent);
+                                        }
+                                        None => c.slots.repack_landed(gpu, c.phys[s] as usize, &l.buffers[i], &sent),
+                                    }
+                                    n_landed += 1;
+                                    if li < crate::stage::MAX_LAYERS {
+                                        stage.useful[li].fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    c.count_fill();
+                                    continue;
+                                }
+                            }
+                            if let Err(err) = c.slots.fill(gpu, c.phys[s] as usize, [raw(&gate.expert(x)), raw(&up.expert(x)), raw(&down.expert(x))]) {
+                                return abandon(m, cache, &format!("layer {li} slot fill: {err}"));
+                            }
+                            c.count_fill();
+                        }
+                        let (n_hit, n_fill) = (plan.hits.len(), plan.fills.len());
+                        let n_demand = n_fill - n_landed;
+                        m.stats.gpu_hits.fetch_add(n_hit as u64, Ordering::Relaxed);
+                        m.stats.on_demand.fetch_add(n_fill as u64, Ordering::Relaxed);
+                        m.stats.on_demand_ns.fetch_add(t_fill.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        stage.layer(li, n_hit, n_landed, n_demand);
+                        stage.moe_layers.fetch_add(1, Ordering::Relaxed);
+                        if n_demand > 0 {
+                            stage.miss_layers.fetch_add(1, Ordering::Relaxed);
+                        }
+                        for (i, &x) in ids.iter().enumerate() {
+                            slot_words[2 * (base + i)] = c.phys[c.slru.slot(li, x as usize).expect("planned")];
+                        }
+                        gpu.write_u32(&prep.slot_routes, &slot_words);
+                        if let Some(f) = fence.take() {
+                            c.slots.fence(gpu, &f);
+                        }
+                        let (outs, _) = c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used);
+                        let sum = gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots));
+                        // landings this layer did not use were wrong guesses: they cost bus, nothing else
+                        if let Some(l) = c.landings.as_mut() {
+                            let raw_b = c.slots.raw_expert_bytes() as u64;
+                            let expired = l.book.expire_through(li);
+                            for &i in &expired {
+                                l.sentinels[i] = None;
+                                if let Some(p) = l.spare[i].take() {
+                                    c.spares.push(p);
+                                }
+                            }
+                            let n = expired.len() as u64;
+                            if n > 0 && li < crate::stage::MAX_LAYERS {
+                                stage.wasted[li].fetch_add(n, Ordering::Relaxed);
+                                stage.wasted_bytes.fetch_add(n * raw_b, Ordering::Relaxed);
+                            }
+                            if pending && la.defer {
+                                // the job is picked up just before the next layer's read: the worker gets
+                                // this layer's launches and the next operator's to finish in
+                                deferred = true;
+                            } else if pending {
+                                let t = Instant::now();
+                                if let Some(w) = c.worker.as_ref() {
+                                    guesses = w.recv();
+                                }
+                                stage.la_guess_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            }
+                        }
+                        if !deferred {
+                            la_issue(m, gpu, c, &guesses);
+                        }
+                        sum
+                    }
+                    _ => {
+                        // not resident as a stack: the old host path for this layer, one sync. With
+                        // the staging ring the same read also brings back the residual stream after
+                        // this layer's operator (`x`, updated in place by `add_rms_norm`), the input
+                        // of the next layer's guess.
+                        let t_read = Instant::now();
+                        let read = if ring_guard.is_some() { gpu.read_raw(vec![(h2, e * 4), (prep.x.clone(), e * 4)]) } else { gpu.read_raw(vec![(h2, e * 4)]) };
+                        let mut bufs = match read {
+                            Ok(b) => b,
+                            Err(err) => {
+                                drop(ring_guard);
+                                return abandon(m, cache, &format!("host MoE layer {li} read: {err}"));
+                            }
+                        };
+                        m.stats.stage.h2_read_ns.fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        let f32v = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
+                        let hv = f32v(&bufs[0]);
+                        let rc = match ring_guard.as_mut() {
+                            Some(ring) => {
+                                let x_mid = f32v(&bufs.pop().expect("x read with h2"));
+                                let t = Instant::now();
+                                let next = if m.store.stage.slots > 0 { crate::stage::predict(&m.w, li + 1, &x_mid, m.store.stage.slots) } else { None };
+                                m.stats.stage.issue_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                Some(crate::stage::RingCall { ring, gpu, w: &m.w, cfg: &m.store.stage, stats: &m.stats.stage, next })
+                            }
+                            None => None,
+                        };
+                        let (out, routes) = moe_ffn_with(&m.w, router, bias, gate, up, down, &hv, 1, &m.store, li, &m.stats, rc);
+                        host_routes.push((li, routes.into_iter().next().expect("one token, one route")));
+                        let hnd = gpu.upload_f32(&out);
+                        keep.push(hnd.clone());
+                        hnd
+                    }
+                },
+            };
+            y = if pend.is_some() { None } else { Some(ffn_out) };
+        }
+        // the last layer's job is for no layer: take its answer so it does not meet the next token's
+        if deferred {
+            if let Some(c) = m.store.cache.lock().expect("expert cache").as_ref() {
+                if let Some(w) = c.worker.as_ref() {
+                    let _ = w.recv();
                 }
-            },
-        };
-        y = if pend.is_some() { None } else { Some(ffn_out) };
-    }
-    // the last layer's job is for no layer: take its answer so it does not meet the next token's
-    if deferred {
-        if let Some(c) = m.store.cache.lock().expect("expert cache").as_ref() {
-            if let Some(w) = c.worker.as_ref() {
-                let _ = w.recv();
             }
         }
+        let hf = match pend.take() {
+            Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &prep.final_norm, (k_used, e, base, prep.n_slots), eps),
+            None => gpu.add_rms_norm(&prep.x, y.as_ref(), &prep.final_norm, e, eps),
+        };
+        let logits_h = match head(m).expect("checked in Prep::new") {
+            Head::Q6(h6) => h6.launch(gpu, &hf, 1),
+            Head::Q4(h4) => h4.launch(gpu, &hf, 1),
+        };
+        if capturing {
+            // the recording runs nothing; a refusal leaves every buffer as it was, so the token is
+            // simply run again without the graph
+            let graph = match gpu.client.stop_capture() {
+                Ok(g) => g,
+                Err(err) => return graph_refused(m, cache, tok, guard, ring_guard, &format!("stop_capture: {err:?}")),
+            };
+            let held = gpu.take_in_flight();
+            if let Some(slot) = prep.graph.as_mut() {
+                slot.state = GraphState::Ready(ReadyGraph { graph, logits: logits_h.clone(), _held: held });
+            }
+            m.timings.dd_graph_captures.fetch_add(1, Ordering::Relaxed);
+        }
+        logits_h
+    };
+    if capturing || replaying {
+        if let Some(GraphState::Ready(r)) = prep.graph.as_ref().map(|g| &g.state) {
+            // SAFETY: every handle the recording used is held by this slot or by `prep`/`cache`,
+            // the graph is only replayed on the stream it was recorded on (`GraphSlot::stream`), and
+            // this token's inputs were written on that same stream above.
+            if let Err(err) = unsafe { r.graph.replay() } {
+                prep.graph = None;
+                return abandon(m, cache, &format!("graph replay: {err:?}"));
+            }
+            m.timings.dd_graph_replays.fetch_add(1, Ordering::Relaxed);
+        }
+        dev_moe = prep.layers.iter().filter(|l| l.moe_index.is_some()).count() as u64;
     }
-    let hf = match pend.take() {
-        Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &prep.final_norm, (k_used, e, base, prep.n_slots), eps),
-        None => gpu.add_rms_norm(&prep.x, y.as_ref(), &prep.final_norm, e, eps),
-    };
-    let vocab = cfg.n_vocab;
-    let logits = match head(m).expect("checked in Prep::new") {
-        Head::Q6(h6) => h6.launch(gpu, &hf, 1),
-        Head::Q4(h4) => h4.launch(gpu, &hf, 1),
-    };
+    m.timings.dd_issue_ns.fetch_add(t_issue.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let read = gpu.read_raw(vec![(logits, vocab * 4), (prep.routes.clone(), prep.n_slots * 8), (prep.weights.clone(), prep.n_slots * 4)]);
     if e2 {
         stage.host_syncs.fetch_add(1, Ordering::Relaxed);
@@ -827,6 +944,26 @@ fn la_issue(m: &Lfm2, gpu: &Gpu, c: &mut crate::cache::ExpertCache, guesses: &[c
             }
             stage.issue_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
+}
+
+/// A capture the runtime refused (or a window that could not open): mark the sequence un-graphed
+/// and run this token again the normal way. The caller's state is untouched (nothing was recorded
+/// to the device), so the repeat is exact.
+fn graph_refused(
+    m: &Lfm2,
+    cache: &mut Cache,
+    tok: u32,
+    mut guard: std::sync::MutexGuard<'_, Option<Prep>>,
+    ring_guard: std::sync::MutexGuard<'_, Option<crate::stage::Ring>>,
+    why: &str,
+) -> Option<Tensor<2>> {
+    eprintln!("lb-lfm2: LB_DD_GRAPH: capture refused ({why}); this sequence runs un-graphed");
+    if let Some(slot) = guard.as_mut().and_then(|p| p.graph.as_mut()) {
+        slot.state = GraphState::Failed;
+    }
+    drop(ring_guard);
+    drop(guard);
+    token(m, tok, cache)
 }
 
 /// The device copy can no longer be trusted (a read failed mid-token, after the KV append and

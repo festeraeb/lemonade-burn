@@ -50,6 +50,15 @@ struct Args {
     ab_math: Vec<String>,
     #[arg(long, default_value_t = 1)]
     ab_rounds: usize,
+    /// Launch table for one decode token (`LB_DD_GRAPH` work): kernels per token by kind and layer
+    /// type, with the queue time and the device time of each (see `launch_trace`).
+    #[arg(long, default_value_t = false)]
+    launch_trace: bool,
+    /// A/B the device decode token replayed as a CUDA graph (knob `dd_graph`) against issuing its
+    /// launches one by one: teacher-forced bit identity, top-1 and max |logit diff| over `--prompt`s,
+    /// then `--ab-rounds` A-B-B-A blocks of `--greedy-n` greedy tokens (sha + tok/s per arm).
+    #[arg(long, default_value_t = false)]
+    ab_graph: bool,
     /// Prompt for the greedy part of `--ab-device` (c4_e2e.sh's by default).
     #[arg(long, default_value = "Explain in two sentences why a sonar return from a hard sand bottom differs from one over silt.")]
     greedy_prompt: String,
@@ -219,6 +228,14 @@ fn main() -> Result<()> {
     #[cfg(feature = "gpu")]
     if args.ab_prefill {
         return ab_prefill(&args, &model, &tokenize, codec.as_ref());
+    }
+    #[cfg(feature = "gpu")]
+    if args.launch_trace {
+        return launch_trace(&args, &model, &tokenize);
+    }
+    #[cfg(feature = "gpu")]
+    if args.ab_graph {
+        return ab_graph(&args, &model, &tokenize, codec.as_ref());
     }
     #[cfg(feature = "gpu")]
     if !args.ab_math.is_empty() {
@@ -695,6 +712,188 @@ fn ab_math(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32>
         }
     }
     gpu.set_q4_math(Q4Math::F32);
+    model.knobs().set_device_decode(false);
+    if let Some(p) = &args.report {
+        std::fs::write(p, serde_json::to_string_pretty(&json!({"model": args.model, "device": gpu.name, "cc": gpu.compute_capability, "rows": report}))?)?;
+    }
+    Ok(())
+}
+
+/// `--launch-trace`: what one decode token launches. Prefill the greedy prompt, warm a few device
+/// tokens, then (1) one token in count mode, (2) several in sync mode where every launch is followed
+/// by a device wait (its time = queue + device + the sync round trip; the floor of an empty launch,
+/// measured here, is subtracted to estimate the device time), (3) a plain timed run giving the wall
+/// time per token and how much of it is spent issuing (everything before the read-back).
+#[cfg(feature = "gpu")]
+fn launch_trace(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32>>) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering::Relaxed;
+    let cfg = model.cfg();
+    let gpu = model.store.gpu.as_ref().context("--launch-trace needs --gpu")?;
+    let mut ids = tokenize(&args.greedy_prompt)?;
+    if args.bos {
+        ids.insert(0, cfg.bos);
+    }
+    model.knobs().set_device_decode(true);
+    model.knobs().set_dd_graph(false);
+    let mut cache = model.new_cache();
+    let mut next = argmax(&logits_row(model.forward(&ids, &mut cache, false)));
+    let mut step = |cache: &mut lb_lfm2::model::Cache, next: &mut u32| {
+        *next = argmax(&logits_row(model.forward(&[*next], cache, false)));
+    };
+    for _ in 0..8 {
+        step(&mut cache, &mut next);
+    }
+    // floor of one empty launch followed by a device wait
+    let (x, y) = (gpu.upload_f32(&[0.0f32; 256]), gpu.upload_f32(&[1.0f32; 256]));
+    for _ in 0..50 {
+        let _ = gpu.add_rms_norm(&x, None, &y, 256, 1e-5);
+        gpu.sync().map_err(anyhow::Error::msg)?;
+    }
+    gpu.sync_recycle().map_err(anyhow::Error::msg)?;
+    let t = Instant::now();
+    let nf = 300;
+    for _ in 0..nf {
+        let _ = gpu.add_rms_norm(&x, None, &y, 256, 1e-5);
+        gpu.sync().map_err(anyhow::Error::msg)?;
+    }
+    let floor_us = t.elapsed().as_secs_f64() * 1e6 / nf as f64;
+    gpu.sync_recycle().map_err(anyhow::Error::msg)?;
+    // (1) count
+    gpu.trace.start(false);
+    step(&mut cache, &mut next);
+    let counted = gpu.trace.take();
+    // (2) sync mode, mean over tokens
+    let n_sync = 6usize;
+    let mut sums: BTreeMap<(String, &'static str, usize), (usize, f64)> = BTreeMap::new();
+    for _ in 0..n_sync {
+        gpu.trace.start(true);
+        step(&mut cache, &mut next);
+        for r in gpu.trace.take() {
+            let ty = r.label.split_once(':').map(|(_, t)| t.to_string()).unwrap_or_else(|| "tail".into());
+            let e = sums.entry((ty, r.name, r.tag)).or_default();
+            e.0 += 1;
+            e.1 += r.us;
+        }
+    }
+    // (3) plain run
+    let n_plain = args.greedy_n.max(64);
+    let (i0, w0) = (model.timings.dd_issue_ns.load(Relaxed), model.timings.dd_ns.load(Relaxed));
+    let t = Instant::now();
+    for _ in 0..n_plain {
+        step(&mut cache, &mut next);
+    }
+    let wall_ms = t.elapsed().as_secs_f64() * 1e3 / n_plain as f64;
+    let issue_ms = (model.timings.dd_issue_ns.load(Relaxed) - i0) as f64 / 1e6 / n_plain as f64;
+    let dd_ms = (model.timings.dd_ns.load(Relaxed) - w0) as f64 / 1e6 / n_plain as f64;
+    // layer types in the token
+    let mut layers_of: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &counted {
+        if let Some((l, ty)) = r.label.split_once(':') {
+            let _ = l;
+            layers_of.entry(ty.to_string()).or_default();
+        }
+    }
+    let mut seen: std::collections::BTreeSet<String> = Default::default();
+    for r in &counted {
+        if seen.insert(r.label.clone()) {
+            if let Some((_, ty)) = r.label.split_once(':') {
+                *layers_of.get_mut(ty).expect("seen") += 1;
+            }
+        }
+    }
+    println!("launch-trace: device {} ; empty launch + wait floor {floor_us:.1} us", gpu.name);
+    println!("one token: {} launches; plain run {n_plain} tokens: wall {wall_ms:.2} ms/token, issue (queue) {issue_ms:.2} ms, forward-internal {dd_ms:.2} ms", counted.len());
+    let mut rows = Vec::new();
+    let mut tot_dev = 0.0;
+    let mut by_ty: BTreeMap<String, (usize, f64)> = BTreeMap::new();
+    println!("{:<12} {:>6} {:<20} {:>8} {:>6} {:>12} {:>12}", "layer type", "layers", "kernel", "tag", "n/layer", "mean us(raw)", "est device us");
+    for ((ty, name, tag), (n, us)) in &sums {
+        let layers = layers_of.get(ty).copied().unwrap_or(1).max(1);
+        let n_tok = *n as f64 / n_sync as f64;
+        let per = n_tok / layers as f64;
+        let mean_raw = us / *n as f64;
+        let est = (mean_raw - floor_us).max(0.0);
+        tot_dev += est * n_tok;
+        let e = by_ty.entry(ty.clone()).or_default();
+        e.0 += n_tok as usize;
+        e.1 += est * n_tok;
+        println!("{ty:<12} {layers:>6} {name:<20} {tag:>8} {per:>6.2} {mean_raw:>12.1} {est:>12.1}");
+        rows.push(json!({"layer_type": ty, "layers": layers, "kernel": name, "tag": tag, "launches_per_token": n_tok, "per_layer": per, "mean_us_raw": mean_raw, "est_device_us": est}));
+    }
+    println!("per layer type (launches per token, estimated device ms per token):");
+    let mut types = Vec::new();
+    for (ty, (n, us)) in &by_ty {
+        println!("  {ty:<12} {n:>4} launches, {:.2} ms", us / 1e3);
+        types.push(json!({"layer_type": ty, "layers": layers_of.get(ty), "launches": n, "est_device_ms": us / 1e3}));
+    }
+    println!("total estimated device time {:.2} ms for {} launches (wall {wall_ms:.2} ms, issue {issue_ms:.2} ms)", tot_dev / 1e3, counted.len());
+    if let Some(p) = &args.report {
+        std::fs::write(p, serde_json::to_string_pretty(&json!({"kind": "launch_trace", "device": gpu.name, "floor_us": floor_us, "launches_per_token": counted.len(), "wall_ms": wall_ms, "issue_ms": issue_ms, "est_device_ms": tot_dev / 1e3, "by_type": types, "rows": rows}))?)?;
+    }
+    model.knobs().set_device_decode(false);
+    Ok(())
+}
+
+/// `--ab-graph`: the graph replay against the launch-by-launch token (same kernels, same order).
+#[cfg(feature = "gpu")]
+fn ab_graph(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec<u32>>, codec: Option<&tokenizers::Tokenizer>) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let cfg = model.cfg();
+    let gpu = model.store.gpu.as_ref().context("--ab-graph needs --gpu")?;
+    let mut report = Vec::new();
+    let (mut n, mut top1, mut bit_same, mut worst) = (0usize, 0usize, 0usize, 0f32);
+    for prompt in &args.prompts {
+        let mut ids = tokenize(prompt)?;
+        if args.bos {
+            ids.insert(0, cfg.bos);
+        }
+        model.knobs().set_dd_graph(false);
+        let base = run_arm(model, &ids, true, false);
+        model.knobs().set_dd_graph(true);
+        let c0 = model.timings.dd_graph_replays.load(Relaxed);
+        let arm = run_arm(model, &ids, true, false);
+        let replays = model.timings.dd_graph_replays.load(Relaxed) - c0;
+        let mut pworst = 0f32;
+        for i in 0..ids.len() {
+            n += 1;
+            top1 += (base.top1[i] == arm.top1[i]) as usize;
+            bit_same += (base.logits[i].iter().zip(&arm.logits[i]).all(|(a, b)| a.to_bits() == b.to_bits())) as usize;
+            pworst = pworst.max(max_abs_diff(&base.logits[i], &arm.logits[i]));
+        }
+        worst = worst.max(pworst);
+        println!("{:?}: {} positions, graph replays {replays}, fallbacks {}, max |dlogit| {pworst:.3e}; top-1 so far {top1}/{n}, bit-identical rows {bit_same}/{n}", &prompt[..prompt.len().min(40)], ids.len(), arm.dd_fallbacks);
+    }
+    println!("teacher-forced graph vs launches: top-1 {top1}/{n}, bit-identical logit rows {bit_same}/{n}, max |dlogit| {worst:.3e}");
+    report.push(json!({"kind": "teacher_forced", "positions": n, "top1_agree": top1, "bit_identical_rows": bit_same, "max_abs_logit_diff": worst}));
+    let mut ids = tokenize(&args.greedy_prompt)?;
+    if args.bos {
+        ids.insert(0, cfg.bos);
+    }
+    let text = |v: &[u32]| codec.and_then(|c| c.decode(v, true).ok()).unwrap_or_else(|| format!("{v:?}"));
+    // A-B-B-A blocks
+    let mut tps: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+    let mut shas: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    for block in 0..args.ab_rounds {
+        for (k, &arm) in [false, true, true, false].iter().enumerate() {
+            model.knobs().set_dd_graph(arm);
+            let (r0, c0) = (model.timings.dd_graph_replays.load(Relaxed), model.timings.dd_graph_captures.load(Relaxed));
+            let (g, _, secs, dd) = greedy_arm(model, &ids, args.greedy_n, true, cfg.eos);
+            let sha = sha16(&text(&g));
+            let t = g.len() as f64 / secs;
+            let (r, c) = (model.timings.dd_graph_replays.load(Relaxed) - r0, model.timings.dd_graph_captures.load(Relaxed) - c0);
+            println!("greedy block {block} slot {k} graph={}: {t:.2} tok/s sha {sha} ({dd} device tokens, {r} replays, {c} captures, {} tokens)", arm as u8, g.len());
+            tps[arm as usize].push(t);
+            shas[arm as usize].push(sha.clone());
+            report.push(json!({"kind": "greedy", "block": block, "slot": k, "graph": arm, "tokens": g.len(), "tok_s": t, "sha": sha, "device_tokens": dd, "replays": r, "captures": c}));
+        }
+    }
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+    let (ma, mb) = (mean(&tps[0]), mean(&tps[1]));
+    let same = shas[0].iter().chain(shas[1].iter()).all(|x| Some(x) == shas[0].first());
+    println!("greedy decode: launches {ma:.2} tok/s, graph {mb:.2} tok/s, ratio {:.3}x; all {} shas equal: {same} ({})", mb / ma, shas[0].len() + shas[1].len(), shas[0].first().cloned().unwrap_or_default());
+    report.push(json!({"kind": "summary", "launch_tok_s": ma, "graph_tok_s": mb, "ratio": mb / ma, "all_shas_equal": same, "sha": shas[0].first()}));
+    model.knobs().set_dd_graph(false);
     model.knobs().set_device_decode(false);
     if let Some(p) = &args.report {
         std::fs::write(p, serde_json::to_string_pretty(&json!({"model": args.model, "device": gpu.name, "cc": gpu.compute_capability, "rows": report}))?)?;

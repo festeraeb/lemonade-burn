@@ -97,6 +97,11 @@ pub struct Timings {
     pub dd_tokens: AtomicU64,
     pub dd_ns: AtomicU64,
     pub dd_fallbacks: AtomicU64,
+    /// Device decode: time spent issuing a token's work to the device (everything before the
+    /// read-back, replay included), graphs captured, tokens that replayed a graph.
+    pub dd_issue_ns: AtomicU64,
+    pub dd_graph_captures: AtomicU64,
+    pub dd_graph_replays: AtomicU64,
     /// Prompt tokens that ran device-resident (`device_prefill.rs`) and their wall time.
     pub dp_tokens: AtomicU64,
     pub dp_ns: AtomicU64,
