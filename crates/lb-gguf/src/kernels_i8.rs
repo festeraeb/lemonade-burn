@@ -1,0 +1,229 @@
+//! CPU expert kernel with 8-bit activations: `out[r] = sum_c W[r, c] * x[c]`, `W` in Q4_0.
+//!
+//! The reference kernels in [`crate::kernels`] dequantize every weight to f32. Here the
+//! activation row is quantized once per call to signed 8-bit values in blocks of 32 (one f32
+//! scale per block), so a Q4_0 block times an activation block is an integer dot product of
+//! 32 small numbers, followed by one multiply with the two block scales:
+//!
+//! ```text
+//! out[r] = sum over blocks b of  d_w[r, b] * d_x[b] * isum[r, b]
+//! isum[r, b] = sum over j in 0..32 of (nibble[r, b, j] - 8) * q[b * 32 + j]      (exact, i32)
+//! ```
+//!
+//! `isum` is bounded by 32 * 8 * 127 = 32512, so it is exact in i32 (and in i16).
+//! The scalar functions here define the arithmetic; the SIMD paths must give the same `isum`
+//! for every block and a final value within float rounding of the scalar one.
+
+use crate::kernels::QuantMat;
+use crate::types::GgmlType;
+use half::f16;
+use rayon::prelude::*;
+
+/// An activation row quantized to i8 in blocks of 32.
+#[derive(Clone, Debug)]
+pub struct ActQ8 {
+    /// `q[c]` in -127..=127; value `c` is `scale[c / 32] * q[c]`.
+    pub q: Vec<i8>,
+    /// One scale per block of 32 values (0.0 for an all-zero block).
+    pub scale: Vec<f32>,
+}
+
+/// Quantize `x` (a whole number of 32-value blocks) to [`ActQ8`]: per block,
+/// `scale = max|x| / 127` and `q = round(x / scale)` (ties away from zero), clamped to +-127.
+pub fn quantize_act_q8(x: &[f32]) -> ActQ8 {
+    assert_eq!(x.len() % 32, 0, "activation length must be a whole number of 32-value blocks");
+    let mut q = vec![0i8; x.len()];
+    let mut scale = vec![0f32; x.len() / 32];
+    for (b, blk) in x.chunks_exact(32).enumerate() {
+        let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        if amax == 0.0 || !amax.is_finite() {
+            continue;
+        }
+        let s = amax / 127.0;
+        let inv = 127.0 / amax;
+        scale[b] = s;
+        for (j, &v) in blk.iter().enumerate() {
+            q[b * 32 + j] = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    ActQ8 { q, scale }
+}
+
+/// The exact integer dot of one Q4_0 block's 16 nibble bytes with 32 activation values.
+#[inline]
+pub fn isum_q4_0_block(nibbles: &[u8], q: &[i8]) -> i32 {
+    debug_assert_eq!(nibbles.len(), 16);
+    debug_assert_eq!(q.len(), 32);
+    let mut s = 0i32;
+    for j in 0..16 {
+        let byte = nibbles[j];
+        s += ((byte & 0x0f) as i32 - 8) * q[j] as i32;
+        s += ((byte >> 4) as i32 - 8) * q[j + 16] as i32;
+    }
+    s
+}
+
+/// Scalar reference: dot of one Q4_0 row (`cols / 32` blocks of 18 bytes) with `a`.
+pub fn dot_q4_0_i8_scalar(row: &[u8], a: &ActQ8) -> f32 {
+    debug_assert_eq!(row.len() / 18 * 32, a.q.len());
+    let mut acc = 0f32;
+    for (b, blk) in row.chunks_exact(18).enumerate() {
+        let d = f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+        let isum = isum_q4_0_block(&blk[2..18], &a.q[b * 32..b * 32 + 32]);
+        acc += d * a.scale[b] * isum as f32;
+    }
+    acc
+}
+
+/// Which kernel [`dot_q4_0_i8`] uses on this CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimdLevel {
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
+/// The best level this CPU supports (AVX-512 needs `avx512f` and `avx512bw`).
+pub fn simd_level() -> SimdLevel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            return SimdLevel::Avx512;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return SimdLevel::Avx2;
+        }
+    }
+    SimdLevel::Scalar
+}
+
+/// Dot of one Q4_0 row with `a`, on the fastest kernel this CPU has.
+#[inline]
+pub fn dot_q4_0_i8(row: &[u8], a: &ActQ8) -> f32 {
+    dot_q4_0_i8_at(simd_level(), row, a)
+}
+
+/// Dot of one Q4_0 row with `a` on a named kernel. Panics if the CPU lacks it.
+pub fn dot_q4_0_i8_at(level: SimdLevel, row: &[u8], a: &ActQ8) -> f32 {
+    match level {
+        SimdLevel::Scalar => dot_q4_0_i8_scalar(row, a),
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx2 => {
+            assert!(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"));
+            // SAFETY: the features were checked on the line above.
+            unsafe { dot_q4_0_i8_avx2(row, a) }
+        }
+        #[cfg(target_arch = "x86_64")]
+        SimdLevel::Avx512 => {
+            assert!(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw"));
+            // SAFETY: the features were checked on the line above.
+            unsafe { dot_q4_0_i8_avx512(row, a) }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        _ => dot_q4_0_i8_scalar(row, a),
+    }
+}
+
+/// AVX2 kernel for one Q4_0 row. Same result contract as [`dot_q4_0_i8_scalar`].
+///
+/// # Safety
+/// The CPU must support `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_q4_0_i8_avx2(row: &[u8], a: &ActQ8) -> f32 {
+    // TODO(forge E2a): AVX2 body. Until then this is the scalar kernel.
+    dot_q4_0_i8_scalar(row, a)
+}
+
+/// AVX-512 (F + BW) kernel for one Q4_0 row. Same result contract as [`dot_q4_0_i8_scalar`].
+///
+/// # Safety
+/// The CPU must support `avx512f` and `avx512bw`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+pub unsafe fn dot_q4_0_i8_avx512(row: &[u8], a: &ActQ8) -> f32 {
+    // TODO(forge E2a): AVX-512 body. Until then this is the scalar kernel.
+    dot_q4_0_i8_scalar(row, a)
+}
+
+/// `out[r] = W[r, :] . x` for one activation row, Q4_0 weights, rows split across rayon threads.
+/// The activation is quantized once. `min_rows_per_task` bounds the split (0 = 64).
+pub fn matvec_q4_0_i8(w: QuantMat<'_>, x: &[f32], out: &mut [f32], min_rows_per_task: usize) {
+    assert_eq!(w.ty, GgmlType::Q4_0, "matvec_q4_0_i8 takes Q4_0 weights");
+    assert_eq!(x.len(), w.cols);
+    assert_eq!(out.len(), w.rows);
+    let a = quantize_act_q8(x);
+    let level = simd_level();
+    let rb = w.row_bytes();
+    let chunk = if min_rows_per_task == 0 { 64 } else { min_rows_per_task };
+    out.par_chunks_mut(chunk).enumerate().for_each(|(ci, o)| {
+        let r0 = ci * chunk;
+        for (i, v) in o.iter_mut().enumerate() {
+            let r = r0 + i;
+            *v = dot_q4_0_i8_at(level, &w.bytes[r * rb..(r + 1) * rb], &a);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::quantize_q4_0;
+
+    fn lcg(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+
+    #[test]
+    fn act_quantization_round_trips_within_half_a_step() {
+        let mut s = 3u64;
+        let x: Vec<f32> = (0..96).map(|_| lcg(&mut s) * 3.0).collect();
+        let a = quantize_act_q8(&x);
+        for (c, &v) in x.iter().enumerate() {
+            let back = a.scale[c / 32] * a.q[c] as f32;
+            assert!((back - v).abs() <= a.scale[c / 32] * 0.5 + 1e-6, "c{c}: {back} vs {v}");
+        }
+        let z = quantize_act_q8(&[0f32; 32]);
+        assert!(z.q.iter().all(|&q| q == 0) && z.scale[0] == 0.0);
+    }
+
+    #[test]
+    fn scalar_i8_dot_is_close_to_the_f32_reference() {
+        let (rows, cols) = (41, 2048);
+        let mut s = 7u64;
+        let wf: Vec<f32> = (0..rows * cols).map(|_| lcg(&mut s)).collect();
+        let x: Vec<f32> = (0..cols).map(|_| lcg(&mut s)).collect();
+        let bytes: Vec<u8> = wf.chunks_exact(cols).flat_map(quantize_q4_0).collect();
+        let qm = QuantMat::new(GgmlType::Q4_0, rows, cols, &bytes);
+        let a = quantize_act_q8(&x);
+        let mut buf = vec![0f32; cols];
+        let (mut err2, mut ref2) = (0f64, 0f64);
+        for r in 0..rows {
+            qm.dequant_row(r, &mut buf);
+            let want: f32 = buf.iter().zip(&x).map(|(p, q)| p * q).sum();
+            let got = dot_q4_0_i8_scalar(qm.row(r), &a);
+            err2 += ((got - want) as f64).powi(2);
+            ref2 += (want as f64).powi(2);
+        }
+        let rel = (err2 / ref2).sqrt();
+        assert!(rel < 0.01, "relative error {rel}");
+    }
+
+    #[test]
+    fn matvec_matches_the_scalar_dot() {
+        let (rows, cols) = (300, 512);
+        let mut s = 11u64;
+        let wf: Vec<f32> = (0..rows * cols).map(|_| lcg(&mut s)).collect();
+        let x: Vec<f32> = (0..cols).map(|_| lcg(&mut s)).collect();
+        let bytes: Vec<u8> = wf.chunks_exact(cols).flat_map(quantize_q4_0).collect();
+        let qm = QuantMat::new(GgmlType::Q4_0, rows, cols, &bytes);
+        let a = quantize_act_q8(&x);
+        let mut out = vec![0f32; rows];
+        matvec_q4_0_i8(qm, &x, &mut out, 0);
+        for r in 0..rows {
+            let want = dot_q4_0_i8_scalar(qm.row(r), &a);
+            assert!((out[r] - want).abs() <= 1e-4 * want.abs().max(1.0), "r{r}: {} vs {want}", out[r]);
+        }
+    }
+}
