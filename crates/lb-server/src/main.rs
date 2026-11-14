@@ -243,6 +243,11 @@ fn prompt_cache_on() -> bool {
     std::env::var("LB_PROMPT_CACHE").map(|v| v != "0").unwrap_or(true)
 }
 
+/// Tokens before the prompt's end where an extra checkpoint is kept (`LB_PROMPT_CACHE_TAIL`, default 32; 0 = none).
+fn prompt_cache_tail() -> usize {
+    std::env::var("LB_PROMPT_CACHE_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
+}
+
 fn worker<D: Decoder>(model: D, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
     let mut session: Option<Session<D>> = None;
     while let Ok(job) = rx.recv() {
@@ -281,16 +286,32 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job, prev: Option<Ses
     }
     let (mut cache, mut seq, mut cps) = reused.unwrap_or_else(|| (model.new_cache(), Vec::new(), Vec::new()));
     let cached_tokens = seq.len();
-    let logits = to_vec(model.forward(&job.prompt[cached_tokens..], &mut cache, false));
-    seq.extend_from_slice(&job.prompt[cached_tokens..]);
-    if prompt_cache_on() && cps.last().is_none_or(|(p, _)| *p < seq.len()) {
-        if let Some(cp) = model.checkpoint(&mut cache) {
-            cps.push((seq.len(), cp));
-            if cps.len() > MAX_CHECKPOINTS {
-                cps.remove(0);
+    // The end of a chat prompt (the assistant header, a closed reasoning block) is often not
+    // repeated verbatim in the next turn's history, so a checkpoint is also kept a little before
+    // the end: the prompt runs in two passes, all but the last `tail` tokens, then the tail.
+    let cache_on = prompt_cache_on();
+    let tail = prompt_cache_tail();
+    let rest = job.prompt.len() - cached_tokens;
+    let mut keep = |cache: &mut D::Cache, seq: &Vec<u32>, cps: &mut Vec<(usize, D::Checkpoint)>| {
+        if cache_on && cps.last().is_none_or(|(p, _)| *p < seq.len()) {
+            if let Some(cp) = model.checkpoint(cache) {
+                cps.push((seq.len(), cp));
+                if cps.len() > MAX_CHECKPOINTS {
+                    cps.remove(0);
+                }
             }
         }
+    };
+    if cache_on && tail > 0 && rest > 2 * tail {
+        let cut = job.prompt.len() - tail;
+        model.forward(&job.prompt[cached_tokens..cut], &mut cache, false);
+        seq.extend_from_slice(&job.prompt[cached_tokens..cut]);
+        keep(&mut cache, &seq, &mut cps);
     }
+    let done = seq.len();
+    let logits = to_vec(model.forward(&job.prompt[done..], &mut cache, false));
+    seq.extend_from_slice(&job.prompt[done..]);
+    keep(&mut cache, &seq, &mut cps);
     let prefill_s = t0.elapsed().as_secs_f64();
     let mut next = sampler.sample(&logits);
     let mut dec = StreamDecoder::new();
