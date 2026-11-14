@@ -760,14 +760,35 @@ impl Gpu {
         y
     }
 
+    /// Start a launch trace: `device` brackets every launch with events (device time per launch).
+    pub fn trace_start(&self, device: bool) {
+        self.trace.start(device);
+        if device {
+            self.trace.set_window(self.client.profile_start().ok());
+        }
+    }
+
+    /// Stop the trace and take its rows (closes the open event window, waits for the device).
+    pub fn trace_take(&self) -> Vec<crate::trace::Row> {
+        if let Some(w) = self.trace.take_window() {
+            self.client.profile_abandon(w);
+        }
+        self.trace.take()
+    }
+
     /// Trace hook, called right after a kernel launch is queued (`trace.rs`): free when off.
     #[inline]
     pub fn tr(&self, name: &'static str, tag: usize) {
         if self.trace.is_on() {
-            if self.trace.sync_mode() {
-                let _ = self.sync();
-            }
-            self.trace.push(name, tag);
+            let dur = if self.trace.sync_mode() {
+                // close the window that opened before this launch, open the next one
+                let d = self.trace.take_window().and_then(|w| self.client.profile_end(w).ok());
+                self.trace.set_window(self.client.profile_start().ok());
+                d
+            } else {
+                None
+            };
+            self.trace.push(name, tag, dur);
         }
     }
 

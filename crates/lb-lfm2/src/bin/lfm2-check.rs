@@ -759,21 +759,29 @@ fn launch_trace(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec
     }
     let floor_us = t.elapsed().as_secs_f64() * 1e6 / nf as f64;
     gpu.sync_recycle().map_err(anyhow::Error::msg)?;
-    // (1) count
-    gpu.trace.start(false);
-    step(&mut cache, &mut next);
-    let counted = gpu.trace.take();
-    // (2) sync mode, mean over tokens
+    // (1) count mode: launches per token and the host queue time between marks
     let n_sync = 6usize;
-    let mut sums: BTreeMap<(String, &'static str, usize), (usize, f64)> = BTreeMap::new();
+    let mut sums: BTreeMap<(String, &'static str, usize), (usize, f64, f64)> = BTreeMap::new();
+    let mut counted = Vec::new();
     for _ in 0..n_sync {
-        gpu.trace.start(true);
+        gpu.trace_start(false);
         step(&mut cache, &mut next);
-        for r in gpu.trace.take() {
+        counted = gpu.trace_take();
+        for r in &counted {
             let ty = r.label.split_once(':').map(|(_, t)| t.to_string()).unwrap_or_else(|| "tail".into());
             let e = sums.entry((ty, r.name, r.tag)).or_default();
             e.0 += 1;
             e.1 += r.us;
+        }
+    }
+    // (2) device-time mode: every launch bracketed by two events, nothing waited on in between
+    for _ in 0..n_sync {
+        gpu.trace_start(true);
+        step(&mut cache, &mut next);
+        for r in gpu.trace_take() {
+            let ty = r.label.split_once(':').map(|(_, t)| t.to_string()).unwrap_or_else(|| "tail".into());
+            let e = sums.entry((ty, r.name, r.tag)).or_default();
+            e.2 += if r.dev_us.is_nan() { 0.0 } else { r.dev_us };
         }
     }
     // (3) plain run
@@ -807,29 +815,31 @@ fn launch_trace(args: &Args, model: &Lfm2, tokenize: &dyn Fn(&str) -> Result<Vec
     let mut rows = Vec::new();
     let mut tot_dev = 0.0;
     let mut by_ty: BTreeMap<String, (usize, f64)> = BTreeMap::new();
-    println!("{:<12} {:>6} {:<20} {:>8} {:>6} {:>12} {:>12}", "layer type", "layers", "kernel", "tag", "n/layer", "mean us(raw)", "est device us");
-    for ((ty, name, tag), (n, us)) in &sums {
+    println!("{:<12} {:>6} {:<20} {:>8} {:>7} {:>10} {:>10}", "layer type", "layers", "kernel", "tag", "n/layer", "queue us", "device us");
+    let mut tot_q = 0.0;
+    for ((ty, name, tag), (n, qus, dus)) in &sums {
         let layers = layers_of.get(ty).copied().unwrap_or(1).max(1);
         let n_tok = *n as f64 / n_sync as f64;
         let per = n_tok / layers as f64;
-        let mean_raw = us / *n as f64;
-        let est = (mean_raw - floor_us).max(0.0);
-        tot_dev += est * n_tok;
+        let queue = qus / *n as f64;
+        let dev = dus / *n as f64;
+        tot_dev += dev * n_tok;
+        tot_q += queue * n_tok;
         let e = by_ty.entry(ty.clone()).or_default();
         e.0 += n_tok as usize;
-        e.1 += est * n_tok;
-        println!("{ty:<12} {layers:>6} {name:<20} {tag:>8} {per:>6.2} {mean_raw:>12.1} {est:>12.1}");
-        rows.push(json!({"layer_type": ty, "layers": layers, "kernel": name, "tag": tag, "launches_per_token": n_tok, "per_layer": per, "mean_us_raw": mean_raw, "est_device_us": est}));
+        e.1 += dev * n_tok;
+        println!("{ty:<12} {layers:>6} {name:<20} {tag:>8} {per:>7.2} {queue:>10.1} {dev:>10.1}");
+        rows.push(json!({"layer_type": ty, "layers": layers, "kernel": name, "tag": tag, "launches_per_token": n_tok, "per_layer": per, "queue_us": queue, "device_us": dev}));
     }
-    println!("per layer type (launches per token, estimated device ms per token):");
+    println!("per layer type (launches per token, device ms per token):");
     let mut types = Vec::new();
     for (ty, (n, us)) in &by_ty {
         println!("  {ty:<12} {n:>4} launches, {:.2} ms", us / 1e3);
         types.push(json!({"layer_type": ty, "layers": layers_of.get(ty), "launches": n, "est_device_ms": us / 1e3}));
     }
-    println!("total estimated device time {:.2} ms for {} launches (wall {wall_ms:.2} ms, issue {issue_ms:.2} ms)", tot_dev / 1e3, counted.len());
+    println!("one token, summed over its launches: queue {:.2} ms, device {:.2} ms, for {} launches (plain run: wall {wall_ms:.2} ms, issue {issue_ms:.2} ms)", tot_q / 1e3, tot_dev / 1e3, counted.len());
     if let Some(p) = &args.report {
-        std::fs::write(p, serde_json::to_string_pretty(&json!({"kind": "launch_trace", "device": gpu.name, "floor_us": floor_us, "launches_per_token": counted.len(), "wall_ms": wall_ms, "issue_ms": issue_ms, "est_device_ms": tot_dev / 1e3, "by_type": types, "rows": rows}))?)?;
+        std::fs::write(p, serde_json::to_string_pretty(&json!({"kind": "launch_trace", "device": gpu.name, "floor_us": floor_us, "launches_per_token": counted.len(), "wall_ms": wall_ms, "issue_ms": issue_ms, "queue_sum_ms": tot_q / 1e3, "device_sum_ms": tot_dev / 1e3, "by_type": types, "rows": rows}))?)?;
     }
     model.knobs().set_device_decode(false);
     Ok(())
