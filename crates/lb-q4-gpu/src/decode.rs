@@ -387,6 +387,165 @@ pub fn weighted_sum_kernel(outs: &[f32], weights: &[f32], routes: &[u32], y: &mu
     }
 }
 
+/// [`add_rms_norm_kernel`] and [`router_topk_kernel`] in one launch (one cube): `x <- x + y` (when
+/// `add`), `h = rms(x) * w`, then the router on `h`. The same arithmetic in the same order as the
+/// two kernels run one after the other, so the results are bit-identical; it exists because a
+/// launch costs 15-35 us of host time and a decode token made ~390 of them. `p` = `[n_expert, k, base]`.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn add_rms_norm_route_kernel(x: &mut [f32], y: &[f32], w: &[f32], h: &mut [f32], eps: &[f32], router: &[f32], bias: &[f32], routes: &mut [u32], weights: &mut [f32], p: &[u32], #[comptime] add: bool, #[comptime] seq: bool) {
+    let n = x.len();
+    let mut sm = Shared::<[f32]>::new_slice(NORM_CUBE);
+    let mut ss = 0.0f32;
+    let mut i = UNIT_POS as usize;
+    while i < n {
+        let mut v = x[i];
+        if add {
+            v += y[i];
+            x[i] = v;
+        }
+        ss += v * v;
+        i += CUBE_DIM_X as usize;
+    }
+    let total = cube_sum(&mut sm, ss);
+    let r = 1.0f32 / Sqrt::sqrt(total / n as f32 + eps[0]);
+    let mut i = UNIT_POS as usize;
+    while i < n {
+        h[i] = x[i] * r * w[i];
+        i += CUBE_DIM_X as usize;
+    }
+    sync_cube();
+
+    let n_exp = p[0] as usize;
+    let k = p[1] as usize;
+    let base = p[2] as usize;
+    let cols = n;
+    let u = UNIT_POS as usize;
+    let mut probs = Shared::<[f32]>::new_slice(MAX_EXPERTS);
+    let mut score = Shared::<[f32]>::new_slice(MAX_EXPERTS);
+    let mut sel = Shared::<[u32]>::new_slice(MAX_EXPERTS);
+    if seq {
+        let mut e = u;
+        while e < n_exp {
+            let mut acc = 0.0f32;
+            let mut c = 0usize;
+            while c < cols {
+                acc += router[e * cols + c] * h[c];
+                c += 1usize;
+            }
+            let pr = 1.0f32 / (1.0f32 + Exp::exp(-acc));
+            probs[e] = pr;
+            score[e] = pr + bias[e];
+            e += CUBE_DIM_X as usize;
+        }
+    } else {
+        let width = PLANE_DIM as usize;
+        let planes = CUBE_DIM_X as usize / width;
+        let lane = UNIT_POS_PLANE as usize;
+        let mut e = (UNIT_POS / PLANE_DIM) as usize;
+        while e < n_exp {
+            let mut acc = 0.0f32;
+            let mut c = lane;
+            while c < cols {
+                acc += router[e * cols + c] * h[c];
+                c += width;
+            }
+            let logit = plane_sum(acc);
+            if lane == 0usize {
+                let pr = 1.0f32 / (1.0f32 + Exp::exp(-logit));
+                probs[e] = pr;
+                score[e] = pr + bias[e];
+            }
+            e += planes;
+        }
+    }
+    sync_cube();
+    let mut e = u;
+    while e < n_exp {
+        let se = score[e];
+        let mut rank = 0usize;
+        let mut j = 0usize;
+        while j < n_exp {
+            let sj = score[j];
+            if sj > se || (sj == se && j < e) {
+                rank += 1usize;
+            }
+            j += 1usize;
+        }
+        if rank < k {
+            sel[rank] = e as u32;
+        }
+        e += CUBE_DIM_X as usize;
+    }
+    sync_cube();
+    if u == 0usize {
+        let mut sum = 0.0f32;
+        let mut i = 0usize;
+        while i < k {
+            sum += probs[sel[i] as usize];
+            i += 1usize;
+        }
+        if sum < 6.103515625e-5f32 {
+            sum = 6.103515625e-5f32;
+        }
+        let mut i = 0usize;
+        while i < k {
+            let ex = sel[i];
+            routes[2usize * (base + i)] = ex;
+            routes[2usize * (base + i) + 1usize] = 0u32;
+            weights[base + i] = probs[ex as usize] / sum;
+            i += 1usize;
+        }
+    }
+}
+
+/// [`weighted_sum_kernel`] and the next [`add_rms_norm_kernel`] in one launch (one cube):
+/// `y = sum_s w_s outs_s` (ascending expert id), `x <- x + y`, `h = rms(x) * w`. Bit-identical to
+/// the two kernels run one after the other. `p` = `[k, n, base]`.
+#[cube(launch)]
+pub fn sum_add_rms_norm_kernel(outs: &[f32], weights: &[f32], routes: &[u32], x: &mut [f32], w: &[f32], h: &mut [f32], p: &[u32], eps: &[f32]) {
+    let k = p[0] as usize;
+    let n = p[1] as usize;
+    let base = p[2] as usize;
+    let mut sm = Shared::<[f32]>::new_slice(NORM_CUBE);
+    let mut ss = 0.0f32;
+    let mut i = UNIT_POS as usize;
+    while i < n {
+        let mut acc = 0.0f32;
+        let mut last = 0u32;
+        let mut first = true;
+        let mut step = 0usize;
+        while step < k {
+            let mut best = 0usize;
+            let mut best_e = 4294967295u32;
+            let mut s = 0usize;
+            while s < k {
+                let e = routes[2usize * (base + s)];
+                if (first || e > last) && e < best_e {
+                    best_e = e;
+                    best = s;
+                }
+                s += 1usize;
+            }
+            acc += weights[base + best] * outs[best * n + i];
+            last = best_e;
+            first = false;
+            step += 1usize;
+        }
+        let v = x[i] + acc;
+        x[i] = v;
+        ss += v * v;
+        i += CUBE_DIM_X as usize;
+    }
+    let total = cube_sum(&mut sm, ss);
+    let r = 1.0f32 / Sqrt::sqrt(total / n as f32 + eps[0]);
+    let mut i = UNIT_POS as usize;
+    while i < n {
+        h[i] = x[i] * r * w[i];
+        i += CUBE_DIM_X as usize;
+    }
+}
+
 /// Launchers for the kernels above: small fixed shapes, so these only pick the geometry and
 /// count elements. Every buffer argument counts **elements** of the kernel's slice type.
 impl Gpu {
@@ -512,6 +671,59 @@ impl Gpu {
                 seq || !self.use_plane,
             );
         }
+    }
+
+    /// The FFN pre-norm and the router in one launch ([`add_rms_norm_route_kernel`]): `x += y`,
+    /// `h = rms(x) * w` (returned, scratch), routes and weights written at slot `base`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_rms_norm_route(&self, x: &Handle, y: Option<&Handle>, w: &Handle, n: usize, eps: f32, router: &Handle, bias: &Handle, routes: &Handle, weights: &Handle, (n_expert, k, base, n_slots): (usize, usize, usize, usize), seq: bool) -> Handle {
+        assert!(n_expert <= MAX_EXPERTS && k >= 1 && k <= n_expert && base + k <= n_slots);
+        let h = self.scratch(n * 4);
+        let yh = y.cloned().unwrap_or_else(|| x.clone());
+        unsafe {
+            add_rms_norm_route_kernel::launch(
+                &self.client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(NORM_CUBE as u32),
+                BufferArg::from_raw_parts(x.clone(), n),
+                BufferArg::from_raw_parts(yh, n),
+                BufferArg::from_raw_parts(w.clone(), n),
+                BufferArg::from_raw_parts(h.clone(), n),
+                BufferArg::from_raw_parts(self.const_f32(&[eps]), 1),
+                BufferArg::from_raw_parts(router.clone(), n_expert * n),
+                BufferArg::from_raw_parts(bias.clone(), n_expert),
+                BufferArg::from_raw_parts(routes.clone(), 2 * n_slots),
+                BufferArg::from_raw_parts(weights.clone(), n_slots),
+                BufferArg::from_raw_parts(self.const_u32(&[n_expert as u32, k as u32, base as u32]), 3),
+                y.is_some(),
+                seq || !self.use_plane,
+            );
+        }
+        h
+    }
+
+    /// The expert sum and the next pre-norm in one launch ([`sum_add_rms_norm_kernel`]):
+    /// `x += sum_s w_s outs_s`, returns `h = rms(x) * w` (scratch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sum_add_rms_norm(&self, outs: &Handle, weights: &Handle, routes: &Handle, x: &Handle, w: &Handle, (k, n, base, n_slots): (usize, usize, usize, usize), eps: f32) -> Handle {
+        assert!(base + k <= n_slots);
+        let h = self.scratch(n * 4);
+        unsafe {
+            sum_add_rms_norm_kernel::launch(
+                &self.client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(NORM_CUBE as u32),
+                BufferArg::from_raw_parts(outs.clone(), k * n),
+                BufferArg::from_raw_parts(weights.clone(), n_slots),
+                BufferArg::from_raw_parts(routes.clone(), 2 * n_slots),
+                BufferArg::from_raw_parts(x.clone(), n),
+                BufferArg::from_raw_parts(w.clone(), n),
+                BufferArg::from_raw_parts(h.clone(), n),
+                BufferArg::from_raw_parts(self.const_u32(&[k as u32, n as u32, base as u32]), 3),
+                BufferArg::from_raw_parts(self.const_f32(&[eps]), 1),
+            );
+        }
+        h
     }
 
     /// `y = sum_s w_s * outs[s]` over the `k` slots at `base` (ascending expert id); `outs` is

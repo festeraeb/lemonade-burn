@@ -351,3 +351,52 @@ fn stacked_layer_views_and_device_routes_are_bit_identical_to_per_expert() {
     let (out2, n2) = layer.launch(&gpu, &xh, 1, &host_routes).unwrap();
     assert_eq!(bits(&read(&gpu, &out2, n2)), bits(&got), "host-routes and device-routes launches");
 }
+
+/// The fused glue launches against the kernels they replace, on f32 bits: norm + router, and expert
+/// sum + next norm. Same arithmetic in the same order, so nothing may differ.
+#[test]
+fn fused_norm_router_and_sum_norm_are_bit_identical_to_the_separate_kernels() {
+    let Some(gpu) = gpu() else { return };
+    let mut rng = Rng(101);
+    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+    let (n, n_exp, k, n_slots, base, eps) = (2048usize, 64usize, 4usize, 12usize, 4usize, 1e-5f32);
+    let x: Vec<f32> = (0..n).map(|_| rng.unit() * 3.0).collect();
+    let y: Vec<f32> = (0..n).map(|_| rng.unit()).collect();
+    let w: Vec<f32> = (0..n).map(|_| 0.5 + rng.unit()).collect();
+    let router: Vec<f32> = (0..n_exp * n).map(|_| rng.unit() * 0.05).collect();
+    let bias: Vec<f32> = (0..n_exp).map(|_| rng.unit() * 0.01).collect();
+    let (wh, rh, bh, yh) = (gpu.upload_f32(&w), gpu.upload_f32(&router), gpu.upload_f32(&bias), gpu.upload_f32(&y));
+    for seq in [true, false] {
+        if !seq && !gpu.use_plane {
+            continue;
+        }
+        // separate: norm, then router
+        let xa = gpu.upload_f32(&x);
+        let (ra, wa) = (gpu.upload_u32(vec![7; 2 * n_slots]), gpu.upload_f32(&vec![-1.0; n_slots]));
+        let ha = gpu.add_rms_norm(&xa, Some(&yh), &wh, n, eps);
+        gpu.router_topk(&ha, &rh, &bh, &ra, &wa, (n_exp, k, n, base, n_slots), seq);
+        // fused
+        let xb = gpu.upload_f32(&x);
+        let (rb, wb) = (gpu.upload_u32(vec![7; 2 * n_slots]), gpu.upload_f32(&vec![-1.0; n_slots]));
+        let hb = gpu.add_rms_norm_route(&xb, Some(&yh), &wh, n, eps, &rh, &bh, &rb, &wb, (n_exp, k, base, n_slots), seq);
+        assert_eq!(bits(&read(&gpu, &hb, n)), bits(&read(&gpu, &ha, n)), "seq={seq}: h");
+        assert_eq!(bits(&read(&gpu, &xb, n)), bits(&read(&gpu, &xa, n)), "seq={seq}: x");
+        assert_eq!(gpu.read_u32(&rb, 2 * n_slots).unwrap(), gpu.read_u32(&ra, 2 * n_slots).unwrap(), "seq={seq}: routes");
+        assert_eq!(bits(&read(&gpu, &wb, n_slots)), bits(&read(&gpu, &wa, n_slots)), "seq={seq}: weights");
+    }
+    // sum + norm
+    let outs: Vec<f32> = (0..k * n).map(|_| rng.unit() * 10.0).collect();
+    let mut routes = vec![0u32; 2 * n_slots];
+    for (i, e) in [41u32, 2, 63, 17].iter().enumerate() {
+        routes[2 * (base + i)] = *e;
+    }
+    let weights: Vec<f32> = (0..n_slots).map(|_| 0.1 + rng.unit().abs()).collect();
+    let (oh, wth, rth) = (gpu.upload_f32(&outs), gpu.upload_f32(&weights), gpu.upload_u32(routes));
+    let xa = gpu.upload_f32(&x);
+    let ya = gpu.weighted_sum(&oh, &wth, &rth, (k, n, base, n_slots));
+    let ha = gpu.add_rms_norm(&xa, Some(&ya), &wh, n, eps);
+    let xb = gpu.upload_f32(&x);
+    let hb = gpu.sum_add_rms_norm(&oh, &wth, &rth, &xb, &wh, (k, n, base, n_slots), eps);
+    assert_eq!(bits(&read(&gpu, &hb, n)), bits(&read(&gpu, &ha, n)), "sum+norm: h");
+    assert_eq!(bits(&read(&gpu, &xb, n)), bits(&read(&gpu, &xa, n)), "sum+norm: x");
+}

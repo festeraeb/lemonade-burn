@@ -347,6 +347,9 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     let mut keep: Vec<Handle> = Vec::new();
     let mut host_routes: Vec<(usize, Route)> = Vec::new();
     let mut y: Option<Handle> = None;
+    // fused glue launches (`LB_DD_FUSE=0` keeps one kernel per step): norm+router, sum+next norm
+    let fuse = m.store.remote.is_none() && std::env::var("LB_DD_FUSE").map(|v| !v.is_empty() && v != "0").unwrap_or(true);
+    let mut pend: Option<(Handle, usize)> = None;
     let mut dev_moe = 0u64;
     let mut inbox_layers = 0u64;
     // engine step E2: experts routed on the device and served from the cache's slot bank
@@ -361,7 +364,11 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     let stage = &m.stats.stage;
     for (li, layer) in m.w.layers.iter().enumerate() {
         let lp = &prep.layers[li];
-        let h = gpu.add_rms_norm(&prep.x, y.as_ref(), &lp.attn_norm, e, eps);
+        let h = match pend.take() {
+            // the previous layer's expert sum, folded into this pre-norm's launch
+            Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &lp.attn_norm, (k_used, e, base, prep.n_slots), eps),
+            None => gpu.add_rms_norm(&prep.x, y.as_ref(), &lp.attn_norm, e, eps),
+        };
         let op_out = match (&layer.op, &lp.op) {
             (Operator::Conv { in_proj, out_proj, .. }, OpPrep::Conv { taps }) => {
                 let bcx = mat(m, in_proj).launch(gpu, &h, 1);
@@ -379,7 +386,20 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             }
             _ => unreachable!("layer {li}: operator and its device copy disagree"),
         };
-        let h2 = gpu.add_rms_norm(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps);
+        // a stacked MoE layer on this card: its router runs in the pre-norm's launch (`fuse`)
+        let fused = fuse
+            && matches!(&layer.ffn, Ffn::Moe { .. })
+            && lp.moe_index.is_some()
+            && lp.router.is_some()
+            && m.store.layers.contains_key(&li)
+            && !m.store.inbox.as_ref().is_some_and(|ib| ib.card_of(li).is_some());
+        let h2 = if fused {
+            let (rh, bh) = lp.router.as_ref().expect("checked");
+            let base = lp.moe_index.expect("checked") * k_used;
+            gpu.add_rms_norm_route(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, base, prep.n_slots), knobs.dd_router_seq())
+        } else {
+            gpu.add_rms_norm(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps)
+        };
         let ffn_out = match &layer.ffn {
             Ffn::Dense { gate, up, down } => {
                 let hh = GpuQ4Mat::launch_gate_up_silu(gpu, mat(m, gate), mat(m, up), &h2, 1);
@@ -405,10 +425,18 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             Ffn::Moe { router, bias, gate, up, down } => match (if remote_on { None } else { m.store.layers.get(&li) }, lp.moe_index, &lp.router) {
                 (Some(stack), Some(mi), Some((rh, bh))) => {
                     let base = mi * k_used;
-                    gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), knobs.dd_router_seq());
+                    if !fused {
+                        gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), knobs.dd_router_seq());
+                    }
                     let (outs, _) = stack.launch_device(gpu, &h2, 1, &prep.routes, prep.n_slots, base, k_used);
                     dev_moe += 1;
-                    gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots))
+                    if fused {
+                        // the sum runs in the next pre-norm's launch
+                        pend = Some((outs.clone(), base));
+                        outs
+                    } else {
+                        gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots))
+                    }
                 }
                 (None, Some(mi), Some((rh, bh))) if e2 => {
                     let base = mi * k_used;
@@ -642,7 +670,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                 }
             },
         };
-        y = Some(ffn_out);
+        y = if pend.is_some() { None } else { Some(ffn_out) };
     }
     // the last layer's job is for no layer: take its answer so it does not meet the next token's
     if deferred {
@@ -652,7 +680,10 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             }
         }
     }
-    let hf = gpu.add_rms_norm(&prep.x, y.as_ref(), &prep.final_norm, e, eps);
+    let hf = match pend.take() {
+        Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &prep.final_norm, (k_used, e, base, prep.n_slots), eps),
+        None => gpu.add_rms_norm(&prep.x, y.as_ref(), &prep.final_norm, e, eps),
+    };
     let vocab = cfg.n_vocab;
     let logits = match head(m).expect("checked in Prep::new") {
         Head::Q6(h6) => h6.launch(gpu, &hf, 1),
