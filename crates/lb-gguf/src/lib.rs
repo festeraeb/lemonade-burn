@@ -16,6 +16,7 @@
 //! so a linear layer's weight `[in, out]` in GGUF terms is `out` rows of `in` columns here.
 
 pub mod kernels;
+pub mod kernels_f32x;
 pub mod kernels_i8;
 pub mod iq_grids;
 pub mod reader;

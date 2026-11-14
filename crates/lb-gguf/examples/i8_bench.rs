@@ -3,6 +3,7 @@
 //! and `speedup_<level>` = scalar int8 time / that level's time.
 //! With `--gate X`, exits 1 unless every SIMD level this CPU has is at least X times the scalar int8 kernel.
 use lb_gguf::kernels::dot_q4_0;
+use lb_gguf::kernels_f32x::dot_q4_0_f32x_at;
 use lb_gguf::kernels_i8::{dot_q4_0_i8_at, quantize_act_q8, simd_level, SimdLevel};
 use lb_gguf::types::quantize_q4_0;
 use std::time::Instant;
@@ -55,6 +56,12 @@ fn main() {
                 ok = false;
             }
         }
+    }
+    // the exact f32-activation kernel (kernels_f32x.rs): same arithmetic as the f32 reference
+    for &lv in levels {
+        let (ms, _) = best_ms(|| (0..rows).map(|r| dot_q4_0_f32x_at(lv, row(r), &x)).sum(), reps);
+        let worst = (0..rows).map(|r| (dot_q4_0_f32x_at(lv, row(r), &x) - dot_q4_0(row(r), &x)).abs() / dot_q4_0(row(r), &x).abs().max(1.0)).fold(0f32, f32::max);
+        println!("f32x_{lv:?}_ms {ms:.3}  speedup_vs_f32_reference {:.2}  worst_row_diff_vs_reference {worst:.2e}", f32_ms / ms);
     }
     if levels.is_empty() {
         println!("no SIMD level on this CPU");
