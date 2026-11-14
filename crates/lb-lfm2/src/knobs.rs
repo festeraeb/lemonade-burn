@@ -40,6 +40,10 @@ pub struct Knobs {
     /// `LB_DEVICE_PREFILL=1` at start; off by default until its parity gate has passed on a
     /// full model (`lfm2-check --ab-prefill`).
     device_prefill: AtomicBool,
+    /// Compute CPU experts (misses) with the int8-activation kernel (`lb_gguf::kernels_i8`)
+    /// instead of the f32 reference: faster, slightly different arithmetic. `LB_CPU_I8=1` at
+    /// start; off by default until its accuracy gate has passed.
+    cpu_i8: AtomicBool,
 }
 
 fn env_on(k: &str) -> bool {
@@ -62,6 +66,7 @@ impl Default for Knobs {
             e2_device_router: AtomicBool::new(env_or("LB_E2", true)),
             dd_router_seq: AtomicBool::new(env_on("LB_DD_ROUTER_SEQ")),
             device_prefill: AtomicBool::new(env_on("LB_DEVICE_PREFILL")),
+            cpu_i8: AtomicBool::new(env_on("LB_CPU_I8")),
         }
     }
 }
@@ -124,6 +129,14 @@ impl Knobs {
 
     pub fn set_device_prefill(&self, on: bool) {
         self.device_prefill.store(on, Ordering::Relaxed);
+    }
+
+    pub fn cpu_i8(&self) -> bool {
+        self.cpu_i8.load(Ordering::Relaxed)
+    }
+
+    pub fn set_cpu_i8(&self, on: bool) {
+        self.cpu_i8.store(on, Ordering::Relaxed);
     }
 
     pub fn dd_router_seq(&self) -> bool {

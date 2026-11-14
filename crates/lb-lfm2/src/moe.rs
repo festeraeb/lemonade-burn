@@ -458,6 +458,11 @@ pub fn expert_ffn(w: &Weights, gate: &ExpertMats, up: &ExpertMats, down: &Expert
     lb_expert_host::expert::swiglu(w.mat(&gate.expert(e)), w.mat(&up.expert(e)), w.mat(&down.expert(e)), x, m)
 }
 
+/// [`expert_ffn`] on the int8-activation CPU kernel (`Knobs::cpu_i8`).
+pub fn expert_ffn_i8(w: &Weights, gate: &ExpertMats, up: &ExpertMats, down: &ExpertMats, e: usize, x: &[f32], m: usize) -> Vec<f32> {
+    lb_expert_host::expert::swiglu_i8(w.mat(&gate.expert(e)), w.mat(&up.expert(e)), w.mat(&down.expert(e)), x, m)
+}
+
 /// MoE FFN for `m` tokens: route each token, group tokens by expert, run each expert once
 /// on its tokens, and add the weighted outputs. Returns `[m, n_embd]` and the routes.
 #[allow(clippy::too_many_arguments)]
@@ -699,11 +704,12 @@ pub fn moe_ffn_with(
         Vec::new()
     } else {
         let t = std::time::Instant::now();
+        let i8 = store.knobs.cpu_i8();
         let v: Vec<(usize, Vec<(usize, f32)>, Vec<f32>)> = cpu_part
             .into_par_iter()
             .map(|(e, toks)| {
                 let xs = gather(&toks);
-                let y = expert_ffn(w, gate, up, down, e, &xs, toks.len());
+                let y = if i8 { expert_ffn_i8(w, gate, up, down, e, &xs, toks.len()) } else { expert_ffn(w, gate, up, down, e, &xs, toks.len()) };
                 (e, toks, y)
             })
             .collect();
