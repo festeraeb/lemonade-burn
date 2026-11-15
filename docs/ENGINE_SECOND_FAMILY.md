@@ -322,3 +322,54 @@ an error of the size of an expert output, 1e-2 or more). The tests assert isolat
 
 Not part of this step: the embedding and the LM head on the device, the layer pipeline across cards, any use of this from `lb-server`, speed (these launches run one layer at a time with scratch allocations and a host read per layer
 in the test; no throughput claim is made). Step B passes; Step C (N-card pipeline, whole model on two P100s, A-B-B-A) is next.
+
+## 13. Step C: the whole model on two P100s, served by `lb-server`
+
+**Layer check, the four missing layers.** Layers 12, 13 (delta-net) and 26, 27 (delta-net, attention) isolated against the CPU decoder: relative L2 6.8e-7 / 5.0e-7 and 3.8e-7 / 4.5e-7 (max abs 3.8e-6 at worst). All 40 layers have now been checked.
+
+**What was built.** `lb-qwen35/src/pipeline.rs`: a general N-stage pipeline. Stage `i` opens CUDA device `i` of `CUDA_VISIBLE_DEVICES` (the cards are chosen by UUID by listing the UUIDs there in stage order), owns a contiguous block of layers
+(`QWEN_SPLIT=20,20`, default even), the last stage also the output norm and head (Q6_K widened or Q8_0, by the file). One token: the embedding row is dequantised on the host (bit-exact, one 8 KB row) and written to stage 0; a stage's activation
+(`n_embd` f32, 8 KB) is read from its card and written to the next at the boundary; nothing else crosses cards and nothing is read back inside a layer (the router, top-8 and expert dispatch run on the device from a routes buffer). Each stage is recorded as one CUDA graph
+on its second token and replayed (the engine's graph protocol; a failed capture falls back to plain launches), which also takes the host launch cost off the critical path (the ENGINE_SYNC_COST lesson: with graphs the host issues a stage in 0.5 ms; without graphs
+launches are flushed to the device thread after every layer). Device kernels beyond step B: `GpuNativeExperts` generalised to the types of both files (gate/up Q5_K or Q6_K, down Q5_K, Q6_K or Q8_0), norm kernels that write the activation both natural and in the permuted order the native kernels read.
+The server loads the model on its own worker thread (graphs are recorded on, and replayed from, one thread's stream), `lemonade-burn-server --model <qwen35moe.gguf>` dispatches on `general.architecture` (feature `qwen`), ChatML without BOS, `enable_thinking:false` closes the think block, stops `<|im_end|>`/`<|endoftext|>`.
+Known limits of the served path: one sequence at a time on the device (no prompt-prefix reuse unless a request extends the kept conversation exactly), prompt tokens run one at a time (about 55 tok/s prefill), logits for the last position only.
+
+**Speed work** (device time, one P100, CUDA-graph replay of repeated calls; decode on two cards in-process, 71-token prompt then 63 tokens). The first working pipeline ran at 33.3 tok/s; a graph made no difference (0.5 ms of host issue a stage against 14 ms of device time), so the limit was device time:
+
+| part (per layer, delta-net layer) | first version | now |
+|---|---|---|
+| delta-net core (conv, L2, recurrence, gated norm) | 123 us (uncoalesced state rows, one thread a row) | 32 us (a plane a row, lanes along the row) |
+| router top-8 | 77 us (one thread) | 21 us (one cube, rank counting) |
+| routed experts (gate+up+down) | 205 us | 114 us (multi-row planes for the 512-wide down, gate+up writes permuted) |
+| in-process decode, two cards | 33.3 tok/s | **55.8 tok/s** |
+
+**Correctness gates** (570 positions, the five texts of section 5, device = both cards, graphs on) [measured]:
+
+| gate | result |
+|---|---|
+| device vs CPU decoder, top-1 | **570 / 570 = 100 %** (gate 99.9 %) |
+| device vs CPU decoder, max logit difference | 7.4e-4 (mean 2.1e-5), mean KL 2.9e-12, worst 1.5e-10 |
+| device vs llama.cpp (batch path), top-1 | 98.42 % (561/570), mean KL 0.00485 |
+| llama.cpp batch vs its own single-token path, same run | 97.37 % (555/570), mean KL 0.00636 |
+| device greedy text, 5 prompts x 48 tokens | identical to the CPU decoder on all 5 (4 identical to llama.cpp, one diverges at token 18 as the CPU decoder does) |
+
+The revised gates are met: against the CPU decoder 100 % and 7.4e-4; against llama.cpp the device is no worse than llama.cpp's own self-agreement on both top-1 (98.42 vs 97.37) and mean KL (0.00485 vs 0.00636). The original 99.5 % gate against a single llama.cpp path stands as not met, for the reason in section 5.
+
+**A-B-B-A on c4 cards AF + D8** (nothing else on them; 5 prompts, 256 new tokens each, temperature 0, no-think, streamed, client-side tok/s after the first token; order ours, llama.cpp, Nauti-Strata, Nauti-Strata, llama.cpp, ours; per-run median of the five) [measured, `abba.sh`, `abba_client.py`]:
+
+| engine | run 1 | run 2 |
+|---|---|---|
+| lemonade-burn (`20261115-qwen35-f73da05`, through `lb-server`) | 53.6 | 53.9 |
+| llama.cpp (fleet build 20261111) | 54.0 | 54.0 |
+| Nauti-Strata (`hard-qwen36-2card-c4` config) | 63.0 | 63.1 |
+
+Where it lands: **parity with llama.cpp, 0.5 % below it (53.75 vs 54.0 through the server; 55.8 in-process on the bench prompts, which run shorter contexts), and 15 % below Nauti-Strata**, which on these prompts measured 63.0-63.1 tok/s, not the 53.1 of the earlier thinking-mode run: the 53.1 figure in the on-demand report is not comparable (different prompt, thinking text). The
+speed gate (>= 54, matching llama.cpp) is missed by a hair through the server. What limits it: all of the remaining time is device time, about 18 ms a token (layers 0.4 ms each, of which the routed experts 0.11-0.12 ms, the two attention-layer projections 0.14 ms, the dense projections and shared expert 0.1 ms, the head 2.3 ms), and the kernels are bound by integer decode of 5-6-bit quants
+(shifts, masks, casts per value: 4 G values a token) as much as by memory (the Q5_K native matvec reaches 160 GB/s of resident bytes on a 732 GB/s card). Nauti-Strata's llama.cpp-derived kernels quantise the activation to int8 and use integer dot products (dp4a), which does that work 4 values at a time; the next step for this engine is the same
+(an int8-activation dp4a path for Q5_K/Q6_K/Q8_0, the `Q4_MATH_DP4A` idea of the Q4_0 kernels, checked against the f32 path as the existing kernels are). The server adds about 2 ms of host work a token over the in-process bench (stream, sampler, text decode; the device idles meanwhile) and a prompt-speed of 55 tok/s because prompt tokens are run one by one.
+
+**Manifest.** Added, disabled: engine `hard-qwen36-own-2card-c4` (port 8118, AF + D8 by UUID in stage order, new build, model Qwen3.6-35B-A3B Q5_K_M, `--ctx 8192`, `expect_model qwen3.6-35b-a3b-own`) and demand class `hard-max-own` (candidate = that engine on cards AF + D8). `demand.enabled` stays false; nothing enabled, no seat touched. Backup `var/fleet-manifest.json.bak-20261115-qwen-c`.
+
+**The Part 0 leftover (first long prompt after boot 8-9 s).** Measured on the LFM2.5 seat entry, first 419-token request: `LB_WARMUP` 0: 7.0 s, 8: 7.8 s, 96: 8.8 s, 512: 13.9 s, 1024: 24.0 s. So it is not a missing one-time kernel compile that a longer warm-up could pay: the first request costs about 7 s whatever, and each warm-up token adds ~10-20 ms to it
+(the warm-up's own long run is paid again at the first request, which points at per-sequence device state or checkpoint release in the first request after a warm-up sequence). Not fixed; cause not isolated; a longer warm-up makes it worse. The same server shape on the Qwen path shows a 4.8-5.3 s first request (about 25 prompt tokens) against 0.6-0.8 s afterwards, so it is a property of the server's first request, not of the LFM2 kernels.

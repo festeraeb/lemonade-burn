@@ -54,8 +54,12 @@ fn main() -> Result<()> {
                 for (i, &t) in p.iter().enumerate() {
                     let d = pipe.step(t, i, true)?.unwrap();
                     let b = load_row(&mut rb, gp + i, vocab)?;
-                    let s = load_row(&mut rs, gp + i, vocab)?;
-                    let mut line = format!("{{\"prompt\":{pi},\"i\":{i},\"dev_top1\":{},\"llama_top1\":{},\"llama_single_top1\":{},\"kl_llama_dev\":{},\"kl_batch_single\":{},\"agree_dev_llama\":{},\"agree_batch_single\":{}", argmax(&d), argmax(&b), argmax(&s), kl(&b, &d), kl(&b, &s), argmax(&d) == argmax(&b), argmax(&b) == argmax(&s));
+                    let mut line = format!("{{\"prompt\":{pi},\"i\":{i},\"dev_top1\":{},\"llama_top1\":{},\"kl_llama_dev\":{},\"agree_dev_llama\":{}", argmax(&d), argmax(&b), kl(&b, &d), argmax(&d) == argmax(&b));
+                    // the single-token reference may cover only the leading positions of the file
+                    if rs.metadata()?.len() >= (gp + i + 1) as u64 * vocab as u64 * 4 {
+                        let s = load_row(&mut rs, gp + i, vocab)?;
+                        line += &format!(",\"llama_single_top1\":{},\"kl_batch_single\":{},\"agree_batch_single\":{}", argmax(&s), kl(&b, &s), argmax(&b) == argmax(&s));
+                    }
                     if cpu {
                         let c = m.forward(&mut st, t, true).unwrap();
                         line += &format!(",\"cpu_top1\":{},\"agree_dev_cpu\":{},\"maxd_dev_cpu\":{},\"kl_cpu_dev\":{}", argmax(&c), argmax(&c) == argmax(&d), maxd(&c, &d), kl(&c, &d));

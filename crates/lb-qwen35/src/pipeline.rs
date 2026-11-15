@@ -9,14 +9,19 @@ use crate::device::DevModel;
 use crate::Model;
 use anyhow::{anyhow, Result};
 use lb_gguf::QuantMat;
-use lb_q4_gpu::{CubeGraph, Gpu, GpuQ6KMat};
+use lb_q4_gpu::{CubeGraph, Gpu, GpuQ6KMat, GpuQ8Mat};
 use std::cell::RefCell;
 
 type Handle = lb_q4_gpu::cubecl_server::Handle;
 
+enum HeadMat {
+    Q6(GpuQ6KMat),
+    Q8(GpuQ8Mat),
+}
+
 struct Head {
     norm: Handle,
-    out: GpuQ6KMat,
+    out: HeadMat,
 }
 
 enum GraphState {
@@ -58,7 +63,11 @@ impl<'m, 'a> Pipeline<'m, 'a> {
             let dev = DevModel::upload(&gpu, model, first..first + cnt, cap)?;
             let head = if i + 1 == split.len() {
                 let out: QuantMat<'_> = model.output;
-                Some(Head { norm: gpu.upload_f32(&model.out_norm), out: GpuQ6KMat::upload(&gpu, out).map_err(|e| anyhow!(e))? })
+                let out = match out.ty {
+                    lb_gguf::GgmlType::Q8_0 => HeadMat::Q8(GpuQ8Mat::upload(&gpu, out).map_err(|e| anyhow!(e))?),
+                    _ => HeadMat::Q6(GpuQ6KMat::upload(&gpu, out).map_err(|e| anyhow!(e))?),
+                };
+                Some(Head { norm: gpu.upload_f32(&model.out_norm), out })
             } else {
                 None
             };
@@ -92,7 +101,10 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         }
         if let Some(h) = &s.head {
             let nrm = s.gpu.qw_rms(&cur, &h.norm, 1, c.n_embd, c.eps).0;
-            return h.out.launch(&s.gpu, &nrm, 1);
+            return match &h.out {
+                HeadMat::Q6(m) => m.launch(&s.gpu, &nrm, 1),
+                HeadMat::Q8(m) => m.launch(&s.gpu, &nrm, 1),
+            };
         }
         cur
     }

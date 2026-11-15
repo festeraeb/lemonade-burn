@@ -1050,8 +1050,131 @@ fn q6n_routed_down_mr_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], h: &[V4F], rout
     }
 }
 
-/// Expert down matrices at file density: Q5_K or Q6_K (the file mixes them by layer).
+
+/// Lane partial of one Q8_0 row at file density (blocks `lane, lane + width, ...`; `bpr` blocks a row).
+#[cube]
+fn q8n_partial(qs: &[V4U], dd: &[u32], x: &[V4F], blk0: usize, xrow4: usize, bpr: usize, lane: usize, width: usize) -> f32 {
+    let mut acc = 0.0f32;
+    let mut b = lane;
+    while b < bpr {
+        let gb = blk0 + b;
+        let d = f16_to_f32((dd[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+        let xb = xrow4 + b * 8usize;
+        let mut p = V4F::new(0.0f32);
+        #[unroll]
+        for a in 0..2usize {
+            let qv = qs[gb * 2usize + a];
+            #[unroll]
+            for k in 0..4u32 {
+                let by = (qv >> V4U::new(8u32 * k)) & V4U::new(255u32);
+                let f = V4F::cast_from(by) - V4F::new(256.0f32) * V4F::cast_from(by >> V4U::new(7u32));
+                p += f * x[xb + 4usize * a + k as usize];
+            }
+        }
+        acc += d * (p.extract(0usize) + p.extract(1usize) + p.extract(2usize) + p.extract(3usize));
+        b += width;
+    }
+    acc
+}
+
+/// Routed down with Q8_0 experts (some Tiel-Coder layers), several rows a plane like the K-quant `_mr` kernels: `ipr` = blocks a row.
+#[cube(launch)]
+fn q8n_routed_down_mr_kernel(qs: &[V4U], dd: &[u32], h: &[V4F], routes: &[u32], dims: &[u32], out: &mut [f32], #[comptime] ipr: usize, #[comptime] rpp: usize) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let step = CUBE_COUNT as usize * ppc * rpp;
+    let rl = lane / ipr;
+    let mut ob = (CUBE_POS as usize * ppc + plane_id) * rpp;
+    while ob < out.len() {
+        let o = ob + rl;
+        let mut part = 0.0f32;
+        if o < out.len() {
+            let slot = o / rows;
+            let r = o % rows;
+            let e = routes[2usize * slot] as usize;
+            part = q8n_partial(qs, dd, h, (e * rows + r) * bpr, slot * cols / 4usize, bpr, lane % ipr, ipr);
+        }
+        #[unroll]
+        for rr in 0..rpp {
+            let mut mv = 0.0f32;
+            if rl == rr {
+                mv = part;
+            }
+            let sdot = plane_sum(mv);
+            if lane == 0usize {
+                if ob + rr < out.len() {
+                    out[ob + rr] = sdot;
+                }
+            }
+        }
+        ob += step;
+    }
+}
+
+/// Routed gate+up+SiLU with Q6_K experts (one Tiel-Coder layer); writes `h` permuted like the Q5_K kernel.
+#[cube(launch)]
+fn q6n_routed_gate_up_silu_kernel(gq: &[V4U], gs: &[V4U], gd: &[u32], uq: &[V4U], us: &[V4U], ud: &[u32], x: &[V4F], routes: &[u32], dims: &[u32], h: &mut [f32], #[comptime] use_plane: bool) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < h.len() {
+        let slot = o / rows;
+        let r = o % rows;
+        let e = routes[2usize * slot] as usize;
+        let tok = routes[2usize * slot + 1usize] as usize;
+        let blk0 = (e * rows + r) * bpr;
+        let pg = q6n_partial(gq, gs, gd, x, blk0, tok * cols / 4usize, bpr, lane, width);
+        let pu = q6n_partial(uq, us, ud, x, blk0, tok * cols / 4usize, bpr, lane, width);
+        let g = lane_sum(&mut sm, pg, use_plane);
+        let u = lane_sum(&mut sm, pu, use_plane);
+        if lane == 0usize {
+            let a16 = r / 16usize;
+            let rem = r % 16usize;
+            h[slot * rows + a16 * 16usize + (rem % 4usize) * 4usize + rem / 4usize] = g / (1.0f32 + Exp::exp(-g)) * u;
+        }
+        o += step;
+    }
+}
+
+/// Q6_K matrix split into aligned arrays at file density (`ql`+`qh`, scales, f16 `d`), as `GpuQ6KNative` holds it.
+fn split_q6(gpu: &Gpu, bytes: &[u8], nb: usize) -> (Handle, Handle, Handle, (usize, usize, usize)) {
+    let mut qq = Vec::with_capacity(nb * 192);
+    let mut sc = Vec::with_capacity(nb * 16);
+    for blk in bytes.chunks_exact(210) {
+        qq.extend_from_slice(&blk[..192]);
+        sc.extend_from_slice(&blk[192..208]);
+    }
+    let dd = pack_f16_pairs(bytes, 210, 208, nb);
+    let (qq, sc) = (bytes_to_words(&qq), bytes_to_words(&sc));
+    let n = (qq.len(), sc.len(), dd.len());
+    (gpu.upload_u32(qq), gpu.upload_u32(sc), gpu.upload_u32(dd), n)
+}
+
+/// Expert gate and up matrices (always the same type in the files seen): Q5_K, or Q6_K in a few layers.
+pub enum NativeGateUp {
+    Q5 { gw: Handle, uw: Handle, n: usize },
+    Q6 { g: (Handle, Handle, Handle), u: (Handle, Handle, Handle), n: (usize, usize, usize) },
+}
+
+/// Expert down matrices at file density: Q5_K, Q6_K or Q8_0 (the files mix them by layer).
 pub enum NativeDown {
+    Q8 { qs: Handle, dd: Handle, n: (usize, usize) },
     Q5 { w: Handle, n: usize },
     Q6 { qq: Handle, sc: Handle, dd: Handle, n: (usize, usize, usize) },
 }
@@ -1061,45 +1184,58 @@ pub struct GpuNativeExperts {
     pub n_expert: usize,
     pub embd: usize,
     pub ff: usize,
-    gw: Handle,
-    uw: Handle,
-    n_gu: usize,
+    gu: NativeGateUp,
     down: NativeDown,
 }
 
 impl GpuNativeExperts {
     pub fn upload(gpu: &Gpu, n_expert: usize, gate: QuantMat<'_>, up: QuantMat<'_>, down: QuantMat<'_>) -> Result<Self, String> {
-        if gate.ty != GgmlType::Q5K || up.ty != GgmlType::Q5K || !matches!(down.ty, GgmlType::Q5K | GgmlType::Q6K) {
-            return Err("expected Q5_K gate/up and Q5_K or Q6_K down".into());
+        if gate.ty != up.ty || !matches!(gate.ty, GgmlType::Q5K | GgmlType::Q6K) || !matches!(down.ty, GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q8_0) {
+            return Err(format!("expert types gate {} up {} down {} not supported", gate.ty.name(), up.ty.name(), down.ty.name()));
         }
         let (ff, embd) = (gate.rows / n_expert, gate.cols);
-        let gw = bytes_to_words(gate.bytes);
-        let uw = bytes_to_words(up.bytes);
-        let n_gu = gw.len();
-        let down = if down.ty == GgmlType::Q5K {
-            let w = bytes_to_words(down.bytes);
-            let n = w.len();
-            NativeDown::Q5 { w: gpu.upload_u32(w), n }
+        let gu = if gate.ty == GgmlType::Q5K {
+            let (gw, uw) = (bytes_to_words(gate.bytes), bytes_to_words(up.bytes));
+            let n = gw.len();
+            NativeGateUp::Q5 { gw: gpu.upload_u32(gw), uw: gpu.upload_u32(uw), n }
         } else {
-            let nb = down.rows * (down.cols / 256);
-            let mut qq = Vec::with_capacity(nb * 192);
-            let mut sc = Vec::with_capacity(nb * 16);
-            for blk in down.bytes.chunks_exact(210) {
-                qq.extend_from_slice(&blk[..192]);
-                sc.extend_from_slice(&blk[192..208]);
-            }
-            let dd = pack_f16_pairs(down.bytes, 210, 208, nb);
-            let (qq, sc) = (bytes_to_words(&qq), bytes_to_words(&sc));
-            let n = (qq.len(), sc.len(), dd.len());
-            NativeDown::Q6 { qq: gpu.upload_u32(qq), sc: gpu.upload_u32(sc), dd: gpu.upload_u32(dd), n }
+            let nb = gate.rows * (gate.cols / 256);
+            let (a, b, c, n) = split_q6(gpu, gate.bytes, nb);
+            let (d, e, f, _) = split_q6(gpu, up.bytes, nb);
+            NativeGateUp::Q6 { g: (a, b, c), u: (d, e, f), n }
         };
-        Ok(Self { n_expert, embd, ff, gw: gpu.upload_u32(gw), uw: gpu.upload_u32(uw), n_gu, down })
+        let down = match down.ty {
+            GgmlType::Q5K => {
+                let w = bytes_to_words(down.bytes);
+                let n = w.len();
+                NativeDown::Q5 { w: gpu.upload_u32(w), n }
+            }
+            GgmlType::Q6K => {
+                let (qq, sc, dd, n) = split_q6(gpu, down.bytes, down.rows * (down.cols / 256));
+                NativeDown::Q6 { qq, sc, dd, n }
+            }
+            _ => {
+                let nb = down.rows * (down.cols / 32);
+                let mut qs = Vec::with_capacity(nb * 32);
+                for blk in down.bytes.chunks_exact(34) {
+                    qs.extend_from_slice(&blk[2..34]);
+                }
+                let dd = pack_f16_pairs(down.bytes, 34, 0, nb);
+                let qs = bytes_to_words(&qs);
+                let n = (qs.len(), dd.len());
+                NativeDown::Q8 { qs: gpu.upload_u32(qs), dd: gpu.upload_u32(dd), n }
+            }
+        };
+        Ok(Self { n_expert, embd, ff, gu, down })
     }
 
     pub fn bytes_on_device(&self) -> usize {
-        2 * self.n_gu * 4
-            + match &self.down {
-                NativeDown::Q5 { n, .. } => n * 4,
+        (match &self.gu {
+            NativeGateUp::Q5 { n, .. } => 2 * n * 4,
+            NativeGateUp::Q6 { n, .. } => 2 * (n.0 + n.1 + n.2) * 4,
+        }) + match &self.down {
+            NativeDown::Q8 { n, .. } => (n.0 + n.1) * 4,
+            NativeDown::Q5 { n, .. } => n * 4,
                 NativeDown::Q6 { n, .. } => (n.0 + n.1 + n.2) * 4,
             }
     }
@@ -1118,24 +1254,60 @@ impl GpuNativeExperts {
         let d_gu = gpu.const_u32(&[self.ff as u32, self.embd as u32]);
         let d_dn = gpu.const_u32(&[self.embd as u32, self.ff as u32]);
         unsafe {
-            q5n_routed_gate_up_silu_kernel::launch(
-                &gpu.client,
-                cube_count(slots * self.ff, gpu.per_cube()),
-                CubeDim::new_1d(gpu.cube_dim as u32),
-                BufferArg::from_raw_parts(self.gw.clone(), self.n_gu / 4),
-                BufferArg::from_raw_parts(self.uw.clone(), self.n_gu / 4),
-                BufferArg::from_raw_parts(xp, self.embd / 4),
-                BufferArg::from_raw_parts(routes.clone(), 2 * slots),
-                BufferArg::from_raw_parts(d_gu, 2),
-                BufferArg::from_raw_parts(h.clone(), slots * self.ff),
-                gpu.use_plane,
-            );
+            match &self.gu {
+                NativeGateUp::Q5 { gw, uw, n } => q5n_routed_gate_up_silu_kernel::launch(
+                    &gpu.client,
+                    cube_count(slots * self.ff, gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(gw.clone(), n / 4),
+                    BufferArg::from_raw_parts(uw.clone(), n / 4),
+                    BufferArg::from_raw_parts(xp, self.embd / 4),
+                    BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                    BufferArg::from_raw_parts(d_gu, 2),
+                    BufferArg::from_raw_parts(h.clone(), slots * self.ff),
+                    gpu.use_plane,
+                ),
+                NativeGateUp::Q6 { g, u, n } => q6n_routed_gate_up_silu_kernel::launch(
+                    &gpu.client,
+                    cube_count(slots * self.ff, gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(g.0.clone(), n.0 / 4),
+                    BufferArg::from_raw_parts(g.1.clone(), n.1 / 4),
+                    BufferArg::from_raw_parts(g.2.clone(), n.2),
+                    BufferArg::from_raw_parts(u.0.clone(), n.0 / 4),
+                    BufferArg::from_raw_parts(u.1.clone(), n.1 / 4),
+                    BufferArg::from_raw_parts(u.2.clone(), n.2),
+                    BufferArg::from_raw_parts(xp, self.embd / 4),
+                    BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                    BufferArg::from_raw_parts(d_gu, 2),
+                    BufferArg::from_raw_parts(h.clone(), slots * self.ff),
+                    gpu.use_plane,
+                ),
+            }
         }
         let hp = h; // gate+up already wrote it permuted
         // multi-row planes need plane ops, a 32-lane plane, and an item count that divides it
         let mr = |ipr: usize| gpu.use_plane && gpu.plane_size.1 == 32 && ipr <= 32 && 32 % ipr == 0;
         unsafe {
             match &self.down {
+                NativeDown::Q8 { qs, dd, n } => {
+                    let ipr = self.ff / 32;
+                    assert!(mr(ipr), "Q8_0 expert down needs plane ops and ff/32 dividing 32 (ff = {})", self.ff);
+                    let rpp = 32 / ipr;
+                    q8n_routed_down_mr_kernel::launch(
+                        &gpu.client,
+                        cube_count((slots * self.embd).div_ceil(rpp), gpu.per_cube()),
+                        CubeDim::new_1d(gpu.cube_dim as u32),
+                        BufferArg::from_raw_parts(qs.clone(), n.0 / 4),
+                        BufferArg::from_raw_parts(dd.clone(), n.1),
+                        BufferArg::from_raw_parts(hp, slots * self.ff / 4),
+                        BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                        BufferArg::from_raw_parts(d_dn, 2),
+                        BufferArg::from_raw_parts(out.clone(), slots * self.embd),
+                        ipr,
+                        rpp,
+                    )
+                }
                 NativeDown::Q5 { w, n } if mr(self.ff / 256 * 4) => {
                     let ipr = self.ff / 256 * 4;
                     let rpp = 32 / ipr;
