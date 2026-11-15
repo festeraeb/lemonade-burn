@@ -18,11 +18,13 @@
 
 pub mod decode;
 pub mod gemm;
+pub mod kquant;
 pub mod prefill;
 pub mod store;
 pub mod trace;
 pub mod transcode;
 pub use decode::TokenParams;
+pub use kquant::{q5_k_matvec_gpu, repack_q5_k, GpuKExpertLayer, GpuQ5KMat};
 pub use store::{PendingRead, pick_cube_device, ExpertSlots, Gpu, Q4Math, SideStream, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat, GpuQ8Mat};
 #[cfg(feature = "cuda")]
 pub mod pinned;
@@ -87,7 +89,7 @@ fn q4_row_partial(qs: &[V4U], sc: &[u32], x: &[V4F], gb0: usize, x4_0: usize, bp
 /// Sum a per-lane partial across the lanes working on one output; valid in every lane.
 /// Plane path: `plane_sum`. Fallback: the whole cube is one output, shared-memory tree.
 #[cube]
-fn lane_sum(sm: &mut Shared<[f32]>, v: f32, #[comptime] use_plane: bool) -> f32 {
+pub(crate) fn lane_sum(sm: &mut Shared<[f32]>, v: f32, #[comptime] use_plane: bool) -> f32 {
     let mut r = v;
     if use_plane {
         r = plane_sum(v);
@@ -187,7 +189,7 @@ fn q4_0_gate_up_silu_kernel(
 /// vector-wide `(w >> 8j) & 255` lands exactly on x's 4-wide vector `j`. The group scale is
 /// already `d * sc[g]` (see [`repack_q6_k`]), so there is no f16 decode in the inner loop.
 #[cube]
-fn q6_row_partial(qv: &[V4U], sd: &[f32], x: &[V4F], gg0: usize, x4_0: usize, gpr: usize, lane: usize, width: usize) -> f32 {
+pub(crate) fn q6_row_partial(qv: &[V4U], sd: &[f32], x: &[V4F], gg0: usize, x4_0: usize, gpr: usize, lane: usize, width: usize) -> f32 {
     let mut acc = V4F::new(0.0f32);
     let mut g = lane;
     while g < gpr {
