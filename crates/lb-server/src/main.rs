@@ -145,6 +145,10 @@ pub trait Decoder: Send + 'static {
     fn new_cache(&self) -> Self::Cache;
     /// Logits `[1, vocab]` for the last of `tokens`, run at positions `cache.len..`.
     fn forward(&self, tokens: &[u32], cache: &mut Self::Cache, all_logits: bool) -> Tensor<2>;
+    /// The logits as a host vector (what the server's sampler needs); decoders that already hold them as one skip the tensor round trip.
+    fn forward_vec(&self, tokens: &[u32], cache: &mut Self::Cache, all_logits: bool) -> Vec<f32> {
+        self.forward(tokens, cache, all_logits).into_data().try_to_vec::<f32>().expect("logits")
+    }
     fn max_context(&self) -> usize;
     fn bos(&self) -> u32;
     fn kernel_name(&self) -> &'static str;
@@ -356,7 +360,7 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job, prev: Option<Ses
         keep(&mut cache, &seq, &mut cps);
     }
     let done = seq.len();
-    let logits = to_vec(model.forward(&job.prompt[done..], &mut cache, false));
+    let logits = model.forward_vec(&job.prompt[done..], &mut cache, false);
     seq.extend_from_slice(&job.prompt[done..]);
     keep(&mut cache, &seq, &mut cps);
     let prefill_s = t0.elapsed().as_secs_f64();
@@ -406,7 +410,7 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job, prev: Option<Ses
         if n >= job.max_tokens {
             break;
         }
-        let l = to_vec(model.forward(&[next], &mut cache, false));
+        let l = model.forward_vec(&[next], &mut cache, false);
         seq.push(next);
         next = sampler.sample(&l);
     }
@@ -715,12 +719,23 @@ fn main() -> Result<()> {
     let (codec, ctx, model_id, kernel, placement, timings, live): Loaded = if is_qwen {
         #[cfg(feature = "qwen")]
         {
-            let (model, codec, ctx) = qwen::load(&args.model, args.ctx)?;
+            // the cards are opened and the weights uploaded on the model thread itself: CUDA graphs are recorded on, and replayed from,
+            // one OS thread's stream (cubecl gives every thread its own), so the whole pipeline lives on that thread
+            let (ltx, lrx) = std_mpsc::channel();
+            let (path, ctx_arg) = (args.model.clone(), args.ctx);
+            std::thread::Builder::new().name("lb-model".into()).spawn(move || match qwen::load(&path, ctx_arg) {
+                Ok((model, codec, ctx)) => {
+                    let _ = ltx.send(Ok((codec.clone(), ctx)));
+                    worker(model, codec, jrx)
+                }
+                Err(e) => {
+                    let _ = ltx.send(Err(e.to_string()));
+                }
+            })?;
+            let (codec, ctx): (Arc<TextCodec>, usize) = lrx.recv()?.map_err(|e| anyhow::anyhow!("qwen35moe load: {e}"))?;
             let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "qwen35moe".into()));
-            let kernel = model.kernel_name();
+            let kernel: &'static str = "qwen35moe q5_k/q6_k/q8_0 file-density kernels, CUDA layer pipeline";
             let live = LiveTargets { knobs: None, scraper: None, default_max_tokens: default_max_tokens.clone(), ctx };
-            let wc = codec.clone();
-            std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
             (codec, ctx, model_id, kernel, None, None, live)
         }
         #[cfg(not(feature = "qwen"))]

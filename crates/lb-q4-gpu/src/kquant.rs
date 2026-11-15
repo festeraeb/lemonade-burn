@@ -1108,6 +1108,11 @@ impl GpuNativeExperts {
     /// returns `[slots, embd]` per-slot outputs (router weights not applied).
     pub fn launch(&self, gpu: &Gpu, x: &Handle, routes: &Handle, slots: usize) -> Handle {
         let xp = GpuQ5KNative::permute_x(gpu, x, self.embd);
+        self.launch_permuted(gpu, xp, routes, slots)
+    }
+
+    /// As [`launch`](Self::launch) with the activation already in the permuted order (`qw_rms`'s / `qw_add_rms`'s second output).
+    pub fn launch_permuted(&self, gpu: &Gpu, xp: Handle, routes: &Handle, slots: usize) -> Handle {
         let h = gpu.scratch(slots * self.ff * 4);
         let out = gpu.scratch(slots * self.embd * 4);
         let d_gu = gpu.const_u32(&[self.ff as u32, self.embd as u32]);

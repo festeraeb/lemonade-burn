@@ -15,6 +15,13 @@ fn silu_f(x: f32) -> f32 {
     x / (1.0f32 + Exp::exp(-x))
 }
 
+/// Index of value `i` in the 16-value-permuted order of `perm16_kernel` (`y[16a + 4j + i'] = x[16a + 4i' + j]`).
+#[cube]
+fn perm16_idx(i: usize) -> usize {
+    let rem = i % 16usize;
+    (i / 16usize) * 16usize + (rem % 4usize) * 4usize + rem / 4usize
+}
+
 #[cube]
 fn sigmoid_f(x: f32) -> f32 {
     1.0f32 / (1.0f32 + Exp::exp(-x))
@@ -22,7 +29,7 @@ fn sigmoid_f(x: f32) -> f32 {
 
 /// `out[row] = x[row] * rsqrt(mean(x[row]^2) + eps) * w`, one cube (256 units) per row of `n`.
 #[cube(launch)]
-fn qw_rms_kernel(x: &[f32], w: &[f32], out: &mut [f32], eps: &[f32], #[comptime] n: usize) {
+fn qw_rms_kernel(x: &[f32], w: &[f32], out: &mut [f32], outp: &mut [f32], eps: &[f32], #[comptime] n: usize) {
     let mut sm = Shared::<[f32]>::new_slice(256usize);
     let row = CUBE_POS as usize;
     let mut ss = 0.0f32;
@@ -36,7 +43,9 @@ fn qw_rms_kernel(x: &[f32], w: &[f32], out: &mut [f32], eps: &[f32], #[comptime]
     let r = 1.0f32 / Sqrt::sqrt(tot / (n as f32) + eps[0]);
     let mut i = UNIT_POS as usize;
     while i < n {
-        out[row * n + i] = x[row * n + i] * r * w[i];
+        let v = x[row * n + i] * r * w[i];
+        out[row * n + i] = v;
+        outp[row * n + perm16_idx(i)] = v;
         i += CUBE_DIM_X as usize;
     }
 }
@@ -73,7 +82,7 @@ fn qw_f32_matvec_kernel(w: &[f32], x: &[f32], out: &mut [f32], #[comptime] cols:
 
 /// `sum = x + y`, `h = rms(sum) * w` (one row of `n`, one cube of 256 units).
 #[cube(launch)]
-fn qw_add_rms_kernel(x: &[f32], y: &[f32], w: &[f32], sum: &mut [f32], h: &mut [f32], eps: &[f32], #[comptime] n: usize) {
+fn qw_add_rms_kernel(x: &[f32], y: &[f32], w: &[f32], sum: &mut [f32], h: &mut [f32], hp: &mut [f32], eps: &[f32], #[comptime] n: usize) {
     let mut sm = Shared::<[f32]>::new_slice(256usize);
     let mut ss = 0.0f32;
     let mut i = UNIT_POS as usize;
@@ -87,7 +96,9 @@ fn qw_add_rms_kernel(x: &[f32], y: &[f32], w: &[f32], sum: &mut [f32], h: &mut [
     let r = 1.0f32 / Sqrt::sqrt(tot / (n as f32) + eps[0]);
     let mut i = UNIT_POS as usize;
     while i < n {
-        h[i] = sum[i] * r * w[i];
+        let v = sum[i] * r * w[i];
+        h[i] = v;
+        hp[perm16_idx(i)] = v;
         i += CUBE_DIM_X as usize;
     }
 }
@@ -216,7 +227,7 @@ fn qw_dn_recur_kernel(s: &mut [f32], conv: &[f32], beta: &[f32], g: &[f32], out:
 
 /// `out = rms(o) * w * silu(z)` per head of `hv`; one cube per head.
 #[cube(launch)]
-fn qw_dn_gnorm_kernel(o: &[f32], z: &[f32], w: &[f32], out: &mut [f32], eps: &[f32], #[comptime] hv: usize) {
+fn qw_dn_gnorm_kernel(o: &[f32], z: &[f32], w: &[f32], out: &mut [f32], outp: &mut [f32], eps: &[f32], #[comptime] hv: usize) {
     let mut sm = Shared::<[f32]>::new_slice(256usize);
     let hh = CUBE_POS as usize;
     let mut ss = 0.0f32;
@@ -230,7 +241,9 @@ fn qw_dn_gnorm_kernel(o: &[f32], z: &[f32], w: &[f32], out: &mut [f32], eps: &[f
     let r = 1.0f32 / Sqrt::sqrt(tot / (hv as f32) + eps[0]);
     let mut i = UNIT_POS as usize;
     while i < hv {
-        out[hh * hv + i] = o[hh * hv + i] * r * w[i] * silu_f(z[hh * hv + i]);
+        let v = o[hh * hv + i] * r * w[i] * silu_f(z[hh * hv + i]);
+        out[hh * hv + i] = v;
+        outp[hh * hv + perm16_idx(i)] = v;
         i += CUBE_DIM_X as usize;
     }
 }
@@ -459,13 +472,15 @@ impl Gpu {
         cube_count(n, self.cube_dim)
     }
 
-    pub fn qw_rms(&self, x: &Handle, w: &Handle, rows: usize, n: usize, eps: f32) -> Handle {
+    /// Returns (`rms(x) * w`, the same values in the 16-value-permuted order the native Q5_K/Q6_K kernels read; `n` a multiple of 16).
+    pub fn qw_rms(&self, x: &Handle, w: &Handle, rows: usize, n: usize, eps: f32) -> (Handle, Handle) {
         let out = self.scratch(rows * n * 4);
+        let outp = self.scratch(rows * n * 4);
         let e = self.const_f32(&[eps]);
         unsafe {
-            qw_rms_kernel::launch(&self.client, CubeCount::Static(rows as u32, 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(x.clone(), rows * n), BufferArg::from_raw_parts(w.clone(), n), BufferArg::from_raw_parts(out.clone(), rows * n), BufferArg::from_raw_parts(e, 1), n);
+            qw_rms_kernel::launch(&self.client, CubeCount::Static(rows as u32, 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(x.clone(), rows * n), BufferArg::from_raw_parts(w.clone(), n), BufferArg::from_raw_parts(out.clone(), rows * n), BufferArg::from_raw_parts(outp.clone(), rows * n), BufferArg::from_raw_parts(e, 1), n);
         }
-        out
+        (out, outp)
     }
 
     /// `w` is `rows x cols` f32 on the device.
@@ -477,15 +492,16 @@ impl Gpu {
         out
     }
 
-    /// Returns (`x + y`, `rms(x + y) * w`).
-    pub fn qw_add_rms(&self, x: &Handle, y: &Handle, w: &Handle, n: usize, eps: f32) -> (Handle, Handle) {
+    /// Returns (`x + y`, `rms(x + y) * w`, the latter permuted).
+    pub fn qw_add_rms(&self, x: &Handle, y: &Handle, w: &Handle, n: usize, eps: f32) -> (Handle, Handle, Handle) {
         let sum = self.scratch(n * 4);
         let h = self.scratch(n * 4);
+        let hp = self.scratch(n * 4);
         let e = self.const_f32(&[eps]);
         unsafe {
-            qw_add_rms_kernel::launch(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(x.clone(), n), BufferArg::from_raw_parts(y.clone(), n), BufferArg::from_raw_parts(w.clone(), n), BufferArg::from_raw_parts(sum.clone(), n), BufferArg::from_raw_parts(h.clone(), n), BufferArg::from_raw_parts(e, 1), n);
+            qw_add_rms_kernel::launch(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(x.clone(), n), BufferArg::from_raw_parts(y.clone(), n), BufferArg::from_raw_parts(w.clone(), n), BufferArg::from_raw_parts(sum.clone(), n), BufferArg::from_raw_parts(h.clone(), n), BufferArg::from_raw_parts(hp.clone(), n), BufferArg::from_raw_parts(e, 1), n);
         }
-        (sum, h)
+        (sum, h, hp)
     }
 
     pub fn qw_add(&self, a: &Handle, b: &Handle, n: usize) -> Handle {
@@ -505,9 +521,9 @@ impl Gpu {
     }
 
     /// Delta-net core for one token. `qkv` `[ch]`, `z` `[d_inner]`, `ba` `[2 nv]` (beta logits then alpha logits); `conv_state` `[(kd-1) * ch]` and `s`
-    /// `[nv * hv * hk]` are persistent (create with `upload_f32`), updated in place. Returns the gated-normed `[d_inner]`.
+    /// `[nv * hv * hk]` are persistent (create with `upload_f32`), updated in place. Returns the gated-normed `[d_inner]` (natural, permuted).
     #[allow(clippy::too_many_arguments)]
-    pub fn qw_delta_net(&self, qkv: &Handle, z: &Handle, ba: &Handle, conv_w: &Handle, dt: &Handle, a: &Handle, norm_w: &Handle, conv_state: &Handle, s: &Handle, (ch, kd, nk, nv, hk, hv): (usize, usize, usize, usize, usize, usize), eps: f32) -> Handle {
+    pub fn qw_delta_net(&self, qkv: &Handle, z: &Handle, ba: &Handle, conv_w: &Handle, dt: &Handle, a: &Handle, norm_w: &Handle, conv_state: &Handle, s: &Handle, (ch, kd, nk, nv, hk, hv): (usize, usize, usize, usize, usize, usize), eps: f32) -> (Handle, Handle) {
         let conv = self.scratch(ch * 4);
         let beta = self.scratch(nv * 4);
         let g = self.scratch(nv * 4);
@@ -520,10 +536,11 @@ impl Gpu {
             qw_dn_recur_kernel::launch(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(128), BufferArg::from_raw_parts(s.clone(), nv * hv * hk), BufferArg::from_raw_parts(conv.clone(), ch), BufferArg::from_raw_parts(beta, nv), BufferArg::from_raw_parts(g, nv), BufferArg::from_raw_parts(o.clone(), nv * hv), nk, hv, hk);
         }
         let out = self.scratch(nv * hv * 4);
+        let outp = self.scratch(nv * hv * 4);
         unsafe {
-            qw_dn_gnorm_kernel::launch(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(128), BufferArg::from_raw_parts(o, nv * hv), BufferArg::from_raw_parts(z.clone(), nv * hv), BufferArg::from_raw_parts(norm_w.clone(), hv), BufferArg::from_raw_parts(out.clone(), nv * hv), BufferArg::from_raw_parts(e, 1), hv);
+            qw_dn_gnorm_kernel::launch(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(128), BufferArg::from_raw_parts(o, nv * hv), BufferArg::from_raw_parts(z.clone(), nv * hv), BufferArg::from_raw_parts(norm_w.clone(), hv), BufferArg::from_raw_parts(out.clone(), nv * hv), BufferArg::from_raw_parts(outp.clone(), nv * hv), BufferArg::from_raw_parts(e, 1), hv);
         }
-        out
+        (out, outp)
     }
 
     /// Gated attention core for one token at `pos` (`pos_h` = a u32 buffer holding it, rewritten by the caller each token with

@@ -58,6 +58,10 @@ impl Decoder for QwenDev {
         QCache { len: 0 }
     }
     fn forward(&self, tokens: &[u32], cache: &mut QCache, all_logits: bool) -> Tensor<2> {
+        let v = self.forward_vec(tokens, cache, all_logits);
+        Tensor::from_data(TensorData::new(v, [1, self.vocab]), &Device::flex())
+    }
+    fn forward_vec(&self, tokens: &[u32], cache: &mut QCache, all_logits: bool) -> Vec<f32> {
         assert!(!all_logits, "qwen35moe decoder returns the last position's logits only");
         if cache.len == 0 {
             self.pipe.reset();
@@ -68,8 +72,7 @@ impl Decoder for QwenDev {
             last = self.pipe.step(t, cache.len, i + 1 == tokens.len()).expect("device step");
             cache.len += 1;
         }
-        let v = last.expect("logits");
-        Tensor::from_data(TensorData::new(v, [1, self.vocab]), &Device::flex())
+        last.expect("logits")
     }
     fn max_context(&self) -> usize {
         self.cap

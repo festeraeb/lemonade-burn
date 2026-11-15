@@ -91,7 +91,7 @@ impl<'m, 'a> Pipeline<'m, 'a> {
             }
         }
         if let Some(h) = &s.head {
-            let nrm = s.gpu.qw_rms(&cur, &h.norm, 1, c.n_embd, c.eps);
+            let nrm = s.gpu.qw_rms(&cur, &h.norm, 1, c.n_embd, c.eps).0;
             return h.out.launch(&s.gpu, &nrm, 1);
         }
         cur
@@ -129,8 +129,10 @@ impl<'m, 'a> Pipeline<'m, 'a> {
                         }
                         Err(e) => {
                             eprintln!("lb-qwen35: stop_capture refused ({e:?})");
+                            // the recording runs nothing: this token is simply run again, un-graphed, from here on
                             *gs = GraphState::Failed;
-                            return Err(anyhow!("graph capture failed mid-token; rerun with LB_QW_GRAPH=0"));
+                            drop(gs);
+                            return Ok(self.build(si, self.flush > 0));
                         }
                     }
                 }

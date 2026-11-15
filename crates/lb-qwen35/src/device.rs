@@ -32,6 +32,14 @@ impl DMat {
             DMat::Q8(m) => m.launch(gpu, x, 1),
         }
     }
+    /// With the activation available both ways (the producer wrote the permuted copy), no permute launch is needed.
+    fn launch2(&self, gpu: &Gpu, x: &Handle, xp: &Handle) -> Handle {
+        match self {
+            DMat::Q5(m) => m.launch_permuted(gpu, xp, 1),
+            DMat::Q6(m) => m.launch_permuted(gpu, xp, 1),
+            DMat::Q8(m) => m.launch(gpu, x, 1),
+        }
+    }
 }
 
 struct DLin {
@@ -166,7 +174,7 @@ impl DevModel {
             (name, us)
         };
         let mut v = Vec::new();
-        v.push(time("rms", &|| gpu.qw_rms(&x, &l.attn_norm, 1, c.n_embd, c.eps)));
+        v.push(time("rms", &|| gpu.qw_rms(&x, &l.attn_norm, 1, c.n_embd, c.eps).0));
         if let Some(d) = &l.lin {
             v.push(time("qkv matvec", &|| d.qkv.launch(gpu, &x)));
             v.push(time("z matvec", &|| d.z.launch(gpu, &x)));
@@ -176,7 +184,7 @@ impl DevModel {
             let qkv = gpu.upload_f32(&vec![0.1f32; c.conv_channels()]);
             let z = gpu.upload_f32(&vec![0.1f32; c.d_inner]);
             let ba = gpu.upload_f32(&vec![0.1f32; 2 * c.n_v_heads]);
-            v.push(time("delta-net core", &|| gpu.qw_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, (c.conv_channels(), c.d_conv, c.n_k_heads, c.n_v_heads, c.head_k, c.head_v()), c.eps)));
+            v.push(time("delta-net core", &|| gpu.qw_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, (c.conv_channels(), c.d_conv, c.n_k_heads, c.n_v_heads, c.head_k, c.head_v()), c.eps).0));
         } else if let Some(a) = &l.attn {
             v.push(time("q matvec", &|| a.q.launch(gpu, &x)));
             v.push(time("k matvec", &|| a.k.launch(gpu, &x)));
@@ -221,25 +229,25 @@ impl DevModel {
     pub fn layer_forward(&self, gpu: &Gpu, i: usize, x: &Handle, _pos: usize) -> (Handle, Handle) {
         let c = &self.cfg;
         let l = &self.layers[i];
-        let h = gpu.qw_rms(x, &l.attn_norm, 1, c.n_embd, c.eps);
+        let (h, hp) = gpu.qw_rms(x, &l.attn_norm, 1, c.n_embd, c.eps);
         let y = if let Some(d) = &l.lin {
-            let qkv = d.qkv.launch(gpu, &h);
-            let z = d.z.launch(gpu, &h);
+            let qkv = d.qkv.launch2(gpu, &h, &hp);
+            let z = d.z.launch2(gpu, &h, &hp);
             let ba = gpu.qw_f32_matvec(&d.ba, &h, 2 * c.n_v_heads, c.n_embd);
             let core = gpu.qw_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, (c.conv_channels(), c.d_conv, c.n_k_heads, c.n_v_heads, c.head_k, c.head_v()), c.eps);
-            d.out.launch(gpu, &core)
+            d.out.launch2(gpu, &core.0, &core.1)
         } else {
             let a = l.attn.as_ref().unwrap();
-            let qf = a.q.launch(gpu, &h);
-            let k = a.k.launch(gpu, &h);
-            let v = a.v.launch(gpu, &h);
+            let qf = a.q.launch2(gpu, &h, &hp);
+            let k = a.k.launch2(gpu, &h, &hp);
+            let v = a.v.launch2(gpu, &h, &hp);
             let o = gpu.qw_attention(&qf, &k, &v, &a.qn, &a.kn, &a.kc, &a.vc, &self.pos_h, (c.n_head, c.n_head_kv, c.head_dim, c.n_rot / 2, self.cap), c.eps, self.theta_scale);
             a.o.launch(gpu, &o)
         };
-        let (x1, h2) = gpu.qw_add_rms(x, &y, &l.post_norm, c.n_embd, c.eps);
+        let (x1, h2, h2p) = gpu.qw_add_rms(x, &y, &l.post_norm, c.n_embd, c.eps);
         let logits = gpu.qw_f32_matvec(&l.router_sg, &h2, c.n_expert + 1, c.n_embd);
         let (routes, weights) = gpu.qw_route(&logits, c.n_expert, c.n_used);
-        let down = l.experts.launch(gpu, &h2, &routes, c.n_used);
+        let down = l.experts.launch_permuted(gpu, h2p, &routes, c.n_used);
         let g = l.sh_gate.launch(gpu, &h2);
         let u = l.sh_up.launch(gpu, &h2);
         let sh = gpu.qw_silu_mul(&g, &u, c.ff_shexp);
