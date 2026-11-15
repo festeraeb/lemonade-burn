@@ -63,6 +63,7 @@ fn device_layers_match_cpu_decoder() {
         let (mut mid, mut out) = (Stat { max_abs: 0.0, max_rel: 0.0 }, Stat { max_abs: 0.0, max_rel: 0.0 });
         for (pos, h) in rec.iter().enumerate() {
             let x = gpu.upload_f32(&h[&("layer_in".to_string(), from + l)]);
+            dev.set_pos(&gpu, pos);
             let (x1, y) = dev.layer_forward(&gpu, l, &x, pos);
             let r = gpu.read_all(vec![(x1, n), (y, n)]).unwrap();
             let (a, b) = cmp(&r[0], &h[&("attn_residual".to_string(), from + l)]);
@@ -86,6 +87,7 @@ fn device_layers_match_cpu_decoder() {
     for (pos, h) in rec.iter().enumerate() {
         let mut x = gpu.upload_f32(&h[&("layer_in".to_string(), from)]);
         for l in 0..nl {
+            dev.set_pos(&gpu, pos);
             let (_x1, y) = dev.layer_forward(&gpu, l, &x, pos);
             let r = gpu.read_all(vec![(y.clone(), n)]).unwrap();
             let (a, b) = cmp(&r[0], &h[&("post_moe".to_string(), from + l)]);

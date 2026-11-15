@@ -38,8 +38,7 @@ struct DLin {
     qkv: DMat,
     z: DMat,
     out: DMat,
-    beta: Handle,
-    alpha: Handle,
+    ba: Handle,
     conv: Handle,
     a: Handle,
     dt: Handle,
@@ -57,7 +56,6 @@ struct DAttn {
     kn: Handle,
     kc: Handle,
     vc: Handle,
-    pos_h: Handle,
 }
 
 pub struct DevLayer {
@@ -65,12 +63,11 @@ pub struct DevLayer {
     post_norm: Handle,
     lin: Option<DLin>,
     attn: Option<DAttn>,
-    router: Handle,
+    router_sg: Handle,
     experts: GpuNativeExperts,
     sh_gate: DMat,
     sh_up: DMat,
     sh_down: DMat,
-    sh_gate_inp: Handle,
 }
 
 pub struct DevModel {
@@ -78,6 +75,7 @@ pub struct DevModel {
     pub cap: usize,
     pub layers: Vec<DevLayer>,
     theta_scale: f32,
+    pos_h: Handle,
 }
 
 impl DevModel {
@@ -89,7 +87,7 @@ impl DevModel {
             layers.push(Self::upload_layer(gpu, &c, &m.layers[il], cap)?);
         }
         let theta_scale = c.rope_base.powf(-2.0 / c.n_rot as f32);
-        Ok(DevModel { cfg: c, cap, layers, theta_scale })
+        Ok(DevModel { cfg: c, cap, layers, theta_scale, pos_h: gpu.upload_u32(vec![0]) })
     }
 
     fn upload_layer(gpu: &Gpu, c: &Config, l: &Layer<'_>, cap: usize) -> Result<DevLayer> {
@@ -100,8 +98,7 @@ impl DevModel {
                     qkv: DMat::new(gpu, &w.qkv.0)?,
                     z: DMat::new(gpu, &w.z.0)?,
                     out: DMat::new(gpu, &w.out.0)?,
-                    beta: f(&w.beta),
-                    alpha: f(&w.alpha),
+                    ba: f(&[w.beta.as_slice(), w.alpha.as_slice()].concat()),
                     conv: f(&w.conv),
                     a: f(&w.a),
                     dt: f(&w.dt_bias),
@@ -122,7 +119,6 @@ impl DevModel {
                     kn: f(&w.k_norm),
                     kc: f(&vec![0.0; cap * c.n_head_kv * c.head_dim]),
                     vc: f(&vec![0.0; cap * c.n_head_kv * c.head_dim]),
-                    pos_h: gpu.upload_u32(vec![0]),
                 }),
             ),
             _ => unreachable!(),
@@ -132,13 +128,73 @@ impl DevModel {
             post_norm: f(&l.post_norm),
             lin,
             attn,
-            router: f(&l.router),
+            router_sg: f(&[l.router.as_slice(), l.sh_gate_inp.as_slice()].concat()),
             experts: GpuNativeExperts::upload(gpu, c.n_expert, l.gate_exps, l.up_exps, l.down_exps).map_err(|e| anyhow!(e))?,
             sh_gate: DMat::new(gpu, &l.sh_gate.0)?,
             sh_up: DMat::new(gpu, &l.sh_up.0)?,
             sh_down: DMat::new(gpu, &l.sh_down.0)?,
-            sh_gate_inp: f(&l.sh_gate_inp),
         })
+    }
+
+    /// Time the parts of layer `i` (microseconds per call, `reps` calls queued then one sync), for finding what limits a token.
+    pub fn bench_parts(&self, gpu: &Gpu, i: usize, reps: usize) -> Vec<(&'static str, f64)> {
+        let c = &self.cfg;
+        let l = &self.layers[i];
+        let x = gpu.upload_f32(&vec![0.1f32; c.n_embd]);
+        // device time: record `reps` calls as one CUDA graph and replay it, so host launch cost is not in the number
+        let time = |name: &'static str, f: &dyn Fn() -> Handle| -> (&'static str, f64) {
+            gpu.client.graph_prepare().expect("graph_prepare");
+            let mut h0 = f();
+            for _ in 1..reps {
+                h0 = f(); // fill the scratch pool with as many buffers as the capture will take
+            }
+            gpu.read_all(vec![(h0, 1)]).unwrap();
+            gpu.client.start_capture().expect("start_capture");
+            let mut last = None;
+            for _ in 0..reps {
+                last = Some(f());
+            }
+            let graph = gpu.client.stop_capture().expect("stop_capture");
+            let held = gpu.take_in_flight();
+            let t0 = std::time::Instant::now();
+            for _ in 0..3 {
+                unsafe { graph.replay() }.expect("replay");
+            }
+            gpu.read_all(vec![(last.unwrap(), 1)]).unwrap();
+            let us = t0.elapsed().as_secs_f64() / 3.0 / reps as f64 * 1e6;
+            drop(held);
+            (name, us)
+        };
+        let mut v = Vec::new();
+        v.push(time("rms", &|| gpu.qw_rms(&x, &l.attn_norm, 1, c.n_embd, c.eps)));
+        if let Some(d) = &l.lin {
+            v.push(time("qkv matvec", &|| d.qkv.launch(gpu, &x)));
+            v.push(time("z matvec", &|| d.z.launch(gpu, &x)));
+            let zin = gpu.upload_f32(&vec![0.1f32; c.d_inner]);
+            v.push(time("out matvec", &|| d.out.launch(gpu, &zin)));
+            v.push(time("beta+alpha f32 matvec", &|| gpu.qw_f32_matvec(&d.ba, &x, 2 * c.n_v_heads, c.n_embd)));
+            let qkv = gpu.upload_f32(&vec![0.1f32; c.conv_channels()]);
+            let z = gpu.upload_f32(&vec![0.1f32; c.d_inner]);
+            let ba = gpu.upload_f32(&vec![0.1f32; 2 * c.n_v_heads]);
+            v.push(time("delta-net core", &|| gpu.qw_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, (c.conv_channels(), c.d_conv, c.n_k_heads, c.n_v_heads, c.head_k, c.head_v()), c.eps)));
+        } else if let Some(a) = &l.attn {
+            v.push(time("q matvec", &|| a.q.launch(gpu, &x)));
+            v.push(time("k matvec", &|| a.k.launch(gpu, &x)));
+            let oin = gpu.upload_f32(&vec![0.1f32; c.n_head * c.head_dim]);
+            v.push(time("o matvec", &|| a.o.launch(gpu, &oin)));
+        }
+        let logits = gpu.upload_f32(&(0..c.n_expert).map(|i| (i as f32 * 0.37).sin()).collect::<Vec<_>>());
+        v.push(time("router+shared-gate matvec", &|| gpu.qw_f32_matvec(&l.router_sg, &x, c.n_expert + 1, c.n_embd)));
+        let (routes, _w) = gpu.qw_route(&logits, c.n_expert, c.n_used);
+        v.push(time("route top-k", &|| gpu.qw_route(&logits, c.n_expert, c.n_used).1));
+        v.push(time("routed experts", &|| l.experts.launch(gpu, &x, &routes, c.n_used)));
+        v.push(time("shared gate+up", &|| {
+            let _g = l.sh_gate.launch(gpu, &x);
+            l.sh_up.launch(gpu, &x)
+        }));
+        let shin = gpu.upload_f32(&vec![0.1f32; c.ff_shexp]);
+        v.push(time("shared down", &|| l.sh_down.launch(gpu, &shin)));
+        v
     }
 
     /// Zero every layer's recurrent state and KV cache (a new sequence).
@@ -156,38 +212,39 @@ impl DevModel {
         }
     }
 
+    /// Set the token position every attention layer of this block reads (call once a token, outside any captured graph).
+    pub fn set_pos(&self, gpu: &Gpu, pos: usize) {
+        gpu.qw_write_u32(&self.pos_h, &[pos as u32]);
+    }
+
     /// One layer for one token at `pos`. Returns (`x` after the mixer, layer output), both on the device.
-    pub fn layer_forward(&self, gpu: &Gpu, i: usize, x: &Handle, pos: usize) -> (Handle, Handle) {
+    pub fn layer_forward(&self, gpu: &Gpu, i: usize, x: &Handle, _pos: usize) -> (Handle, Handle) {
         let c = &self.cfg;
         let l = &self.layers[i];
         let h = gpu.qw_rms(x, &l.attn_norm, 1, c.n_embd, c.eps);
         let y = if let Some(d) = &l.lin {
             let qkv = d.qkv.launch(gpu, &h);
             let z = d.z.launch(gpu, &h);
-            let braw = gpu.qw_f32_matvec(&d.beta, &h, c.n_v_heads, c.n_embd);
-            let araw = gpu.qw_f32_matvec(&d.alpha, &h, c.n_v_heads, c.n_embd);
-            let core = gpu.qw_delta_net(&qkv, &z, &braw, &araw, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, (c.conv_channels(), c.d_conv, c.n_k_heads, c.n_v_heads, c.head_k, c.head_v()), c.eps);
+            let ba = gpu.qw_f32_matvec(&d.ba, &h, 2 * c.n_v_heads, c.n_embd);
+            let core = gpu.qw_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, (c.conv_channels(), c.d_conv, c.n_k_heads, c.n_v_heads, c.head_k, c.head_v()), c.eps);
             d.out.launch(gpu, &core)
         } else {
             let a = l.attn.as_ref().unwrap();
             let qf = a.q.launch(gpu, &h);
             let k = a.k.launch(gpu, &h);
             let v = a.v.launch(gpu, &h);
-            gpu.qw_write_u32(&a.pos_h, &[pos as u32]);
-            let o = gpu.qw_attention(&qf, &k, &v, &a.qn, &a.kn, &a.kc, &a.vc, &a.pos_h, (c.n_head, c.n_head_kv, c.head_dim, c.n_rot / 2, self.cap), c.eps, self.theta_scale);
+            let o = gpu.qw_attention(&qf, &k, &v, &a.qn, &a.kn, &a.kc, &a.vc, &self.pos_h, (c.n_head, c.n_head_kv, c.head_dim, c.n_rot / 2, self.cap), c.eps, self.theta_scale);
             a.o.launch(gpu, &o)
         };
-        let x1 = gpu.qw_add(x, &y, c.n_embd);
-        let h2 = gpu.qw_rms(&x1, &l.post_norm, 1, c.n_embd, c.eps);
-        let logits = gpu.qw_f32_matvec(&l.router, &h2, c.n_expert, c.n_embd);
+        let (x1, h2) = gpu.qw_add_rms(x, &y, &l.post_norm, c.n_embd, c.eps);
+        let logits = gpu.qw_f32_matvec(&l.router_sg, &h2, c.n_expert + 1, c.n_embd);
         let (routes, weights) = gpu.qw_route(&logits, c.n_expert, c.n_used);
         let down = l.experts.launch(gpu, &h2, &routes, c.n_used);
-        let sg = gpu.qw_f32_matvec(&l.sh_gate_inp, &h2, 1, c.n_embd);
         let g = l.sh_gate.launch(gpu, &h2);
         let u = l.sh_up.launch(gpu, &h2);
         let sh = gpu.qw_silu_mul(&g, &u, c.ff_shexp);
         let shout = l.sh_down.launch(gpu, &sh);
-        let out = gpu.qw_moe_combine(&x1, &down, &weights, &shout, &sg, c.n_embd, c.n_used);
+        let out = gpu.qw_moe_combine(&x1, &down, &weights, &shout, &logits, c.n_expert + 1, c.n_expert, c.n_embd, c.n_used);
         (x1, out)
     }
 }

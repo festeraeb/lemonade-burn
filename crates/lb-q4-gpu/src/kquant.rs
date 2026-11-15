@@ -904,7 +904,10 @@ fn q5n_routed_gate_up_silu_kernel(gw: &[V4U], uw: &[V4U], x: &[V4F], routes: &[u
         let g = lane_sum(&mut sm, pg, use_plane);
         let u = lane_sum(&mut sm, pu, use_plane);
         if lane == 0usize {
-            h[o] = g / (1.0f32 + Exp::exp(-g)) * u;
+            // written in the 16-value-permuted order the down pass reads (`perm16_kernel`: y[16a + 4j + i] = x[16a + 4i + j])
+            let a16 = r / 16usize;
+            let rem = r % 16usize;
+            h[slot * rows + a16 * 16usize + (rem % 4usize) * 4usize + rem / 4usize] = g / (1.0f32 + Exp::exp(-g)) * u;
         }
         o += step;
     }
@@ -967,6 +970,83 @@ fn q6n_routed_down_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], h: &[V4F], routes:
             out[o] = v;
         }
         o += step;
+    }
+}
+
+
+/// Routed down with several output rows per plane, for short rows (`cols` 512: 8 or 4 items a row would leave most lanes idle):
+/// a plane of 32 lanes takes `32 / ipr` rows, `ipr` lanes a row, and separates the rows with masked plane sums. Needs plane ops, 32 lanes.
+#[cube(launch)]
+fn q5n_routed_down_mr_kernel(w: &[V4U], h: &[V4F], routes: &[u32], dims: &[u32], out: &mut [f32], #[comptime] ipr: usize, #[comptime] rpp: usize) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let step = CUBE_COUNT as usize * ppc * rpp;
+    let rl = lane / ipr;
+    let mut ob = (CUBE_POS as usize * ppc + plane_id) * rpp;
+    while ob < out.len() {
+        let o = ob + rl;
+        let mut part = 0.0f32;
+        if o < out.len() {
+            let slot = o / rows;
+            let r = o % rows;
+            let e = routes[2usize * slot] as usize;
+            part = q5n_partial(w, h, (e * rows + r) * bpr, slot * cols / 4usize, bpr, lane % ipr, ipr);
+        }
+        #[unroll]
+        for rr in 0..rpp {
+            let mut mv = 0.0f32;
+            if rl == rr {
+                mv = part;
+            }
+            let sdot = plane_sum(mv);
+            if lane == 0usize {
+                if ob + rr < out.len() {
+                    out[ob + rr] = sdot;
+                }
+            }
+        }
+        ob += step;
+    }
+}
+
+#[cube(launch)]
+fn q6n_routed_down_mr_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], h: &[V4F], routes: &[u32], dims: &[u32], out: &mut [f32], #[comptime] ipr: usize, #[comptime] rpp: usize) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let step = CUBE_COUNT as usize * ppc * rpp;
+    let rl = lane / ipr;
+    let mut ob = (CUBE_POS as usize * ppc + plane_id) * rpp;
+    while ob < out.len() {
+        let o = ob + rl;
+        let mut part = 0.0f32;
+        if o < out.len() {
+            let slot = o / rows;
+            let r = o % rows;
+            let e = routes[2usize * slot] as usize;
+            part = q6n_partial(qq, sc, dd, h, (e * rows + r) * bpr, slot * cols / 4usize, bpr, lane % ipr, ipr);
+        }
+        #[unroll]
+        for rr in 0..rpp {
+            let mut mv = 0.0f32;
+            if rl == rr {
+                mv = part;
+            }
+            let sdot = plane_sum(mv);
+            if lane == 0usize {
+                if ob + rr < out.len() {
+                    out[ob + rr] = sdot;
+                }
+            }
+        }
+        ob += step;
     }
 }
 
@@ -1046,9 +1126,27 @@ impl GpuNativeExperts {
                 gpu.use_plane,
             );
         }
-        let hp = GpuQ5KNative::permute_x(gpu, &h, slots * self.ff);
+        let hp = h; // gate+up already wrote it permuted
+        // multi-row planes need plane ops, a 32-lane plane, and an item count that divides it
+        let mr = |ipr: usize| gpu.use_plane && gpu.plane_size.1 == 32 && ipr <= 32 && 32 % ipr == 0;
         unsafe {
             match &self.down {
+                NativeDown::Q5 { w, n } if mr(self.ff / 256 * 4) => {
+                    let ipr = self.ff / 256 * 4;
+                    let rpp = 32 / ipr;
+                    q5n_routed_down_mr_kernel::launch(
+                        &gpu.client,
+                        cube_count((slots * self.embd).div_ceil(rpp), gpu.per_cube()),
+                        CubeDim::new_1d(gpu.cube_dim as u32),
+                        BufferArg::from_raw_parts(w.clone(), n / 4),
+                        BufferArg::from_raw_parts(hp, slots * self.ff / 4),
+                        BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                        BufferArg::from_raw_parts(d_dn, 2),
+                        BufferArg::from_raw_parts(out.clone(), slots * self.embd),
+                        ipr,
+                        rpp,
+                    )
+                }
                 NativeDown::Q5 { w, n } => q5n_routed_down_kernel::launch(
                     &gpu.client,
                     cube_count(slots * self.embd, gpu.per_cube()),
@@ -1060,6 +1158,24 @@ impl GpuNativeExperts {
                     BufferArg::from_raw_parts(out.clone(), slots * self.embd),
                     gpu.use_plane,
                 ),
+                NativeDown::Q6 { qq, sc, dd, n } if mr(self.ff / 256 * 2) => {
+                    let ipr = self.ff / 256 * 2;
+                    let rpp = 32 / ipr;
+                    q6n_routed_down_mr_kernel::launch(
+                        &gpu.client,
+                        cube_count((slots * self.embd).div_ceil(rpp), gpu.per_cube()),
+                        CubeDim::new_1d(gpu.cube_dim as u32),
+                        BufferArg::from_raw_parts(qq.clone(), n.0 / 4),
+                        BufferArg::from_raw_parts(sc.clone(), n.1 / 4),
+                        BufferArg::from_raw_parts(dd.clone(), n.2),
+                        BufferArg::from_raw_parts(hp, slots * self.ff / 4),
+                        BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                        BufferArg::from_raw_parts(d_dn, 2),
+                        BufferArg::from_raw_parts(out.clone(), slots * self.embd),
+                        ipr,
+                        rpp,
+                    )
+                }
                 NativeDown::Q6 { qq, sc, dd, n } => q6n_routed_down_kernel::launch(
                     &gpu.client,
                     cube_count(slots * self.embd, gpu.per_cube()),

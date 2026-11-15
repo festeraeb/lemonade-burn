@@ -10,6 +10,8 @@
 pub mod chat;
 #[cfg(feature = "gpu")]
 pub mod device;
+#[cfg(feature = "gpu")]
+pub mod pipeline;
 pub mod tokenizer;
 
 use anyhow::{anyhow, bail, Result};
@@ -131,9 +133,9 @@ pub(crate) struct LinW<'a> {
 
 pub struct Model<'a> {
     pub cfg: Config,
-    tok_embd: QuantMat<'a>,
-    out_norm: Vec<f32>,
-    output: QuantMat<'a>,
+    pub(crate) tok_embd: QuantMat<'a>,
+    pub(crate) out_norm: Vec<f32>,
+    pub(crate) output: QuantMat<'a>,
     pub(crate) layers: Vec<Layer<'a>>,
 }
 

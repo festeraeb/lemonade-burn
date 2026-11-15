@@ -71,6 +71,27 @@ fn qw_f32_matvec_kernel(w: &[f32], x: &[f32], out: &mut [f32], #[comptime] cols:
     }
 }
 
+/// `sum = x + y`, `h = rms(sum) * w` (one row of `n`, one cube of 256 units).
+#[cube(launch)]
+fn qw_add_rms_kernel(x: &[f32], y: &[f32], w: &[f32], sum: &mut [f32], h: &mut [f32], eps: &[f32], #[comptime] n: usize) {
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut ss = 0.0f32;
+    let mut i = UNIT_POS as usize;
+    while i < n {
+        let v = x[i] + y[i];
+        sum[i] = v;
+        ss += v * v;
+        i += CUBE_DIM_X as usize;
+    }
+    let tot = lane_sum(&mut sm, ss, false);
+    let r = 1.0f32 / Sqrt::sqrt(tot / (n as f32) + eps[0]);
+    let mut i = UNIT_POS as usize;
+    while i < n {
+        h[i] = sum[i] * r * w[i];
+        i += CUBE_DIM_X as usize;
+    }
+}
+
 #[cube(launch)]
 fn qw_add_kernel(a: &[f32], b: &[f32], out: &mut [f32]) {
     let i = ABSOLUTE_POS as usize;
@@ -132,11 +153,11 @@ fn qw_l2_kernel(x: &mut [f32], eps: &[f32], #[comptime] hk: usize) {
 
 /// `beta = sigmoid(braw)`, `g = softplus(araw + dt_bias) * a` per v head.
 #[cube(launch)]
-fn qw_dn_scalars_kernel(braw: &[f32], araw: &[f32], dt: &[f32], a: &[f32], beta: &mut [f32], g: &mut [f32]) {
+fn qw_dn_scalars_kernel(ba: &[f32], dt: &[f32], a: &[f32], beta: &mut [f32], g: &mut [f32], #[comptime] nv: usize) {
     let i = ABSOLUTE_POS as usize;
     if i < beta.len() {
-        beta[i] = sigmoid_f(braw[i]);
-        let x = araw[i] + dt[i];
+        beta[i] = sigmoid_f(ba[i]);
+        let x = ba[nv + i] + dt[i];
         let mut sp = x;
         if x <= 20.0f32 {
             sp = Log1p::log1p(Exp::exp(x));
@@ -145,43 +166,51 @@ fn qw_dn_scalars_kernel(braw: &[f32], araw: &[f32], dt: &[f32], a: &[f32], beta:
     }
 }
 
-/// The delta rule, one cube per v head, one unit per state row: `S *= exp(g); d = (v - S k) beta; S += d k^T; o = S q / sqrt(hk)`.
-/// `conv` is the post-conv, L2-normalised row `[q (nk*hk) | k (nk*hk) | v (nv*hv)]`; v head `h` uses q/k head `h % nk`.
+/// The delta rule, one cube (4 planes of 32) per v head, one plane per state row, lanes along the row so every state access is
+/// coalesced: `S *= exp(g); d = (v - S k) beta; S += d k^T; o = S q / sqrt(hk)`. `hk` = 128 (four columns a lane). `conv` is the
+/// post-conv, L2-normalised row `[q (nk*hk) | k (nk*hk) | v (nv*hv)]`; v head `h` uses q/k head `h % nk`. Needs plane ops (CUDA).
 #[cube(launch)]
 fn qw_dn_recur_kernel(s: &mut [f32], conv: &[f32], beta: &[f32], g: &[f32], out: &mut [f32], #[comptime] nk: usize, #[comptime] hv: usize, #[comptime] hk: usize) {
     let hh = CUBE_POS as usize;
-    let i = UNIT_POS as usize;
     let kh = hh % nk;
-    let mut ks = Shared::<[f32]>::new_slice(256usize);
-    let mut qs = Shared::<[f32]>::new_slice(256usize);
-    let mut j = UNIT_POS as usize;
-    while j < hk {
-        ks[j] = conv[nk * hk + kh * hk + j];
-        qs[j] = conv[kh * hk + j];
-        j += CUBE_DIM_X as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let w = (UNIT_POS / PLANE_DIM) as usize;
+    let nw = (CUBE_DIM_X / PLANE_DIM) as usize;
+    let decay = Exp::exp(g[hh]);
+    let bt = beta[hh];
+    let mut kr = Array::<f32>::new(4usize);
+    let mut qr = Array::<f32>::new(4usize);
+    #[unroll]
+    for m in 0..4usize {
+        kr[m] = conv[nk * hk + kh * hk + lane + 32usize * m];
+        qr[m] = conv[kh * hk + lane + 32usize * m];
     }
-    sync_cube();
-    if i < hv {
-        let decay = Exp::exp(g[hh]);
+    let qscale = 1.0f32 / Sqrt::sqrt(hk as f32);
+    let mut i = w;
+    while i < hv {
         let base = hh * hv * hk + i * hk;
-        let mut sk = 0.0f32;
-        let mut j = 0usize;
-        while j < hk {
-            let v = s[base + j] * decay;
-            s[base + j] = v;
-            sk += v * ks[j];
-            j += 1usize;
+        let mut vr = Array::<f32>::new(4usize);
+        let mut ps = 0.0f32;
+        #[unroll]
+        for m in 0..4usize {
+            let v = s[base + lane + 32usize * m] * decay;
+            vr[m] = v;
+            ps += v * kr[m];
         }
-        let d = (conv[2usize * nk * hk + hh * hv + i] - sk) * beta[hh];
-        let mut o = 0.0f32;
-        let mut j = 0usize;
-        while j < hk {
-            let v = s[base + j] + ks[j] * d;
-            s[base + j] = v;
-            o += v * qs[j];
-            j += 1usize;
+        let sk = plane_sum(ps);
+        let d = (conv[2usize * nk * hk + hh * hv + i] - sk) * bt;
+        let mut po = 0.0f32;
+        #[unroll]
+        for m in 0..4usize {
+            let v = vr[m] + kr[m] * d;
+            s[base + lane + 32usize * m] = v;
+            po += v * qr[m];
         }
-        out[hh * hv + i] = o / Sqrt::sqrt(hk as f32);
+        let o = plane_sum(po);
+        if lane == 0usize {
+            out[hh * hv + i] = o * qscale;
+        }
+        i += nw;
     }
 }
 
@@ -329,51 +358,75 @@ fn qw_attn_decode_kernel(
     }
 }
 
-/// Softmax over `ne` router logits, top `k` by probability (ties: lowest index), weights renormalised; writes `[expert, 0]` pairs.
-/// One unit.
+/// Softmax over `ne` (<= 512) router logits, top `k` by probability (ties: lowest index), weights renormalised; writes `[expert, 0]`
+/// pairs. One cube of 256 units (`ne` <= 256): max and sum reductions, then every expert counts how many outrank it.
 #[cube(launch)]
 fn qw_route_kernel(logits: &[f32], routes: &mut [u32], weights: &mut [f32], #[comptime] ne: usize, #[comptime] k: usize) {
+    let t = UNIT_POS as usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
     let mut p = Shared::<[f32]>::new_slice(512usize);
-    if UNIT_POS == 0u32 {
-        let mut m = logits[0usize];
-        let mut i = 1usize;
-        while i < ne {
-            if logits[i] > m {
-                m = logits[i];
+    let mut mx = logits[0usize] * 0.0f32 - 3.0e38f32;
+    let mut i = t;
+    while i < ne {
+        if logits[i] > mx {
+            mx = logits[i];
+        }
+        i += 256usize;
+    }
+    sm[t] = mx;
+    sync_cube();
+    let mut st = 128usize;
+    while st > 0usize {
+        if t < st {
+            let o2 = sm[t + st];
+            if o2 > sm[t] {
+                sm[t] = o2;
             }
-            i += 1usize;
         }
-        let mut s = 0.0f32;
-        let mut i = 0usize;
-        while i < ne {
-            let e = Exp::exp(logits[i] - m);
-            p[i] = e;
-            s += e;
-            i += 1usize;
+        sync_cube();
+        st = st / 2usize;
+    }
+    let m = sm[0usize];
+    sync_cube();
+    let mut ss = 0.0f32;
+    let mut i = t;
+    while i < ne {
+        let e = Exp::exp(logits[i] - m);
+        p[i] = e;
+        ss += e;
+        i += 256usize;
+    }
+    let total = lane_sum(&mut sm, ss, false);
+    let mut i = t;
+    while i < ne {
+        p[i] = p[i] / total;
+        i += 256usize;
+    }
+    sync_cube();
+    // rank of every expert by (probability desc, index asc), one pass; the top k write themselves out in rank order
+    if t < ne {
+        let pt = p[t];
+        let mut rank = 0usize;
+        let mut j = 0usize;
+        while j < ne {
+            let pj = p[j];
+            if pj > pt || (pj == pt && j < t) {
+                rank += 1usize;
+            }
+            j += 1usize;
         }
-        let mut i = 0usize;
-        while i < ne {
-            p[i] = p[i] / s;
-            i += 1usize;
+        if rank < k {
+            routes[2usize * rank] = t as u32;
+            routes[2usize * rank + 1usize] = 0u32;
+            weights[rank] = pt;
         }
+    }
+    sync_cube();
+    if t == 0usize {
         let mut sel_sum = 0.0f32;
         let mut r = 0usize;
         while r < k {
-            let mut best = 0usize;
-            let mut bv = logits[0usize] * 0.0f32 - 1.0f32;
-            let mut i = 0usize;
-            while i < ne {
-                if p[i] > bv {
-                    bv = p[i];
-                    best = i;
-                }
-                i += 1usize;
-            }
-            routes[2usize * r] = best as u32;
-            routes[2usize * r + 1usize] = 0u32;
-            weights[r] = bv;
-            sel_sum += bv;
-            p[best] = logits[0usize] * 0.0f32 - 1.0f32;
+            sel_sum += weights[r];
             r += 1usize;
         }
         let mut r = 0usize;
@@ -386,7 +439,7 @@ fn qw_route_kernel(logits: &[f32], routes: &mut [u32], weights: &mut [f32], #[co
 
 /// `out = x + (sum_r w_r down_r) + sigmoid(sgate) * shared`, in the CPU decoder's order.
 #[cube(launch)]
-fn qw_moe_combine_kernel(x: &[f32], down: &[f32], weights: &[f32], shared: &[f32], sgate: &[f32], out: &mut [f32], #[comptime] n: usize, #[comptime] k: usize) {
+fn qw_moe_combine_kernel(x: &[f32], down: &[f32], weights: &[f32], shared: &[f32], sgate: &[f32], out: &mut [f32], #[comptime] n: usize, #[comptime] k: usize, #[comptime] sg_off: usize) {
     let i = ABSOLUTE_POS as usize;
     if i < n {
         let mut acc = 0.0f32;
@@ -395,7 +448,7 @@ fn qw_moe_combine_kernel(x: &[f32], down: &[f32], weights: &[f32], shared: &[f32
             acc += weights[r] * down[r * n + i];
             r += 1usize;
         }
-        acc += sigmoid_f(sgate[0usize]) * shared[i];
+        acc += sigmoid_f(sgate[sg_off]) * shared[i];
         out[i] = x[i] + acc;
     }
 }
@@ -424,6 +477,17 @@ impl Gpu {
         out
     }
 
+    /// Returns (`x + y`, `rms(x + y) * w`).
+    pub fn qw_add_rms(&self, x: &Handle, y: &Handle, w: &Handle, n: usize, eps: f32) -> (Handle, Handle) {
+        let sum = self.scratch(n * 4);
+        let h = self.scratch(n * 4);
+        let e = self.const_f32(&[eps]);
+        unsafe {
+            qw_add_rms_kernel::launch(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(x.clone(), n), BufferArg::from_raw_parts(y.clone(), n), BufferArg::from_raw_parts(w.clone(), n), BufferArg::from_raw_parts(sum.clone(), n), BufferArg::from_raw_parts(h.clone(), n), BufferArg::from_raw_parts(e, 1), n);
+        }
+        (sum, h)
+    }
+
     pub fn qw_add(&self, a: &Handle, b: &Handle, n: usize) -> Handle {
         let out = self.scratch(n * 4);
         unsafe {
@@ -440,10 +504,10 @@ impl Gpu {
         out
     }
 
-    /// Delta-net core for one token. `qkv` `[ch]`, `z` `[d_inner]`, `braw`/`araw` `[nv]`; `conv_state` `[(kd-1) * ch]` and `s`
+    /// Delta-net core for one token. `qkv` `[ch]`, `z` `[d_inner]`, `ba` `[2 nv]` (beta logits then alpha logits); `conv_state` `[(kd-1) * ch]` and `s`
     /// `[nv * hv * hk]` are persistent (create with `upload_f32`), updated in place. Returns the gated-normed `[d_inner]`.
     #[allow(clippy::too_many_arguments)]
-    pub fn qw_delta_net(&self, qkv: &Handle, z: &Handle, braw: &Handle, araw: &Handle, conv_w: &Handle, dt: &Handle, a: &Handle, norm_w: &Handle, conv_state: &Handle, s: &Handle, (ch, kd, nk, nv, hk, hv): (usize, usize, usize, usize, usize, usize), eps: f32) -> Handle {
+    pub fn qw_delta_net(&self, qkv: &Handle, z: &Handle, ba: &Handle, conv_w: &Handle, dt: &Handle, a: &Handle, norm_w: &Handle, conv_state: &Handle, s: &Handle, (ch, kd, nk, nv, hk, hv): (usize, usize, usize, usize, usize, usize), eps: f32) -> Handle {
         let conv = self.scratch(ch * 4);
         let beta = self.scratch(nv * 4);
         let g = self.scratch(nv * 4);
@@ -452,7 +516,7 @@ impl Gpu {
         unsafe {
             qw_dn_conv_kernel::launch(&self.client, self.qw_cubes(ch), CubeDim::new_1d(self.cube_dim as u32), BufferArg::from_raw_parts(qkv.clone(), ch), BufferArg::from_raw_parts(conv_w.clone(), ch * kd), BufferArg::from_raw_parts(conv_state.clone(), (kd - 1) * ch), BufferArg::from_raw_parts(conv.clone(), ch), ch, kd);
             qw_l2_kernel::launch(&self.client, CubeCount::Static((2 * nk) as u32, 1, 1), CubeDim::new_1d(128), BufferArg::from_raw_parts(conv.clone(), ch), BufferArg::from_raw_parts(e.clone(), 1), hk);
-            qw_dn_scalars_kernel::launch(&self.client, self.qw_cubes(nv), CubeDim::new_1d(self.cube_dim as u32), BufferArg::from_raw_parts(braw.clone(), nv), BufferArg::from_raw_parts(araw.clone(), nv), BufferArg::from_raw_parts(dt.clone(), nv), BufferArg::from_raw_parts(a.clone(), nv), BufferArg::from_raw_parts(beta.clone(), nv), BufferArg::from_raw_parts(g.clone(), nv));
+            qw_dn_scalars_kernel::launch(&self.client, self.qw_cubes(nv), CubeDim::new_1d(self.cube_dim as u32), BufferArg::from_raw_parts(ba.clone(), 2 * nv), BufferArg::from_raw_parts(dt.clone(), nv), BufferArg::from_raw_parts(a.clone(), nv), BufferArg::from_raw_parts(beta.clone(), nv), BufferArg::from_raw_parts(g.clone(), nv), nv);
             qw_dn_recur_kernel::launch(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(128), BufferArg::from_raw_parts(s.clone(), nv * hv * hk), BufferArg::from_raw_parts(conv.clone(), ch), BufferArg::from_raw_parts(beta, nv), BufferArg::from_raw_parts(g, nv), BufferArg::from_raw_parts(o.clone(), nv * hv), nk, hv, hk);
         }
         let out = self.scratch(nv * hv * 4);
@@ -502,15 +566,16 @@ impl Gpu {
         let routes = self.scratch(2 * k * 4);
         let weights = self.scratch(k * 4);
         unsafe {
-            qw_route_kernel::launch(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(1), BufferArg::from_raw_parts(logits.clone(), ne), BufferArg::from_raw_parts(routes.clone(), 2 * k), BufferArg::from_raw_parts(weights.clone(), k), ne, k);
+            qw_route_kernel::launch(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(logits.clone(), ne), BufferArg::from_raw_parts(routes.clone(), 2 * k), BufferArg::from_raw_parts(weights.clone(), k), ne, k);
         }
         (routes, weights)
     }
 
-    pub fn qw_moe_combine(&self, x: &Handle, down: &Handle, weights: &Handle, shared: &Handle, sgate: &Handle, n: usize, k: usize) -> Handle {
+    /// `sgate` is a buffer whose element `sg_off` is the shared-expert gate logit (the router matvec's extra row).
+    pub fn qw_moe_combine(&self, x: &Handle, down: &Handle, weights: &Handle, shared: &Handle, sgate: &Handle, sg_len: usize, sg_off: usize, n: usize, k: usize) -> Handle {
         let out = self.scratch(n * 4);
         unsafe {
-            qw_moe_combine_kernel::launch(&self.client, self.qw_cubes(n), CubeDim::new_1d(self.cube_dim as u32), BufferArg::from_raw_parts(x.clone(), n), BufferArg::from_raw_parts(down.clone(), k * n), BufferArg::from_raw_parts(weights.clone(), k), BufferArg::from_raw_parts(shared.clone(), n), BufferArg::from_raw_parts(sgate.clone(), 1), BufferArg::from_raw_parts(out.clone(), n), n, k);
+            qw_moe_combine_kernel::launch(&self.client, self.qw_cubes(n), CubeDim::new_1d(self.cube_dim as u32), BufferArg::from_raw_parts(x.clone(), n), BufferArg::from_raw_parts(down.clone(), k * n), BufferArg::from_raw_parts(weights.clone(), k), BufferArg::from_raw_parts(shared.clone(), n), BufferArg::from_raw_parts(sgate.clone(), sg_len), BufferArg::from_raw_parts(out.clone(), n), n, k, sg_off);
         }
         out
     }
