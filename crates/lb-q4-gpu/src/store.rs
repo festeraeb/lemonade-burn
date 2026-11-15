@@ -244,6 +244,13 @@ impl Gpu {
         Self::open_device(dev)
     }
 
+    /// Open a wgpu adapter by spec (`discrete:N`, `name:<text>`, `bus:<pci id>`; see
+    /// `lb_ternary_gpu::pick_device_spec`) whatever `LB_WGPU_DEVICE` says: a further card in the
+    /// same process (in-box expert cards, a prefill card) on the Vulkan runtime.
+    pub fn open_wgpu(spec: &str) -> Result<Self, String> {
+        Self::open_device(cubecl::Device::Wgpu(lb_ternary_gpu::pick_device_spec(spec)?))
+    }
+
     fn open_device(dev: cubecl::Device) -> Result<Self, String> {
         let client = std::panic::catch_unwind(|| dev.client()).map_err(|_| format!("{dev:?}: no client (adapter missing, or its runtime failed to initialise)"))?;
         let props = client.properties();

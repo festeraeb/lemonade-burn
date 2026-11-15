@@ -23,6 +23,7 @@ pub mod store;
 pub mod trace;
 pub mod transcode;
 pub use decode::TokenParams;
+pub use lb_ternary_gpu::{list_adapters, resolve_discrete, AdapterRow};
 pub use store::{PendingRead, pick_cube_device, ExpertSlots, Gpu, Q4Math, SideStream, GpuConv, GpuExpert, GpuExpertLayer, GpuQ4Mat, GpuQ6KMat, GpuQ8Mat};
 #[cfg(feature = "cuda")]
 pub mod pinned;
