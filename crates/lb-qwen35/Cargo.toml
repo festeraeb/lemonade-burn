@@ -1,0 +1,16 @@
+[package]
+name = "lb-qwen35"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "qwen35moe (Qwen3.5/3.6 MoE: gated delta-net + gated attention hybrid) CPU reference decoder and teacher-forced check"
+
+[dependencies]
+lb-gguf.workspace = true
+rayon.workspace = true
+half = "2"
+anyhow.workspace = true
+clap.workspace = true
+tokenizers.workspace = true
+ahash = "0.8"

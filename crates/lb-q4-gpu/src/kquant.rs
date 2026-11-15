@@ -18,7 +18,7 @@
 //! kernels in `lib.rs`.
 
 use crate::store::Gpu;
-use crate::{cube_count, lane_sum, q6_row_partial, V4F, V4U};
+use crate::{cube_count, f16_to_f32, lane_sum, q6_row_partial, V4F, V4U};
 use cubecl::prelude::*;
 use lb_gguf::{GgmlType, QuantMat};
 
@@ -219,6 +219,138 @@ fn q5_k_routed_matvec_kernel(qv: &[V4U], sd: &[f32], mn: &[f32], h: &[V4F], rout
             out[o] = v;
         }
         o += step;
+    }
+}
+
+/// Native-layout Q5_K matvec: the GGUF bytes as they are (176-byte blocks = 44 u32 words, 0.6875 bytes a value), no repack.
+///
+/// The widened layout above costs 1.5 bytes a value (2.2x the file): 26 GB of Qwen3.6 Q5_K_M would be about 50 GB on the card.
+/// This kernel keeps the file's density (so 25 GB of weights fit across two 16 GB cards) and pays bit extraction in the kernel.
+/// One lane per (block, 32-value group) work item; `dims` = [rows, cols].
+#[cube(launch)]
+fn q5_k_native_matvec_kernel(w: &[u32], x: &[f32], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let items = bpr * 8usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < out.len() {
+        let t = o / rows;
+        let r = o % rows;
+        let mut acc = 0.0f32;
+        let mut j = lane;
+        while j < items {
+            let b = j / 8usize;
+            let g = j % 8usize;
+            let base = (r * bpr + b) * 44usize;
+            let w0 = w[base];
+            let d = f16_to_f32(w0 & 65535u32);
+            let dmin = f16_to_f32((w0 >> 16u32) & 65535u32);
+            // 6-bit scale and min of group g from the 12 packed bytes (words base+1 .. base+3)
+            let mut sc = 0u32;
+            let mut mn = 0u32;
+            if g < 4usize {
+                // bytes g and g + 4
+                sc = (w[base + 1usize + g / 4usize] >> (((g % 4usize) * 8usize) as u32)) & 63u32;
+                mn = (w[base + 1usize + (g + 4usize) / 4usize] >> ((((g + 4usize) % 4usize) * 8usize) as u32)) & 63u32;
+            } else {
+                // low nibbles from byte g + 4, top two bits from byte g - 4 (scale) and byte g (min)
+                let bs = (w[base + 1usize + (g + 4usize) / 4usize] >> ((((g + 4usize) % 4usize) * 8usize) as u32)) & 255u32;
+                let bt = (w[base + 1usize + (g - 4usize) / 4usize] >> ((((g - 4usize) % 4usize) * 8usize) as u32)) & 255u32;
+                let bm = (w[base + 1usize + g / 4usize] >> (((g % 4usize) * 8usize) as u32)) & 255u32;
+                sc = (bs & 15u32) | ((bt >> 6u32) << 4u32);
+                mn = (bs >> 4u32) | ((bm >> 6u32) << 4u32);
+            }
+            let s = d * (sc as f32);
+            let m = dmin * (mn as f32);
+            let hi = (g % 2usize) as u32 * 4u32;
+            let gshift = g as u32;
+            let qs0 = base + 12usize + 8usize * (g / 2usize);
+            let qh0 = base + 4usize;
+            let xb = t * cols + b * 256usize + 32usize * g;
+            let mut qx = 0.0f32;
+            let mut xs = 0.0f32;
+            #[unroll]
+            for wi in 0..8usize {
+                let qw = w[qs0 + wi];
+                let hw = w[qh0 + wi];
+                #[unroll]
+                for k in 0..4usize {
+                    let sh = (k * 8usize) as u32;
+                    let nib = (qw >> (sh + hi)) & 15u32;
+                    let hb = (hw >> (sh + gshift)) & 1u32;
+                    let q = (nib + hb * 16u32) as f32;
+                    let xv = x[xb + wi * 4usize + k];
+                    qx += q * xv;
+                    xs += xv;
+                }
+            }
+            acc += s * qx - m * xs;
+            j += width;
+        }
+        let total = lane_sum(&mut sm, acc, use_plane);
+        if lane == 0usize {
+            out[o] = total;
+        }
+        o += step;
+    }
+}
+
+/// A Q5_K matrix resident on the device in the file's own layout.
+pub struct GpuQ5KNative {
+    pub rows: usize,
+    pub cols: usize,
+    w: Handle,
+    n_words: usize,
+    dims: Handle,
+}
+
+impl GpuQ5KNative {
+    pub fn upload(gpu: &Gpu, w: QuantMat<'_>) -> Result<Self, String> {
+        if w.ty != GgmlType::Q5K || w.cols % 256 != 0 {
+            return Err("expected Q5_K with cols % 256 == 0".into());
+        }
+        let words: Vec<u32> = w.bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        Ok(Self { rows: w.rows, cols: w.cols, n_words: words.len(), w: gpu.upload_u32(words), dims: gpu.const_u32(&crate::matvec_dims(w.rows, w.cols)) })
+    }
+
+    pub fn bytes_on_device(&self) -> usize {
+        self.n_words * 4
+    }
+
+    pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        let n_out = m * self.rows;
+        let out = gpu.scratch(n_out * 4);
+        unsafe {
+            q5_k_native_matvec_kernel::launch(
+                &gpu.client,
+                cube_count(n_out, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.w.clone(), self.n_words),
+                BufferArg::from_raw_parts(x.clone(), m * self.cols),
+                BufferArg::from_raw_parts(self.dims.clone(), 2),
+                BufferArg::from_raw_parts(out.clone(), n_out),
+                gpu.use_plane,
+            );
+        }
+        out
+    }
+
+    pub fn matvec(&self, gpu: &Gpu, x: &[f32], m: usize) -> Result<Vec<f32>, String> {
+        let xh = gpu.upload_f32(x);
+        let out = self.launch(gpu, &xh, m);
+        Ok(gpu.read_all(vec![(out, m * self.rows)])?.remove(0))
     }
 }
 

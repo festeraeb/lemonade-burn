@@ -3,7 +3,7 @@
 mod common;
 use common::{assert_close, Rng};
 use lb_gguf::{matvec_f32, GgmlType, QuantMat};
-use lb_q4_gpu::{q5_k_matvec_gpu, Gpu, GpuKExpertLayer};
+use lb_q4_gpu::{q5_k_matvec_gpu, Gpu, GpuKExpertLayer, GpuQ5KNative};
 
 fn random_rows(rng: &mut Rng, ty: GgmlType, rows: usize, cols: usize) -> Vec<u8> {
     let rb = ty.row_bytes(cols).unwrap();
@@ -182,5 +182,39 @@ fn q6_k_and_q8_0_real_qwen_rows_if_present() {
         matvec_f32(w, &x, 2, &mut want);
         let got = if ty == GgmlType::Q6K { lb_q4_gpu::q6_k_matvec_gpu(w, &x, 2) } else { lb_q4_gpu::q8_0_matvec_gpu(w, &x, 2) }.unwrap();
         assert_close(&got, &want, cols, rows, &format!("{} real {name}", ty.name()));
+    }
+}
+
+/// The native-layout Q5_K kernel (file density, no repack) against the same CPU reference, random and real rows.
+#[test]
+fn q5_k_native_layout_matches_reference() {
+    let gpu = Gpu::open().unwrap();
+    for (rows, cols, m, seed) in [(8usize, 256usize, 1usize, 31u64), (37, 512, 3, 32), (1000, 2048, 2, 33)] {
+        let mut rng = Rng(seed);
+        let bytes = random_rows(&mut rng, GgmlType::Q5K, rows, cols);
+        let w = QuantMat::new(GgmlType::Q5K, rows, cols, &bytes);
+        let x: Vec<f32> = (0..m * cols).map(|_| rng.unit() * 4.0).collect();
+        let mut want = vec![0f32; m * rows];
+        matvec_f32(w, &x, m, &mut want);
+        let got = GpuQ5KNative::upload(&gpu, w).unwrap().matvec(&gpu, &x, m).unwrap();
+        assert_close(&got, &want, cols, rows, &format!("q5_k native ({rows},{cols},{m})"));
+    }
+    let path = std::path::Path::new("/mnt/raid0/models/Qwen3.6-35B-A3B-Q5_K_M.gguf");
+    if path.exists() {
+        let g = lb_gguf::Gguf::open(path).unwrap();
+        for name in ["blk.0.attn_gate.weight", "token_embd.weight", "blk.20.ffn_up_exps.weight"] {
+            let t = g.tensor(name).unwrap();
+            let cols = t.dims[0];
+            let rows = 3000usize;
+            let w = QuantMat::new(GgmlType::Q5K, rows, cols, &g.tensor_bytes(t)[..rows * t.ty.row_bytes(cols).unwrap()]);
+            let mut rng = Rng(9);
+            let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+            let mut want = vec![0f32; rows];
+            matvec_f32(w, &x, 1, &mut want);
+            let n = GpuQ5KNative::upload(&gpu, w).unwrap();
+            assert_eq!(n.bytes_on_device(), rows * t.ty.row_bytes(cols).unwrap());
+            let got = n.matvec(&gpu, &x, 1).unwrap();
+            assert_close(&got, &want, cols, rows, &format!("q5_k native real {name}"));
+        }
     }
 }
