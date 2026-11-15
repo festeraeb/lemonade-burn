@@ -13,6 +13,9 @@ default = []
 # A/B both runtimes on the same card. Needs libcuda + libnvrtc (CUDA 12.8 for Pascal) at run
 # time only; nothing is linked at build time (cudarc dynamic loading).
 cuda = ["cubecl/cuda", "dep:cudarc"]
+# The wgpu runtime with the SPIR-V compiler on Vulkan (cubecl `vulkan` = `wgpu-spirv`) instead of WGSL: f16, dot products and
+# subgroup ops where the driver has them. Off by default; see docs/ENGINE_VULKAN.md.
+vulkan = ["cubecl/vulkan"]
 
 
 [dependencies]

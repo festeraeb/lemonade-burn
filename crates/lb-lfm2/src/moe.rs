@@ -387,8 +387,26 @@ impl ExpertStore {
                 Err(e) => eprintln!("lb-lfm2: mapping not page-locked ({e}); uploads repack on the host"),
             }
         }
+        // wgpu has no page-locked registration. The host repack reads the raw expert bytes straight out
+        // of the mapping, and on a mapping nobody has touched in this process every 4 KiB page is a
+        // minor fault: measured on c1 (E5-2680 v2, RX 6700 XT / Polaris) the `u32` conversion was 54 % of
+        // the decode thread and a miss cost ~20 ms instead of ~1 ms. `MADV_POPULATE_READ` maps the whole
+        // file's pages once at load (they are page-cache pages, shared, no extra RAM). `LB_NO_PREFAULT=1`
+        // turns it off.
         #[cfg(not(feature = "cuda"))]
-        let _ = w;
+        if std::env::var_os("LB_NO_PREFAULT").is_none() {
+            let t = std::time::Instant::now();
+            let map = w.gguf.mapping();
+            // SAFETY: a read-only advisory call on a live mapping; the range is the mapping's own.
+            let rc = unsafe { libc::madvise(map.as_ptr() as *mut libc::c_void, map.len(), libc::MADV_POPULATE_READ) };
+            // SAFETY: the mapping is `w.gguf`'s, an `Arc<Gguf>` the model holds as long as its store, and so this `Gpu`, exists.
+            let _ = unsafe { gpu.register_mapping(map) };
+            if rc == 0 {
+                eprintln!("lb-lfm2: prefaulted {:.2} GB of the GGUF mapping in {:.0} ms", map.len() as f64 / 1e9, t.elapsed().as_secs_f64() * 1e3);
+            } else {
+                eprintln!("lb-lfm2: MADV_POPULATE_READ failed ({}); expert uploads fault the mapping in", std::io::Error::last_os_error());
+            }
+        }
         Ok(gpu)
     }
 

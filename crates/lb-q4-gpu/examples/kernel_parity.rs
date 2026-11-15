@@ -50,6 +50,11 @@ impl Out {
 fn dump(path: &str) -> Result<(), String> {
     let gpu = Gpu::open()?;
     eprintln!("device {} plane {:?} use_plane {} q4_math {:?}", gpu.name, gpu.plane_size, gpu.use_plane, gpu.q4_math_kind());
+    if std::env::var_os("KP_CAPS").is_some() {
+        let props = gpu.client.properties();
+        eprintln!("hardware: {:?}", props.hardware);
+        eprintln!("features: {:?}", props.features);
+    }
     let mut rng = Rng(7);
     let mut out = Out(Vec::new());
     let x: Vec<f32> = (0..4 * 2048).map(|_| rng.unit()).collect();

@@ -28,6 +28,8 @@ pub use store::{PendingRead, pick_cube_device, ExpertSlots, Gpu, Q4Math, SideStr
 pub mod pinned;
 #[cfg(feature = "cuda")]
 pub mod registered;
+#[cfg(not(feature = "cuda"))]
+pub mod borrowed;
 pub use cubecl::server as cubecl_server;
 /// A captured CUDA graph (`Gpu::client.stop_capture()`), replayed by `device_decode.rs`.
 pub use cubecl::client::Graph as CubeGraph;

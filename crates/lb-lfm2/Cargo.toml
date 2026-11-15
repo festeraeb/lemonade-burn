@@ -28,3 +28,5 @@ ureq = { version = "2", features = ["json"] }
 # lfm2-check --tokenizer (already in the workspace for lb-model; no new crate)
 tokenizers.workspace = true
 sha2.workspace = true
+# MADV_POPULATE_READ on the GGUF mapping for the wgpu runtime (moe.rs); already in the lock.
+libc = "=0.2.191"

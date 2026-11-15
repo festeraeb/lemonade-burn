@@ -74,6 +74,10 @@ pub struct Gpu {
     /// driver as it is, no host copy, and repacked on the device.
     #[cfg(feature = "cuda")]
     registered: Mutex<Vec<std::sync::Arc<crate::registered::HostRegistration>>>,
+    /// File mappings the caller keeps alive (`register_mapping`, wgpu runtime): a slice inside one goes to
+    /// the device write as a borrowed view, no host copy (see `borrowed.rs`).
+    #[cfg(not(feature = "cuda"))]
+    borrowed: Mutex<Vec<crate::borrowed::Mapping>>,
     /// Repack on the host even when the bytes are registered (`LB_HOST_REPACK=1`, or
     /// `set_host_repack`): the A/B switch for the device repack.
     host_repack: AtomicBool,
@@ -301,6 +305,8 @@ impl Gpu {
             },
             #[cfg(feature = "cuda")]
             registered: Mutex::new(Vec::new()),
+            #[cfg(not(feature = "cuda"))]
+            borrowed: Mutex::new(Vec::new()),
             host_repack: AtomicBool::new(std::env::var_os("LB_HOST_REPACK").is_some()),
             batch_miss: AtomicBool::new(std::env::var_os("LB_NO_BATCH_MISS").is_none()),
             consts: Mutex::new(HashMap::new()),
@@ -536,6 +542,26 @@ impl Gpu {
         let n = reg.len();
         self.registered.lock().expect("registered").push(std::sync::Arc::new(reg));
         Ok(n)
+    }
+
+    /// wgpu runtime: remember `map` so expert writes borrow slices of it instead of copying them first.
+    ///
+    /// # Safety
+    /// `map` must stay mapped, unmodified, for as long as this `Gpu` is used.
+    #[cfg(not(feature = "cuda"))]
+    pub unsafe fn register_mapping(&self, map: &[u8]) -> Result<usize, String> {
+        if std::env::var_os("LB_NO_BORROW").is_some() {
+            return Ok(0);
+        }
+        self.borrowed.lock().expect("borrowed").push(crate::borrowed::Mapping { start: map.as_ptr() as usize, len: map.len() });
+        Ok(map.len())
+    }
+
+    /// `bytes` as borrowed `Bytes` when they lie inside a registered mapping.
+    #[cfg(not(feature = "cuda"))]
+    fn registered_slice(&self, bytes: &[u8]) -> Option<Bytes> {
+        let regs = self.borrowed.lock().expect("borrowed");
+        regs.iter().find(|r| r.contains(bytes)).map(|_| crate::borrowed::bytes_of(bytes))
     }
 
     /// Bytes page-locked by `register_mapping` so far (0 without the cuda runtime).
@@ -1961,12 +1987,13 @@ impl ExpertSlots {
             #[cfg(feature = "cuda")]
             let reg = if gpu.host_repack() { None } else { gpu.registered_slice(raw) };
             #[cfg(not(feature = "cuda"))]
-            let reg: Option<Bytes> = None;
+            let reg: Option<Bytes> = if gpu.host_repack() { None } else { gpu.registered_slice(raw) };
             match reg {
                 Some(b) => gpu.client.write(&dst, b),
                 None => {
-                    let words: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                    gpu.client.write(&dst, Bytes::from_elems(words));
+                    // a plain byte copy: the buffer is bytes to the driver, and the old per-word `u32` conversion cost
+                    // ~3-5 ms per expert on c1's CPU (the repack kernel reads the same bytes as little-endian words)
+                    gpu.client.write(&dst, Bytes::from_bytes_vec(raw.to_vec()));
                 }
             }
             unsafe {
@@ -2020,12 +2047,13 @@ impl ExpertSlots {
                 #[cfg(feature = "cuda")]
                 let reg = if gpu.host_repack() { None } else { gpu.registered_slice(raw) };
                 #[cfg(not(feature = "cuda"))]
-                let reg: Option<Bytes> = None;
+                let reg: Option<Bytes> = if gpu.host_repack() { None } else { gpu.registered_slice(raw) };
                 match reg {
                     Some(b) => gpu.client.write(&dst, b),
                     None => {
-                        let words: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                        gpu.client.write(&dst, Bytes::from_elems(words));
+                        // a plain byte copy: the buffer is bytes to the driver, and the old per-word `u32` conversion cost
+                        // ~3-5 ms per expert on c1's CPU (the repack kernel reads the same bytes as little-endian words)
+                        gpu.client.write(&dst, Bytes::from_bytes_vec(raw.to_vec()));
                     }
                 }
             }
@@ -2052,12 +2080,13 @@ impl ExpertSlots {
                 #[cfg(feature = "cuda")]
                 let reg = if gpu.host_repack() { None } else { gpu.registered_slice(raw) };
                 #[cfg(not(feature = "cuda"))]
-                let reg: Option<Bytes> = None;
+                let reg: Option<Bytes> = if gpu.host_repack() { None } else { gpu.registered_slice(raw) };
                 match reg {
                     Some(b) => gpu.client.write(&dst, b),
                     None => {
-                        let words: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                        gpu.client.write(&dst, Bytes::from_elems(words));
+                        // a plain byte copy: the buffer is bytes to the driver, and the old per-word `u32` conversion cost
+                        // ~3-5 ms per expert on c1's CPU (the repack kernel reads the same bytes as little-endian words)
+                        gpu.client.write(&dst, Bytes::from_bytes_vec(raw.to_vec()));
                     }
                 }
                 unsafe {
