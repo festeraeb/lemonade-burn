@@ -6,6 +6,8 @@ use half::f16;
 pub enum GgmlType {
     F32,
     F16,
+    /// bfloat16: the top 16 bits of an f32 (GGML type id 30).
+    BF16,
     Q4_0,
     Q8_0,
     Q2K,
@@ -52,6 +54,7 @@ impl GgmlType {
             22 => GgmlType::IQ2S,
             23 => GgmlType::IQ4XS,
             29 => GgmlType::IQ1M,
+            30 => GgmlType::BF16,
             other => GgmlType::Other(other),
         }
     }
@@ -60,6 +63,7 @@ impl GgmlType {
         match self {
             GgmlType::F32 => "F32".into(),
             GgmlType::F16 => "F16".into(),
+            GgmlType::BF16 => "BF16".into(),
             GgmlType::Q4_0 => "Q4_0".into(),
             GgmlType::Q8_0 => "Q8_0".into(),
             GgmlType::Q2K => "Q2_K".into(),
@@ -85,6 +89,7 @@ impl GgmlType {
         Some(match self {
             GgmlType::F32 => (1, 4),
             GgmlType::F16 => (1, 2),
+            GgmlType::BF16 => (1, 2),
             GgmlType::Q4_0 => (32, 18),
             GgmlType::Q8_0 => (32, 34),
             // K-quants: 256 values a block. d/dmin are f16; the 12-byte `scales` of Q4_K/Q5_K
@@ -133,6 +138,11 @@ impl GgmlType {
             GgmlType::F32 => {
                 for (d, c) in dst.iter_mut().zip(src.chunks_exact(4)) {
                     *d = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                }
+            }
+            GgmlType::BF16 => {
+                for (d, c) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                    *d = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
                 }
             }
             GgmlType::F16 => {
