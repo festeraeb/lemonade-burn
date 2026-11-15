@@ -1170,6 +1170,20 @@ impl Gpu {
         y
     }
 
+    /// Hand the launches queued so far to the device thread now, without waiting for it.
+    ///
+    /// CubeCL batches tasks for its device thread in a 32-slot queue and delivers the batch when it
+    /// is full or when something flushes it; the E2 path queues about a dozen launches a layer and
+    /// then reads, so the device thread issues the whole layer only at the read (measured:
+    /// `docs/ENGINE_SYNC_COST.md`). Abandoning a profiling window that was never opened is a
+    /// public, non-blocking, side-effect-free call whose documented effect is exactly this flush
+    /// (`Client::profile_abandon`: "does not wait for the server ... but does flush"); the server
+    /// removes an unknown token from an empty map. No CubeCL patch.
+    pub fn flush_queue(&self) {
+        let window = cubecl::client::ProfileWindow { stream_id: cubecl_environment::stream::StreamId::current(), token: cubecl::server::ProfilingToken { id: u64::MAX } };
+        self.client.profile_abandon(window);
+    }
+
     /// [`Gpu::read_raw`] without recycling the scratch pool: for a read in the middle of a token
     /// whose scratch buffers (the router input, the last FFN output) are still needed afterwards.
     /// The token's last `read_raw` recycles them.

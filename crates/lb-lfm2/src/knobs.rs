@@ -67,6 +67,14 @@ pub struct Knobs {
     /// runs the hits while the host reads and plans; only a layer with a miss is repaired afterwards. Bit-identical
     /// to the synced layer. Needs the look-ahead off (`LB_LA_*` unset). `LB_E2_SPEC=1` at start; off by default. Live.
     e2_spec: AtomicBool,
+    /// E2 path: hand the queued launches to CubeCL's device thread after every Nth launch group instead of
+    /// only at the routes read, so the thread issues them while the host is still building the rest of the
+    /// layer (`docs/ENGINE_SYNC_COST.md`). 0 = off (the default), 1 = after every group. Bit-identical.
+    /// `LB_E2_FLUSH=N`. Live.
+    e2_flush: AtomicU32,
+    /// E2 path: fold a MoE layer's weighted expert sum into the next pre-norm's launch (as the all-resident
+    /// path does): one launch fewer a layer, bit-identical. `LB_E2_FUSE=1`. Live.
+    e2_fuse: AtomicBool,
 }
 
 fn env_on(k: &str) -> bool {
@@ -94,6 +102,8 @@ impl Default for Knobs {
             dd_fast: AtomicBool::new(env_or("LB_DD_FAST", true)),
             cpu_miss: AtomicBool::new(env_on("LB_CPU_MISS")),
             e2_spec: AtomicBool::new(env_on("LB_E2_SPEC")),
+            e2_fuse: AtomicBool::new(env_on("LB_E2_FUSE")),
+            e2_flush: AtomicU32::new(std::env::var("LB_E2_FLUSH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)),
             cpu_miss_admit: AtomicU32::new(std::env::var("LB_CPU_MISS_ADMIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)),
         }
     }
@@ -199,6 +209,22 @@ impl Knobs {
         self.e2_spec.store(on, Ordering::Relaxed);
     }
 
+    pub fn e2_fuse(&self) -> bool {
+        self.e2_fuse.load(Ordering::Relaxed)
+    }
+
+    pub fn set_e2_fuse(&self, on: bool) {
+        self.e2_fuse.store(on, Ordering::Relaxed);
+    }
+
+    pub fn e2_flush(&self) -> u32 {
+        self.e2_flush.load(Ordering::Relaxed)
+    }
+
+    pub fn set_e2_flush(&self, n: u32) {
+        self.e2_flush.store(n, Ordering::Relaxed);
+    }
+
     pub fn cpu_miss(&self) -> bool {
         self.cpu_miss.load(Ordering::Relaxed)
     }
@@ -242,6 +268,7 @@ mod tests {
             (Knobs::dd_fast, Knobs::set_dd_fast),
             (Knobs::cpu_miss, Knobs::set_cpu_miss),
             (Knobs::e2_spec, Knobs::set_e2_spec),
+            (Knobs::e2_fuse, Knobs::set_e2_fuse),
         ] {
             let b = get(&k);
             set(&k, !b);

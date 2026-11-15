@@ -445,9 +445,23 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     let mut deferred = false;
     let stage = &m.stats.stage;
     let vocab = cfg.n_vocab;
+    // LB_E2_FLUSH=N: queued launches go to the device thread after every Nth launch group (see `Gpu::flush_queue`)
+    let e2_fuse = e2 && knobs.e2_fuse();
+    let flush_n = if e2 { knobs.e2_flush() as usize } else { 0 };
+    let mut flush_i = 0usize;
+    macro_rules! fl {
+        () => {
+            if flush_n > 0 {
+                flush_i += 1;
+                if flush_i % flush_n == 0 {
+                    gpu.flush_queue();
+                }
+            }
+        };
+    }
     let t_issue = Instant::now();
-    // LB_E2_PROFILE=<file>: one JSON line a token: per MoE layer [layer, misses, sync wait us, host busy us since the last sync, bytes read]
-    let mut prof: Vec<[u64; 5]> = Vec::new();
+    // LB_E2_PROFILE=<file>: one JSON line a token: per MoE layer [layer, misses, sync wait us, host busy us since the last sync, bytes read, read_begin us, read_finish us, host us from the read's return to the end of the layer's launches]
+    let mut prof: Vec<[u64; 8]> = Vec::new();
     let mut last_ret = t_issue;
     let logits: Handle = if replaying {
         match prep.graph.as_ref().map(|g| &g.state) {
@@ -475,20 +489,30 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             Some((outs, base)) => gpu.sum_add_rms_norm(&outs, &prep.weights, &prep.routes, &prep.x, &lp.attn_norm, (k_used, e, base, prep.n_slots), eps),
                 None => gpu.add_rms_norm(&prep.x, y.as_ref(), &lp.attn_norm, e, eps),
             };
+            fl!();
             let op_out = match (&layer.op, &lp.op) {
                 (Operator::Conv { in_proj, out_proj, .. }, OpPrep::Conv { taps }) => {
                     let bcx = mat(m, in_proj).launch(gpu, &h, 1);
+                    fl!();
                     let state = dev_conv[li].as_ref().expect("conv layer state");
                     let yy = gpu.conv_decode(&bcx, taps, state, e, l);
-                    mat(m, out_proj).launch(gpu, &yy, 1)
+                    fl!();
+                    let o = mat(m, out_proj).launch(gpu, &yy, 1);
+                    fl!();
+                    o
                 }
                 (Operator::Attn { q, k, v, o, .. }, OpPrep::Attn { q_norm, k_norm }) => {
                     let kvh = cfg.kv_heads[li];
                     let (qh, kh, vh) = (mat(m, q).launch(gpu, &h, 1), mat(m, k).launch(gpu, &h, 1), mat(m, v).launch(gpu, &h, 1));
+                    fl!();
                     let (kc, vc) = (dev_k[li].as_ref().expect("k cache"), dev_v[li].as_ref().expect("v cache"));
                     let qo = gpu.qk_norm_rope(&qh, &kh, &vh, q_norm, k_norm, &rope, rope_rows, kc, vc, &prep.tp, (nh, kvh, hd), eps);
+                    fl!();
                     let att = gpu.attn_decode(&qo, kc, vc, &prep.tp, (nh, kvh, hd));
-                    mat(m, o).launch(gpu, &att, 1)
+                    fl!();
+                    let oo = mat(m, o).launch(gpu, &att, 1);
+                    fl!();
+                    oo
                 }
                 _ => unreachable!("layer {li}: operator and its device copy disagree"),
             };
@@ -512,6 +536,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             } else {
                 gpu.add_rms_norm(&prep.x, Some(&op_out), &lp.ffn_norm, e, eps)
             };
+            fl!();
             let ffn_out = match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
                     let hh = GpuQ4Mat::launch_gate_up_silu(gpu, mat(m, gate), mat(m, up), &h2, 1);
@@ -554,6 +579,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         let base = mi * k_used;
                         let seq = knobs.dd_router_seq();
                         gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), seq);
+                        fl!();
                         // the guess of the next MoE layer, from the same residual stream (`x` is this
                         // layer's x_mid here): its router on its own FFN pre-norm
                         let mut want = vec![(prep.routes.clone(), prep.n_slots * 8)];
@@ -584,6 +610,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         // from host memory cannot avoid
                         let t_read = Instant::now();
                         let busy_us = t_read.duration_since(last_ret).as_micros() as u64;
+                        let (mut prof_begin, mut prof_finish) = (0u64, 0u64);
                         // LB_E2_SPEC: the routes read is enqueued right behind the router, and only then are the experts
                         // launched from the device table, so the host gets the routes while the card runs the experts
                         // per layer: speculate only where the layer has mostly hit lately (an EMA of "this pass had a
@@ -600,6 +627,15 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                                 Some(c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used).0)
                             };
                             (so, gpu.read_finish(pr))
+                        } else if prof_on() {
+                            // same calls as `read_raw_keep` (read_async then read_sync), timed apart
+                            let t0 = Instant::now();
+                            let pr = gpu.read_begin(want);
+                            prof_begin = t0.elapsed().as_micros() as u64;
+                            let t1 = Instant::now();
+                            let r = gpu.read_finish(pr);
+                            prof_finish = t1.elapsed().as_micros() as u64;
+                            (None, r)
                         } else {
                             (None, gpu.read_raw_keep(want))
                         };
@@ -746,10 +782,11 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                                 return abandon(m, cache, &format!("layer {li} slot fill: {err}"));
                             }
                             c.count_fill();
+                            fl!();
                         }
                         let (n_hit, n_fill) = (plan.hits.len(), plan.fills.len());
                         if prof_on() {
-                            prof.push([li as u64, (n_fill + cpu_set.len()) as u64, prof_wait, busy_us, prof_bytes]);
+                            prof.push([li as u64, (n_fill + cpu_set.len()) as u64, prof_wait, busy_us, prof_bytes, prof_begin, prof_finish, 0]);
                         }
                         let n_demand = n_fill - n_landed;
                         m.stats.gpu_hits.fetch_add(n_hit as u64, Ordering::Relaxed);
@@ -776,12 +813,15 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                             Some(o) if n_fill == 0 => o,
                             _ => {
                                 gpu.write_u32(&prep.slot_routes, &slot_words);
+                                fl!();
                                 if let Some(f) = fence.take() {
                                     c.slots.fence(gpu, &f);
                                 }
                                 c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used).0
                             }
                         };
+                        // the card starts the experts now, while the CPU computes the missed ones below
+                        fl!();
                         if spec {
                             if c.layer_miss.len() <= li {
                                 c.layer_miss.resize(cfg.n_layer, 0.0);
@@ -810,7 +850,15 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                             stage.cpu_miss_layers.fetch_add(1, Ordering::Relaxed);
                             stage.cpu_miss_ns.fetch_add(t_cpu.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
-                        let sum = gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots));
+                        fl!();
+                        // LB_E2_FUSE: the sum runs in the next pre-norm's launch, as in the all-resident path
+                        let sum = if e2_fuse {
+                            pend = Some((outs.clone(), base));
+                            outs
+                        } else {
+                            gpu.weighted_sum(&outs, &prep.weights, &prep.routes, (k_used, e, base, prep.n_slots))
+                        };
+                        fl!();
                         // landings this layer did not use were wrong guesses: they cost bus, nothing else
                         if let Some(l) = c.landings.as_mut() {
                             let raw_b = c.slots.raw_expert_bytes() as u64;
@@ -840,6 +888,10 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         }
                         if !deferred {
                             la_issue(m, gpu, c, &guesses);
+                        }
+                        if let Some(p) = prof.last_mut() {
+                            // host time from the read's return to the end of this layer's launches
+                            p[7] = last_ret.elapsed().as_micros() as u64;
                         }
                         sum
                     }
@@ -1133,7 +1185,7 @@ fn prof_on() -> bool {
     prof_file().is_some()
 }
 
-fn prof_write(layers: &[[u64; 5]], issue_us: u64) {
+fn prof_write(layers: &[[u64; 8]], issue_us: u64) {
     use std::io::Write;
     if let Some(f) = prof_file() {
         let _ = writeln!(f.lock().expect("profile"), "{}", serde_json::json!({"layers": layers, "issue_to_last_sync_us": issue_us}));
