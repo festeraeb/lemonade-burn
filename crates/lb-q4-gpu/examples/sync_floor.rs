@@ -13,7 +13,10 @@ fn stat(name: &str, v: &mut [f64]) {
 
 fn main() {
     let dev: usize = std::env::var("LB_CUDA_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    #[cfg(feature = "cuda")]
     let gpu = if std::env::var("LB_CUDA_DEVICE").is_ok() { Gpu::open_cuda(dev) } else { Gpu::open() }.expect("device");
+    #[cfg(not(feature = "cuda"))]
+    let gpu = Gpu::open().expect("device");
     let k: usize = std::env::var("SF_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let e: usize = std::env::var("SF_E").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
     let reps: usize = std::env::var("SF_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);

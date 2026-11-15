@@ -44,6 +44,3 @@ required-features = ["cuda"]
 # `examples/imc_bw.rs` only (perf_event_open on the uncore memory controllers); already in the lock.
 libc = "=0.2.191"
 
-[[example]]
-name = "sync_floor"
-required-features = ["cuda"]
