@@ -69,11 +69,11 @@ pub struct Knobs {
     e2_spec: AtomicBool,
     /// E2 path: hand the queued launches to CubeCL's device thread after every Nth launch group instead of
     /// only at the routes read, so the thread issues them while the host is still building the rest of the
-    /// layer (`docs/ENGINE_SYNC_COST.md`). 0 = off (the default), 1 = after every group. Bit-identical.
+    /// layer (`docs/ENGINE_SYNC_COST.md`). 0 = off, 1 = after every group (the default). Bit-identical.
     /// `LB_E2_FLUSH=N`. Live.
     e2_flush: AtomicU32,
     /// E2 path: fold a MoE layer's weighted expert sum into the next pre-norm's launch (as the all-resident
-    /// path does): one launch fewer a layer, bit-identical. `LB_E2_FUSE=1`. Live.
+    /// path does): one launch fewer a layer, bit-identical. On by default; `LB_E2_FUSE=0` turns it off. Live.
     e2_fuse: AtomicBool,
 }
 
@@ -102,8 +102,8 @@ impl Default for Knobs {
             dd_fast: AtomicBool::new(env_or("LB_DD_FAST", true)),
             cpu_miss: AtomicBool::new(env_on("LB_CPU_MISS")),
             e2_spec: AtomicBool::new(env_on("LB_E2_SPEC")),
-            e2_fuse: AtomicBool::new(env_on("LB_E2_FUSE")),
-            e2_flush: AtomicU32::new(std::env::var("LB_E2_FLUSH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)),
+            e2_fuse: AtomicBool::new(env_or("LB_E2_FUSE", true)),
+            e2_flush: AtomicU32::new(std::env::var("LB_E2_FLUSH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)),
             cpu_miss_admit: AtomicU32::new(std::env::var("LB_CPU_MISS_ADMIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)),
         }
     }

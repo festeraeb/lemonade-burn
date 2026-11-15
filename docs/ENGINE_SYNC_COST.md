@@ -93,9 +93,22 @@ Flush and fuse reorder nothing on the card (launch timing, and a sum kernel the 
 * 5120 MiB, >= 1.25x against the default E2 path: **copy misses 1.234x: FAIL by 0.016.** With `LB_CPU_MISS=1`: **1.416x: pass.**
 * Logits bit-identical (max |logit diff| 0, top-1 100 %) for flush and fuse; CPU-miss arm keeps its own 2.5e-5.
 * No regression: all-resident 0.998, 12500 MiB 1.486x. 3072: 1.202x copy, 1.447x with CPU misses.
-* Because the copy arm misses the gate, the switches stay **default off**. They are bit-identical and never slower in any
-  measurement, so the one-line flip (knobs `e2_flush` default 1, `e2_fuse` default on) is the next commit if the operator accepts
-  1.23x as enough.
+* The gate (a win at 5120 MiB) is **missed**: 1.234x against 1.25x. Defaults are a separate decision, taken by the
+  coordinator: flush and fuse are bit-identical and not slower anywhere, so **`e2_flush` = 1 and `e2_fuse` = on are the defaults**
+  (switches kept: `LB_E2_FLUSH=0`, `LB_E2_FUSE=0`, or the live tunables). `LB_CPU_MISS` stays off (its logits differ by 2.5e-5) and
+  `LB_E2_SPEC` stays off.
+
+### Confirming run with the new defaults (A-B-B-A, 2 rounds, 5 prompts x 160 tokens, same binary, switches forced off for the other arm)
+
+| budget | defaults | switches off | defaults / off | text |
+|---|---|---|---|---|
+| all resident (14500) | 100.08 | 100.00 | 1.001 | identical 4/4 |
+| 12500 (cache forced) | 73.10 | 49.64 | 1.473 | identical 4/4 |
+| 5120 | 30.02 | 24.34 | 1.233 (paired 1.236, 1.229) | identical 4/4 |
+| 3072 | 21.27 | 17.95 | 1.185 (paired 1.189, 1.176) | identical 4/4 |
+
+Teacher-forced at 5120 MiB with the defaults (no env set): 1590/1590 top-1, max |logit diff| 0. Unit tests: `lb-lfm2` 32, `lb-q4-gpu` 4,
+`lb-server` 8 pass (GPU integration tests not run: they would open a card on the build host).
 
 ## 6. What the floor implies at 5120 and 3072
 

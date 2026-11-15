@@ -169,9 +169,9 @@ impl Tunables {
                 "description": "E2 expert cache: compute a cache miss on the CPU from the host GGUF bytes instead of copying the expert to the card (a miss is copied in on its LB_CPU_MISS_ADMIT-th miss, 2 by default); exact f32 SIMD kernel unless cpu_i8"}));
             v.push(json!({"name": "e2_spec", "value": k.e2_spec(), "type": "bool", "scope": "live", "source": "LB_E2_SPEC",
                 "description": "E2 expert cache: launch a MoE layer's experts from a device-side slot table right after the router so the card runs the hits while the host reads the routes; bit-identical logits; ignored with the look-ahead on"}));
-            v.push(json!({"name": "e2_fuse", "value": k.e2_fuse(), "type": "bool", "scope": "live", "source": "LB_E2_FUSE",
+            v.push(json!({"name": "e2_fuse", "value": k.e2_fuse(), "type": "bool", "scope": "live", "source": "LB_E2_FUSE", "default": true,
                 "description": "E2 expert cache: fold a MoE layer's expert sum into the next pre-norm's launch (one launch fewer a layer); bit-identical logits"}));
-            v.push(json!({"name": "e2_flush", "value": k.e2_flush(), "type": "int", "range": [0, 64], "scope": "live", "source": "LB_E2_FLUSH",
+            v.push(json!({"name": "e2_flush", "value": k.e2_flush(), "type": "int", "range": [0, 64], "scope": "live", "source": "LB_E2_FLUSH", "default": 1,
                 "description": "E2 expert cache: hand queued launches to the device thread after every Nth launch group (0 = only at the routes read, 1 = after every group); bit-identical logits; the per-sync cost falls from ~0.21 to ~0.1 ms a layer"}));
             v.push(json!({"name": "cpu_i8", "value": k.cpu_i8(), "type": "bool", "scope": "live", "source": "LB_CPU_I8",
                 "description": "CPU experts use the int8-activation kernel (faster on some CPUs, rounds activations to 8 bits: 98.0 % top-1 against all-resident on LFM2.5, so off by default)"}));
