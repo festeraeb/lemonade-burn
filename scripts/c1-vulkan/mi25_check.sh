@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run on c1 the moment the MI25 (Vega 10, gfx900) is in the box. Read-only apart from the log files it writes under $V/results.
 # 1 detect  2 vulkaninfo  3 kernel parity  4 decode test  5 temperature log
-# Usage: mi25_check.sh [wgpu-index]   (no argument: the index is found from vulkaninfo's device order)
+# Usage: mi25_check.sh [wgpu-index]   (the engine is opened by name:VEGA10; the index only feeds the log names)
+# Needs the phase-2 binaries in $V/bin2 (kernel_parity, lfm2-check) and the page cache of the 24B GGUF on NUMA node 0.
 V=${V:-/mnt/models/vk}; R=$V/results; mkdir -p $R; D=$1
 echo "== 1 detect"; lspci -nn | grep -i -E '1002:6860|Vega 10|Instinct' || echo "MI25 NOT on the bus (lspci shows no 1002:6860): reseat the card / check the 8-pin power / 'Above 4G decoding' in RBSU"
 dmesg 2>/dev/null | grep -i -E 'amdgpu.*(vega|gfx9|VRAM|fail|error)' | tail -8 || true
@@ -10,14 +11,15 @@ echo "== 2 vulkaninfo (the order below is the wgpu discrete:N order; read it, do
 vulkaninfo --summary 2>/dev/null | grep -E '^GPU|deviceName|deviceType|driverName|driverInfo' | paste - - - - - 2>/dev/null | head
 if [ -z "$D" ]; then D=$(vulkaninfo --summary 2>/dev/null | awk '/deviceType/ && /DISCRETE/ {n++} /deviceName/ && /Vega|MI25|Instinct/ {print n-1; exit}'); fi
 [ -n "$D" ] || { echo "no Vega device in vulkaninfo (RADV may need the card initialised by amdgpu first: check dmesg)"; exit 2; }
-echo "MI25 = wgpu discrete:$D"
+echo "MI25 = wgpu discrete:$D (this run picks it by name, name:VEGA10, not by index)"
+SPEC="name:VEGA10"; export BIN=bin2 DEV="$SPEC" PFX="numactl --cpunodebind=${NODE:-0} --membind=${NODE:-0}"   # NODE: the fast NUMA node (c1: 0; node 1 memory reads at 0.3 GB/s)
 vulkaninfo 2>/dev/null | awk '/GPU id/ {g++} g==('$D'+1) && /shaderFloat16|shaderInt8|shaderInt64|subgroupSize|shaderIntegerDotProduct|integerDotProduct8BitSignedAccelerated|storageBuffer16BitAccess|maxStorageBufferRange/ {print}' | head -14
 echo "== 3 kernel parity vs the CUDA P100 dump (identical seeded inputs)"
-LB_WGPU_DEVICE=discrete:$D $V/bin/kernel_parity dump $R/kp-wgsl-mi25.bin 2>&1 | tail -2
-$V/bin/kernel_parity cpu $R/kp-wgsl-mi25.bin
-[ -f $V/kp-cuda-0.bin ] && $V/bin/kernel_parity cmp $R/kp-wgsl-mi25.bin $V/kp-cuda-0.bin
+LB_WGPU_DEVICE="$SPEC" $V/bin2/kernel_parity dump $R/kp-wgsl-mi25.bin 2>&1 | tail -2
+$V/bin2/kernel_parity cpu $R/kp-wgsl-mi25.bin
+[ -f $V/kp-cuda-0.bin ] && $V/bin2/kernel_parity cmp $R/kp-wgsl-mi25.bin $V/kp-cuda-0.bin
 echo "== 4 decode test: 24B teacher-forced vs the CUDA reference, first prompt (322 positions), cache 8192 MiB"
-( NP=1 $V/c1_agree.sh mi25-8192 $D 8192 ) &
+( NP=1 CUBECL_WGPU_RING_MB=64 CUBECL_WGPU_RING_THREADS=4 CUBECL_WGPU_POLL_CALLER=1 $V/c1_agree.sh mi25-8192 $D 8192 CUBECL_WGPU_RING_MB=64 CUBECL_WGPU_RING_THREADS=4 CUBECL_WGPU_POLL_CALLER=1 ) &
 APID=$!
 echo "== 5 temperature log every 10 s while the decode runs (edge/junction/mem, PPT) -> $R/mi25-temps.log"
 H=""; for h in /sys/class/hwmon/hwmon*; do [ "$(cat $h/name)" = amdgpu ] && [ "$(readlink -f $h/device | grep -c $(lspci -D | grep -i 'Vega 10' | cut -d' ' -f1 | head -1))" = 1 ] && H=$h; done
