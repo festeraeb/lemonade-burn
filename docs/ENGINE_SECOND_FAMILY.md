@@ -283,3 +283,19 @@ one above), the device delta-net / gated-attention / MoE layers, the N-card laye
 `LB_WARMUP` first-long-prompt cost. None of them was started; the speed gate (>= 54 tok/s) is therefore neither met nor measured. The revised gates (device against the CPU decoder at top-1 >= 99.9 %; against
 llama.cpp no worse than its own 97.37 % / 0.0064) are stated here as the acceptance tests for that work; the 99.5 % gate against a single llama.cpp path stands as not met, for the reason in section 5
 (its own two paths agree at 97.37 %).
+
+## 11. Step A: native-density Q6_K and Q8_0
+
+Kernels `q6_k_native_matvec_kernel` / `q8_0_native_matvec_kernel` (`kquant.rs`, `GpuQ6KNative`, `GpuQ8Native`, test `tests/native_q6_q8.rs`). Their blocks (210 and 34 bytes) are not 16-byte
+aligned, so at upload the bytes are split into aligned arrays with no change to any stored value or the byte count (Q6_K: 192 bytes `ql`+`qh` as 12 vectors, 16 i8 scales as one vector, f16 `d` two to a word;
+Q8_0: 32 quants as 2 vectors, f16 `d` two to a word). Activations are permuted like Q5_K. [measured, P100 AF, 16384 x 2048, permute launch included]
+
+| type | existing kernel | native kernel | file size |
+|---|---|---|---|
+| Q6_K | 143.9 us, 41.9 MB (widened) | 163.2 us, **27.5 MB** | 27.5 MB |
+| Q8_0 | 72.5 us, 35.7 MB | 140.0 us, 35.7 MB | 35.7 MB |
+
+Q6_K: native costs 1.13x the time of the widened kernel at 66 % of the memory (within the 2x target). Q8_0: the existing kernel is already at file density and is 1.9x faster, so the native Q8_0 kernel is correct but
+has no use; **keep `GpuQ8Mat` for Q8_0.** Correctness [max |gpu - cpu|]: real Qwen3.6 rows (3000 each, 2 tokens) Q6_K `output` 4.1e-6, `attn_q` 3.1e-6, expert down 4.8e-7; Q8_0 `attn_qkv` 3.7e-6, shared gate 1.9e-6, `ssm_out` 5.1e-6
+(same as the existing kernels); random shapes within the f32 summation tolerance. With Q5_K native (section 10), every dense and routed type of this file now has a file-density kernel
+(routed Q5_K/Q6_K experts still use the widened layout; native routed variants follow with the MoE layer in step B).

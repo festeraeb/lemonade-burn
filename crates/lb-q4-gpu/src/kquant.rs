@@ -582,3 +582,278 @@ impl GpuKExpertLayer {
         Ok(gpu.read_all(vec![(out, slots * self.embd)])?.remove(0))
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Q6_K and Q8_0 at file density. Their blocks (210 and 34 bytes) are not 16-byte aligned, so the bytes are split at upload into
+// aligned arrays without changing a single stored value or the byte count: Q6_K -> the 192 bytes of `ql`+`qh` (12 vectors a block),
+// the 16 i8 scales (one vector), the f16 `d` packed two to a word (210 B a block); Q8_0 -> the 32 quants (2 vectors a block) and the
+// f16 `d` packed two to a word (34 B a block). Both read activations permuted by `perm16_kernel`.
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/// Q6_K lane = one 128-value half block. `dims` = [rows, cols].
+#[cube(launch)]
+fn q6_k_native_matvec_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let items = bpr * 2usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < out.len() {
+        let t = o / rows;
+        let r = o % rows;
+        let mut acc = 0.0f32;
+        let mut it = lane;
+        while it < items {
+            let gb = r * bpr + it / 2usize;
+            let h = it % 2usize;
+            let d = f16_to_f32((dd[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+            let sv = sc[gb];
+            // scale bytes 8h + c live in word 2h + c/4 of the scale vector
+            let mut w0 = sv.extract(0usize);
+            let mut w1 = sv.extract(1usize);
+            if h == 1usize {
+                w0 = sv.extract(2usize);
+                w1 = sv.extract(3usize);
+            }
+            let xb = (t * cols + (it / 2usize) * 256usize + 128usize * h) / 4usize;
+            let qb = gb * 12usize;
+            let mut part = 0.0f32;
+            #[unroll]
+            for a in 0..2usize {
+                let qla = qq[qb + 4usize * h + a];
+                let qlb = qq[qb + 4usize * h + a + 2usize];
+                let qhv = qq[qb + 8usize + 2usize * h + a];
+                let mut p0 = V4F::new(0.0f32);
+                let mut p1 = V4F::new(0.0f32);
+                let mut p2 = V4F::new(0.0f32);
+                let mut p3 = V4F::new(0.0f32);
+                #[unroll]
+                for k in 0..4u32 {
+                    let sh = 8u32 * k;
+                    let v0 = ((qla >> V4U::new(sh)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh)) & V4U::new(3u32)) << V4U::new(4u32));
+                    let v1 = ((qlb >> V4U::new(sh)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 2u32)) & V4U::new(3u32)) << V4U::new(4u32));
+                    let v2 = ((qla >> V4U::new(sh + 4u32)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 4u32)) & V4U::new(3u32)) << V4U::new(4u32));
+                    let v3 = ((qlb >> V4U::new(sh + 4u32)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 6u32)) & V4U::new(3u32)) << V4U::new(4u32));
+                    let xo = xb + 4usize * a + k as usize;
+                    p0 += (V4F::cast_from(v0) - V4F::new(32.0f32)) * x[xo];
+                    p1 += (V4F::cast_from(v1) - V4F::new(32.0f32)) * x[xo + 8usize];
+                    p2 += (V4F::cast_from(v2) - V4F::new(32.0f32)) * x[xo + 16usize];
+                    p3 += (V4F::cast_from(v3) - V4F::new(32.0f32)) * x[xo + 24usize];
+                }
+                // scale index within the half: a + 2m, m = 0..3  -> byte (a + 2m) of w0 (a+2m < 4) or w1
+                let s0 = ((w0 >> ((8usize * a) as u32)) & 255u32) as f32;
+                let s1 = ((w0 >> ((8usize * (a + 2usize)) as u32)) & 255u32) as f32;
+                let s2 = ((w1 >> ((8usize * a) as u32)) & 255u32) as f32;
+                let s3 = ((w1 >> ((8usize * (a + 2usize)) as u32)) & 255u32) as f32;
+                // i8 -> signed
+                let f0 = s0 - 256.0f32 * (((s0 as u32) >> 7u32) as f32);
+                let f1 = s1 - 256.0f32 * (((s1 as u32) >> 7u32) as f32);
+                let f2 = s2 - 256.0f32 * (((s2 as u32) >> 7u32) as f32);
+                let f3 = s3 - 256.0f32 * (((s3 as u32) >> 7u32) as f32);
+                let e0 = p0.extract(0usize) + p0.extract(1usize) + p0.extract(2usize) + p0.extract(3usize);
+                let e1 = p1.extract(0usize) + p1.extract(1usize) + p1.extract(2usize) + p1.extract(3usize);
+                let e2 = p2.extract(0usize) + p2.extract(1usize) + p2.extract(2usize) + p2.extract(3usize);
+                let e3 = p3.extract(0usize) + p3.extract(1usize) + p3.extract(2usize) + p3.extract(3usize);
+                part += f0 * e0 + f1 * e1 + f2 * e2 + f3 * e3;
+            }
+            acc += d * part;
+            it += width;
+        }
+        let total = lane_sum(&mut sm, acc, use_plane);
+        if lane == 0usize {
+            out[o] = total;
+        }
+        o += step;
+    }
+}
+
+/// Q8_0 lane = one 32-value block.
+#[cube(launch)]
+fn q8_0_native_matvec_kernel(qs: &[V4U], dd: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < out.len() {
+        let t = o / rows;
+        let r = o % rows;
+        let mut acc = 0.0f32;
+        let mut b = lane;
+        while b < bpr {
+            let gb = r * bpr + b;
+            let d = f16_to_f32((dd[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+            let xb = (t * cols + b * 32usize) / 4usize;
+            let mut p = V4F::new(0.0f32);
+            #[unroll]
+            for a in 0..2usize {
+                let qv = qs[gb * 2usize + a];
+                #[unroll]
+                for k in 0..4u32 {
+                    let by = (qv >> V4U::new(8u32 * k)) & V4U::new(255u32);
+                    let f = V4F::cast_from(by) - V4F::new(256.0f32) * V4F::cast_from(by >> V4U::new(7u32));
+                    p += f * x[xb + 4usize * a + k as usize];
+                }
+            }
+            acc += d * (p.extract(0usize) + p.extract(1usize) + p.extract(2usize) + p.extract(3usize));
+            b += width;
+        }
+        let total = lane_sum(&mut sm, acc, use_plane);
+        if lane == 0usize {
+            out[o] = total;
+        }
+        o += step;
+    }
+}
+
+fn pack_f16_pairs(bytes: &[u8], block: usize, off: usize, n_blocks: usize) -> Vec<u32> {
+    let mut v = vec![0u32; n_blocks.div_ceil(2)];
+    for b in 0..n_blocks {
+        let h = u16::from_le_bytes([bytes[b * block + off], bytes[b * block + off + 1]]) as u32;
+        v[b / 2] |= h << (16 * (b % 2) as u32);
+    }
+    v
+}
+
+fn bytes_to_words(b: &[u8]) -> Vec<u32> {
+    b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+/// A Q6_K matrix on the device at file density (210 bytes a block, split into aligned arrays).
+pub struct GpuQ6KNative {
+    pub rows: usize,
+    pub cols: usize,
+    qq: Handle,
+    sc: Handle,
+    dd: Handle,
+    n: (usize, usize, usize),
+    dims: Handle,
+}
+
+impl GpuQ6KNative {
+    pub fn upload(gpu: &Gpu, w: QuantMat<'_>) -> Result<Self, String> {
+        if w.ty != GgmlType::Q6K || w.cols % 256 != 0 {
+            return Err("expected Q6_K with cols % 256 == 0".into());
+        }
+        let nb = w.rows * (w.cols / 256);
+        let mut qq = Vec::with_capacity(nb * 192);
+        let mut sc = Vec::with_capacity(nb * 16);
+        for blk in w.bytes.chunks_exact(210) {
+            qq.extend_from_slice(&blk[..192]);
+            sc.extend_from_slice(&blk[192..208]);
+        }
+        let dd = pack_f16_pairs(w.bytes, 210, 208, nb);
+        let (qq, sc) = (bytes_to_words(&qq), bytes_to_words(&sc));
+        let n = (qq.len(), sc.len(), dd.len());
+        Ok(Self { rows: w.rows, cols: w.cols, n, qq: gpu.upload_u32(qq), sc: gpu.upload_u32(sc), dd: gpu.upload_u32(dd), dims: gpu.const_u32(&crate::matvec_dims(w.rows, w.cols)) })
+    }
+    pub fn bytes_on_device(&self) -> usize {
+        (self.n.0 + self.n.1 + self.n.2) * 4
+    }
+    pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        let xp = GpuQ5KNative::permute_x(gpu, x, m * self.cols);
+        self.launch_permuted(gpu, &xp, m)
+    }
+    pub fn launch_permuted(&self, gpu: &Gpu, xp: &Handle, m: usize) -> Handle {
+        let n_out = m * self.rows;
+        let out = gpu.scratch(n_out * 4);
+        unsafe {
+            q6_k_native_matvec_kernel::launch(
+                &gpu.client,
+                cube_count(n_out, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.qq.clone(), self.n.0 / 4),
+                BufferArg::from_raw_parts(self.sc.clone(), self.n.1 / 4),
+                BufferArg::from_raw_parts(self.dd.clone(), self.n.2),
+                BufferArg::from_raw_parts(xp.clone(), m * self.cols / 4),
+                BufferArg::from_raw_parts(self.dims.clone(), 2),
+                BufferArg::from_raw_parts(out.clone(), n_out),
+                gpu.use_plane,
+            );
+        }
+        out
+    }
+    pub fn matvec(&self, gpu: &Gpu, x: &[f32], m: usize) -> Result<Vec<f32>, String> {
+        let xh = gpu.upload_f32(x);
+        let out = self.launch(gpu, &xh, m);
+        Ok(gpu.read_all(vec![(out, m * self.rows)])?.remove(0))
+    }
+}
+
+/// A Q8_0 matrix on the device at file density (34 bytes a block, split into aligned arrays).
+pub struct GpuQ8Native {
+    pub rows: usize,
+    pub cols: usize,
+    qs: Handle,
+    dd: Handle,
+    n: (usize, usize),
+    dims: Handle,
+}
+
+impl GpuQ8Native {
+    pub fn upload(gpu: &Gpu, w: QuantMat<'_>) -> Result<Self, String> {
+        if w.ty != GgmlType::Q8_0 || w.cols % 32 != 0 || (w.rows * (w.cols / 32)) % 1 != 0 {
+            return Err("expected Q8_0".into());
+        }
+        let nb = w.rows * (w.cols / 32);
+        let mut qs = Vec::with_capacity(nb * 32);
+        for blk in w.bytes.chunks_exact(34) {
+            qs.extend_from_slice(&blk[2..34]);
+        }
+        let dd = pack_f16_pairs(w.bytes, 34, 0, nb);
+        let qs = bytes_to_words(&qs);
+        let n = (qs.len(), dd.len());
+        Ok(Self { rows: w.rows, cols: w.cols, n, qs: gpu.upload_u32(qs), dd: gpu.upload_u32(dd), dims: gpu.const_u32(&crate::matvec_dims(w.rows, w.cols)) })
+    }
+    pub fn bytes_on_device(&self) -> usize {
+        (self.n.0 + self.n.1) * 4
+    }
+    pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        let xp = GpuQ5KNative::permute_x(gpu, x, m * self.cols);
+        self.launch_permuted(gpu, &xp, m)
+    }
+    pub fn launch_permuted(&self, gpu: &Gpu, xp: &Handle, m: usize) -> Handle {
+        let n_out = m * self.rows;
+        let out = gpu.scratch(n_out * 4);
+        unsafe {
+            q8_0_native_matvec_kernel::launch(
+                &gpu.client,
+                cube_count(n_out, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.qs.clone(), self.n.0 / 4),
+                BufferArg::from_raw_parts(self.dd.clone(), self.n.1),
+                BufferArg::from_raw_parts(xp.clone(), m * self.cols / 4),
+                BufferArg::from_raw_parts(self.dims.clone(), 2),
+                BufferArg::from_raw_parts(out.clone(), n_out),
+                gpu.use_plane,
+            );
+        }
+        out
+    }
+    pub fn matvec(&self, gpu: &Gpu, x: &[f32], m: usize) -> Result<Vec<f32>, String> {
+        let xh = gpu.upload_f32(x);
+        let out = self.launch(gpu, &xh, m);
+        Ok(gpu.read_all(vec![(out, m * self.rows)])?.remove(0))
+    }
+}
