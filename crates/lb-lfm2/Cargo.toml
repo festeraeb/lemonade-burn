@@ -12,6 +12,7 @@ default = []
 gpu = ["lb-q4-gpu"]
 # Also build the cubecl-cuda runtime (LB_CUDA_DEVICE=N); see lb-q4-gpu.
 cuda = ["gpu", "lb-q4-gpu/cuda"]
+vulkan = ["gpu", "lb-q4-gpu/vulkan"]
 
 [dependencies]
 lb-gguf.workspace = true

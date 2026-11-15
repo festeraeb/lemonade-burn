@@ -590,7 +590,11 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                     (None, Some(mi), Some((rh, bh))) if e2 => {
                         let base = mi * k_used;
                         let seq = knobs.dd_router_seq();
-                        gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), seq);
+                        if fast_router {
+                            gpu.router_topk_split(&h2, rh, bh, &prep.rscratch, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots));
+                        } else {
+                            gpu.router_topk(&h2, rh, bh, &prep.routes, &prep.weights, (n_exp, k_used, e, base, prep.n_slots), seq);
+                        }
                         fl!();
                         // the guess of the next MoE layer, from the same residual stream (`x` is this
                         // layer's x_mid here): its router on its own FFN pre-norm
@@ -598,7 +602,11 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         if let (Some((gr, gw)), Some(next)) = (prep.guess.as_ref(), prep.layers.get(li + 1)) {
                             if let (Some(nmi), Some((nr, nb))) = (next.moe_index, next.router.as_ref()) {
                                 let hn = gpu.add_rms_norm(&prep.x, None, &next.ffn_norm, e, eps);
-                                gpu.router_topk(&hn, nr, nb, gr, gw, (n_exp, k_used, e, nmi * k_used, prep.n_slots), seq);
+                                if fast_router {
+                                    gpu.router_topk_split(&hn, nr, nb, &prep.rscratch, gr, gw, (n_exp, k_used, e, nmi * k_used, prep.n_slots));
+                                } else {
+                                    gpu.router_topk(&hn, nr, nb, gr, gw, (n_exp, k_used, e, nmi * k_used, prep.n_slots), seq);
+                                }
                                 want.push((gr.clone(), prep.n_slots * 8));
                             }
                         }
