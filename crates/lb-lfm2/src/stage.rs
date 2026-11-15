@@ -416,6 +416,11 @@ pub struct StageStats {
     /// Host time issuing prefetches (predict + uploads on the side stream).
     pub issue_ns: AtomicU64,
     pub tokens: AtomicU64,
+    /// Predictor gate (`pred_min_miss`): moving average of demand misses a token, in thousandths, and the
+    /// cumulative demand count at the previous token. The residual read and the guesses run only while the average
+    /// is at least the knob, so a cache that already holds nearly everything pays nothing.
+    pub pred_ema_milli: AtomicU64,
+    pub pred_prev_demand: AtomicU64,
     /// Engine step E2: stream syncs the host waited on in device-routed decode tokens (one a layer
     /// plus the token's last read), the MoE layers that had at least one miss, and the on-device
     /// next-layer guess's score (experts of the real set it named, out of k per layer).
@@ -470,6 +475,8 @@ impl Default for StageStats {
             moe_read_ns: AtomicU64::new(0),
             issue_ns: AtomicU64::new(0),
             tokens: AtomicU64::new(0),
+            pred_ema_milli: AtomicU64::new(1_000_000),
+            pred_prev_demand: AtomicU64::new(0),
             host_syncs: AtomicU64::new(0),
             miss_layers: AtomicU64::new(0),
             moe_layers: AtomicU64::new(0),

@@ -78,6 +78,9 @@ pub struct Knobs {
     /// Predictor (`LB_PRED=1`): a guessed expert is prefetched when its probability is at least this many thousandths.
     /// `LB_PRED_THETA=0.4`. Live.
     pred_theta_milli: AtomicU32,
+    /// Predictor: it runs only while the moving average of demand misses a token is at least this many (0 = always).
+    /// `LB_PRED_MIN_MISS=6`. Live.
+    pred_min_miss: AtomicU32,
 }
 
 fn env_on(k: &str) -> bool {
@@ -108,6 +111,7 @@ impl Default for Knobs {
             e2_fuse: AtomicBool::new(env_or("LB_E2_FUSE", true)),
             e2_flush: AtomicU32::new(std::env::var("LB_E2_FLUSH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)),
             pred_theta_milli: AtomicU32::new(std::env::var("LB_PRED_THETA").ok().and_then(|v| v.trim().parse::<f32>().ok()).map(|t| (t * 1000.0).round().clamp(0.0, 1000.0) as u32).unwrap_or(400)),
+            pred_min_miss: AtomicU32::new(std::env::var("LB_PRED_MIN_MISS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6)),
             cpu_miss_admit: AtomicU32::new(std::env::var("LB_CPU_MISS_ADMIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)),
         }
     }
@@ -227,6 +231,14 @@ impl Knobs {
 
     pub fn set_e2_flush(&self, n: u32) {
         self.e2_flush.store(n, Ordering::Relaxed);
+    }
+
+    pub fn pred_min_miss(&self) -> u32 {
+        self.pred_min_miss.load(Ordering::Relaxed)
+    }
+
+    pub fn set_pred_min_miss(&self, n: u32) {
+        self.pred_min_miss.store(n, Ordering::Relaxed);
     }
 
     pub fn pred_theta(&self) -> f32 {

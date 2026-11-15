@@ -415,6 +415,18 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
         r.begin_token();
     }
     m.stats.stage.tokens.fetch_add(1, Ordering::Relaxed);
+    // predictor gate: guess only while the cache is missing (a moving average of demand misses a token)
+    let pred_active = if m.store.la.pred.is_some() {
+        let st = &m.stats.stage;
+        let od = m.stats.on_demand.load(Ordering::Relaxed);
+        let miss = od.saturating_sub(st.pred_prev_demand.swap(od, Ordering::Relaxed)) as i64 * 1000;
+        let ema = st.pred_ema_milli.load(Ordering::Relaxed) as i64;
+        let ema = (ema + (miss - ema) / 8).max(0);
+        st.pred_ema_milli.store(ema as u64, Ordering::Relaxed);
+        ema >= knobs.pred_min_miss() as i64 * 1000
+    } else {
+        true
+    };
     let mut emb = vec![0f32; e];
     m.w.embed_row(tok, &mut emb);
     gpu.write_f32(&prep.x, &emb);
@@ -593,7 +605,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         // E3: the residual stream comes back with the routes (same sync) for the host's
                         // guess of the next layer (`x` is this layer's x_mid here)
                         let la = &m.store.la;
-                        let x_at = (la.on && la.oracle.is_none()).then(|| { want.push((prep.x.clone(), e * 4)); want.len() - 1 });
+                        let x_at = (la.on && la.oracle.is_none() && pred_active).then(|| { want.push((prep.x.clone(), e * 4)); want.len() - 1 });
                         // LB_CPU_MISS: the router input comes back too (same sync), for the CPU-served misses
                         let cpu_miss = knobs.cpu_miss();
                         let h2_at = cpu_miss.then(|| { want.push((h2.clone(), e * 4)); want.len() - 1 });
