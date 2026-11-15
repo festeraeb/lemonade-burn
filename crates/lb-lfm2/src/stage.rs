@@ -135,11 +135,16 @@ pub struct LookaheadCfg {
     /// Diagnostic: a `LB_LA_TRACE` file of the same session, replayed as a perfect guess of the next
     /// layer (no x read, no router dots), to measure what overlap alone can buy (`LB_LA_ORACLE`).
     pub oracle: Option<std::path::PathBuf>,
+    /// Layers ahead the guess looks, nearest first (`LB_PRED_LEADS=2,4`; default `1..=pf_depth`). With a predictor model the
+    /// prefetch of each guess is gated by its probability instead of `min_conf` (engine step P, docs/ENGINE_PREDICTOR.md).
+    pub leads: Vec<usize>,
+    /// The logistic probability model behind `pred` (`LB_PRED=1` embedded table, `LB_PRED_MODEL=<json>` another one).
+    pub pred: Option<std::sync::Arc<PredModel>>,
 }
 
 impl Default for LookaheadCfg {
     fn default() -> Self {
-        Self { on: false, n_guess: 8, keep: false, keep_depth: 1, promote: 0, prefetch_cap: 0, min_conf: f32::NEG_INFINITY, landings: 8, cycle_window: 0, trace: None, pf_depth: 1, spare: false, ballast: 0, defer: false, worker: false, oracle: None }
+        Self { on: false, n_guess: 8, keep: false, keep_depth: 1, promote: 0, prefetch_cap: 0, min_conf: f32::NEG_INFINITY, landings: 8, cycle_window: 0, trace: None, pf_depth: 1, spare: false, ballast: 0, defer: false, worker: false, oracle: None, leads: vec![1], pred: None }
     }
 }
 
@@ -153,8 +158,18 @@ impl LookaheadCfg {
         let prefetch_cap = num("LB_LA_PREFETCH_CAP").map(|v| v as usize).unwrap_or(d.prefetch_cap);
         let trace = std::env::var("LB_LA_TRACE").ok().filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
         let oracle = std::env::var("LB_LA_ORACLE").ok().filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        let pf_depth = num("LB_LA_PF_DEPTH").map(|v| (v as usize).max(1)).unwrap_or(d.pf_depth);
+        let leads: Vec<usize> = match std::env::var("LB_PRED_LEADS") {
+            Ok(v) if !v.trim().is_empty() => v.split(',').filter_map(|x| x.trim().parse::<usize>().ok()).filter(|&x| x >= 1).collect(),
+            _ => (1..=pf_depth).collect(),
+        };
+        let pred = match std::env::var("LB_PRED_MODEL") {
+            Ok(p) if !p.trim().is_empty() => Some(std::sync::Arc::new(PredModel::from_json(&std::fs::read_to_string(p.trim()).expect("LB_PRED_MODEL file")).expect("LB_PRED_MODEL json"))),
+            _ if on("LB_PRED") => Some(std::sync::Arc::new(PredModel::default_table())),
+            _ => None,
+        };
         Self {
-            on: on("LB_LOOKAHEAD") || keep || promote > 0 || prefetch_cap > 0 || trace.is_some(),
+            on: on("LB_LOOKAHEAD") || std::env::var_os("LB_PRED_DUMP").is_some() || pred.is_some() || keep || promote > 0 || prefetch_cap > 0 || trace.is_some(),
             n_guess: num("LB_LA_N_GUESS").map(|v| v as usize).unwrap_or(d.n_guess),
             keep,
             keep_depth: num("LB_LA_KEEP_DEPTH").map(|v| v as usize).unwrap_or(d.keep_depth),
@@ -164,7 +179,9 @@ impl LookaheadCfg {
             landings: num("LB_LA_LANDINGS").map(|v| v as usize).unwrap_or(d.landings),
             cycle_window: num("LB_LA_CYCLE_W").map(|v| v as usize).unwrap_or(d.cycle_window),
             trace,
-            pf_depth: num("LB_LA_PF_DEPTH").map(|v| (v as usize).max(1)).unwrap_or(d.pf_depth),
+            pf_depth,
+            leads,
+            pred,
             spare: on("LB_LA_SPARE"),
             ballast: num("LB_LA_BALLAST").map(|v| v as usize).unwrap_or(d.ballast),
             defer: on("LB_LA_DEFER"),
@@ -190,6 +207,46 @@ pub fn expert_vram_budget(fallback_bytes: usize) -> usize {
     std::env::var("LB_EXPERT_VRAM_MIB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map(|m| m * 1024 * 1024).unwrap_or(fallback_bytes)
 }
 
+/// The probability that a guessed expert is routed, per lead (docs/ENGINE_PREDICTOR.md): a logistic model on
+/// `[score, gap to the 4th best score, ln(1 + rank), rank < 4]` of the expert in the early-routing guess, fitted
+/// on route traces (training-trace hash and held-out score are in the table's JSON).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PredModel {
+    /// Per lead: standardisation `(mu, sd)`, weights, bias.
+    pub per_lead: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>, Vec<f32>, f32)>,
+}
+
+impl PredModel {
+    pub fn from_json(txt: &str) -> Result<Self, String> {
+        let v: serde_json::Value = serde_json::from_str(txt).map_err(|e| e.to_string())?;
+        let feats: Vec<&str> = v["features"].as_array().ok_or("features")?.iter().filter_map(|x| x.as_str()).collect();
+        if feats != ["e", "gap", "log1p_rank", "rank_lt4"] {
+            return Err(format!("unsupported predictor features {feats:?}"));
+        }
+        let vec = |x: &serde_json::Value| -> Vec<f32> { x.as_array().map(|a| a.iter().filter_map(|y| y.as_f64()).map(|y| y as f32).collect()).unwrap_or_default() };
+        let mut per_lead = std::collections::HashMap::new();
+        for (k, m) in v["models"].as_object().ok_or("models")? {
+            per_lead.insert(k.parse::<usize>().map_err(|e| e.to_string())?, (vec(&m["mu"]), vec(&m["sd"]), vec(&m["w"]), m["b"].as_f64().ok_or("b")? as f32));
+        }
+        Ok(Self { per_lead })
+    }
+
+    /// The table compiled into the binary.
+    pub fn default_table() -> Self {
+        Self::from_json(include_str!("pred_model.json")).expect("embedded predictor table")
+    }
+
+    /// Probability that the expert at `rank` (0 = best) of a guess made `lead` layers ahead is routed. `score` and `gap`
+    /// (`score - scores[3]`) are the guess's own numbers. A lead the model has no row for uses the nearest one.
+    pub fn prob(&self, lead: usize, rank: usize, score: f32, gap: f32) -> f32 {
+        let key = self.per_lead.keys().copied().min_by_key(|k| (k.abs_diff(lead), *k)).unwrap_or(lead);
+        let Some((mu, sd, w, b)) = self.per_lead.get(&key) else { return 0.0 };
+        let x = [score, gap, (1.0 + rank as f32).ln(), if rank < 4 { 1.0 } else { 0.0 }];
+        let z: f32 = b + (0..4).map(|i| w[i] * (x[i] - mu[i]) / sd[i]).sum::<f32>();
+        1.0 / (1.0 + (-z).exp())
+    }
+}
+
 /// A ranked guess of one layer's experts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Guess {
@@ -203,6 +260,8 @@ pub struct Guess {
     /// `score[k]`, the best score left out of the real top-k: `scores[i] - ref_score` is expert `i`'s
     /// confidence (engine step E3), positive inside the top-k, the margin above the cut.
     pub ref_score: f32,
+    /// Layers between the layer whose state made the guess and `layer` (0 = not set by the caller).
+    pub lead: usize,
 }
 
 /// The `mid1` guess of `target`'s experts from the residual stream `x_mid` of the layer before
@@ -268,7 +327,7 @@ pub fn rank(router: &[f32], bias: &[f32], norm: &[f32], x: &[f32], eps: f32, n_e
     let ref_score = if k < n_expert { score[order[k]] } else { f32::NEG_INFINITY };
     order.truncate(slots.min(n_expert));
     let scores = order.iter().map(|&e| score[e]).collect();
-    Guess { layer, experts: order, margin, scores, ref_score }
+    Guess { layer, experts: order, margin, scores, ref_score, lead: 0 }
 }
 
 
@@ -286,7 +345,7 @@ pub type RouterCopy = (Vec<f32>, Vec<f32>, Vec<f32>);
 impl GuessWorker {
     /// `routers[l]` is `None` for a layer with no MoE FFN. For layer `l` the worker guesses `l + 1 ..=
     /// l + depth`.
-    pub fn new(routers: Vec<Option<RouterCopy>>, eps: f32, n_expert: usize, k: usize, slots: usize, depth: usize) -> Self {
+    pub fn new(routers: Vec<Option<RouterCopy>>, eps: f32, n_expert: usize, k: usize, slots: usize, leads: Vec<usize>) -> Self {
         let (tx, jobs) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
         let (out, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
@@ -294,10 +353,13 @@ impl GuessWorker {
             .spawn(move || {
                 while let Ok((li, bytes)) = jobs.recv() {
                     let x: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                    let gs: Vec<Guess> = (1..=depth)
-                        .filter_map(|d| {
+                    let gs: Vec<Guess> = leads
+                        .iter()
+                        .filter_map(|&d| {
                             let (r, b, n) = routers.get(li + d)?.as_ref()?;
-                            Some(rank(r, b, n, &x, eps, n_expert, k, slots, li + d))
+                            let mut g = rank(r, b, n, &x, eps, n_expert, k, slots, li + d);
+                            g.lead = d;
+                            Some(g)
                         })
                         .collect();
                     if out.send(gs).is_err() {
@@ -713,11 +775,24 @@ mod tests {
     }
 
     #[test]
+    fn the_embedded_predictor_table_is_monotone_in_rank() {
+        let m = PredModel::default_table();
+        assert!(m.per_lead.contains_key(&2));
+        // a guess with a large score and gap is likelier than one far down the ranking
+        let hi = m.prob(2, 0, 1.2, 0.3);
+        let lo = m.prob(2, 7, 0.8, -0.4);
+        assert!(hi > lo && (0.0..=1.0).contains(&hi) && (0.0..=1.0).contains(&lo), "{hi} {lo}");
+        // a lead without a row falls back to the nearest one
+        assert_eq!(m.prob(5, 0, 1.0, 0.1), m.prob(4, 0, 1.0, 0.1));
+    }
+
+    #[test]
     fn the_worker_gives_the_same_guess_as_the_direct_call() {
         let (router, bias, norm) = (vec![1.0f32, 0.0, 0.0, 1.0, -1.0, 0.0, 0.5, 0.5], vec![0.0f32; 4], vec![1.0f32; 2]);
         let x = [3.0f32, 4.0];
-        let direct = rank(&router, &bias, &norm, &x, 1e-6, 4, 2, 3, 1);
-        let w = GuessWorker::new(vec![None, Some((router, bias, norm))], 1e-6, 4, 2, 3, 2);
+        let mut direct = rank(&router, &bias, &norm, &x, 1e-6, 4, 2, 3, 1);
+        direct.lead = 1;
+        let w = GuessWorker::new(vec![None, Some((router, bias, norm))], 1e-6, 4, 2, 3, vec![1, 2]);
         w.send(0, x.iter().flat_map(|v| v.to_le_bytes()).collect());
         // depth 2 asks for layers 1 and 2; layer 2 does not exist, so one guess
         assert_eq!(w.recv(), vec![direct]);

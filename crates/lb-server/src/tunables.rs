@@ -92,6 +92,7 @@ enum Change {
     E2Spec(bool),
     E2Fuse(bool),
     E2Flush(u32),
+    PredTheta(u32),
     ScrapeDir(Option<PathBuf>),
     ScrapeModelId(String),
     ScrapeClassId(String),
@@ -173,6 +174,8 @@ impl Tunables {
                 "description": "E2 expert cache: fold a MoE layer's expert sum into the next pre-norm's launch (one launch fewer a layer); bit-identical logits"}));
             v.push(json!({"name": "e2_flush", "value": k.e2_flush(), "type": "int", "range": [0, 64], "scope": "live", "source": "LB_E2_FLUSH", "default": 1,
                 "description": "E2 expert cache: hand queued launches to the device thread after every Nth launch group (0 = only at the routes read, 1 = after every group); bit-identical logits; the per-sync cost falls from ~0.21 to ~0.1 ms a layer"}));
+            v.push(json!({"name": "pred_theta", "value": (k.pred_theta() * 1000.0).round() as u32, "type": "int", "range": [0, 1000], "scope": "live", "source": "LB_PRED_THETA", "default": 400,
+                "description": "next-expert predictor (LB_PRED=1): prefetch a guessed expert when its modelled probability of being routed is at least this many thousandths; higher = fewer, surer copies"}));
             v.push(json!({"name": "cpu_i8", "value": k.cpu_i8(), "type": "bool", "scope": "live", "source": "LB_CPU_I8",
                 "description": "CPU experts use the int8-activation kernel (faster on some CPUs, rounds activations to 8 bits: 98.0 % top-1 against all-resident on LFM2.5, so off by default)"}));
             v.push(json!({"name": "dd_graph", "value": k.dd_graph(), "type": "bool", "scope": "live", "source": "LB_DD_GRAPH",
@@ -255,6 +258,11 @@ impl Tunables {
                 knobs.ok_or_else(not_lfm2)?;
                 let n = value.as_u64().filter(|n| *n <= 64).ok_or_else(|| invalid(format!("expected an integer 0..=64, got {value}")))?;
                 Ok(Change::E2Flush(n as u32))
+            }
+            "pred_theta" => {
+                knobs.ok_or_else(not_lfm2)?;
+                let n = value.as_u64().filter(|n| *n <= 1000).ok_or_else(|| invalid(format!("expected an integer 0..=1000, got {value}")))?;
+                Ok(Change::PredTheta(n as u32))
             }
             "cpu_i8" => {
                 knobs.ok_or_else(not_lfm2)?;
@@ -346,6 +354,10 @@ impl Tunables {
                 }
                 Change::E2Flush(n) => {
                     self.live.knobs.as_ref().expect("validated").set_e2_flush(n);
+                    json!(n)
+                }
+                Change::PredTheta(n) => {
+                    self.live.knobs.as_ref().expect("validated").set_pred_theta_milli(n);
                     json!(n)
                 }
                 Change::CpuI8(b) => {

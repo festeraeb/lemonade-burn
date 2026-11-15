@@ -262,7 +262,7 @@ impl Lfm2 {
         let per = lb_q4_gpu::ExpertSlots::slot_bytes(nb);
         // LB_LA_SPARE: `n_landing` spare slots in the bank and two raw buffers instead of one raw buffer a landing
         let spare = n_landing > 0 && self.store.la.spare;
-        let n_sides = if spare { self.store.la.pf_depth.max(1) } else { 1 };
+        let n_sides = if spare { self.store.la.pf_depth.max(self.store.la.leads.iter().copied().max().unwrap_or(1)).max(1) } else { 1 };
         let (n_spare, n_raw) = if spare { (n_landing, 2 * n_sides) } else { (0, n_landing) };
         let n_slots = budget_bytes.saturating_sub(lb_q4_gpu::ExpertSlots::staging_bytes(nb, n_staging) + lb_q4_gpu::ExpertSlots::landing_bytes(nb, n_raw) + n_spare * per) / per;
         if n_slots < cfg.n_expert_used {
@@ -291,7 +291,7 @@ impl Lfm2 {
                 })
                 .collect();
             let la = &self.store.la;
-            cache.worker = Some(crate::stage::GuessWorker::new(routers, cfg.rms_eps, cfg.n_expert, cfg.n_expert_used, la.n_guess, la.pf_depth));
+            cache.worker = Some(crate::stage::GuessWorker::new(routers, cfg.rms_eps, cfg.n_expert, cfg.n_expert_used, la.n_guess, la.leads.clone()));
         }
         if let Some(p) = &self.store.la.oracle {
             let txt = std::fs::read_to_string(p).map_err(|e| format!("look-ahead oracle {}: {e}", p.display()))?;

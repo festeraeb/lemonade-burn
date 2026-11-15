@@ -673,9 +673,14 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                                 pending = true;
                             } else {
                                 let x_mid: Vec<f32> = bufs[i].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                guesses.extend((1..=la.pf_depth).filter_map(|d| crate::stage::predict(&m.w, li + d, &x_mid, la.n_guess)));
+                                guesses.extend(la.leads.iter().filter_map(|&d| crate::stage::predict(&m.w, li + d, &x_mid, la.n_guess).map(|mut g| { g.lead = d; g })));
                             }
                             stage.la_guess_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
+                        if let Some(i) = x_at {
+                            if std::env::var_os("LB_PRED_DUMP").is_some() {
+                                pred_dump(m, tok, pos0, li, &ids, &bufs[i]);
+                            }
                         }
                         let t_fill = Instant::now();
                         let mut guard = m.store.cache.lock().expect("expert cache");
@@ -685,7 +690,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                             let cur = *i;
                             *i += 1;
                             guesses = (1..=la.pf_depth)
-                                .filter_map(|d| passes.get(cur + d).filter(|(l, _)| *l == li + d).map(|(l, ex)| crate::stage::Guess { layer: *l, experts: ex.clone(), margin: 0.0, scores: vec![1.0; ex.len()], ref_score: 0.0 }))
+                                .filter_map(|d| passes.get(cur + d).filter(|(l, _)| *l == li + d).map(|(l, ex)| crate::stage::Guess { layer: *l, experts: ex.clone(), margin: 0.0, scores: vec![1.0; ex.len()], ref_score: 0.0, lead: d }))
                                 .collect();
                         }
                         let guess = guesses.first().cloned();
@@ -1055,6 +1060,7 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
 fn la_issue(m: &Lfm2, gpu: &Gpu, c: &mut crate::cache::ExpertCache, guesses: &[crate::stage::Guess]) {
     let (la, stage) = (&m.store.la, &m.stats.stage);
     let (cap, mc) = (la.prefetch_cap, la.min_conf);
+    let theta = m.store.knobs.pred_theta();
     let raw_b = c.slots.raw_expert_bytes() as u64;
     let Some(l) = c.landings.as_mut() else { return };
         for g in guesses.iter().filter(|_| cap > 0) {
@@ -1065,7 +1071,14 @@ fn la_issue(m: &Lfm2, gpu: &Gpu, c: &mut crate::cache::ExpertCache, guesses: &[c
                     break;
                 }
                 // the guesses are in descending score, so nothing later passes
-                if g.scores[rank] - g.ref_score < mc {
+                if let Some(pm) = la.pred.as_ref() {
+                    // the predictor's probability against the live threshold (`pred_theta`), not the raw margin
+                    let gap = g.scores[rank] - g.scores.get(3).copied().unwrap_or(g.ref_score);
+                    if pm.prob(g.lead, rank, g.scores[rank], gap) < theta {
+                        stage.guess_low_margin.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                } else if g.scores[rank] - g.ref_score < mc {
                     stage.guess_low_margin.fetch_add((g.experts.len() - rank) as u64, Ordering::Relaxed);
                     break;
                 }
@@ -1196,4 +1209,40 @@ fn prof_write(layers: &[[u64; 8]], issue_us: u64) {
 fn spec_miss_threshold() -> f32 {
     static T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var("LB_E2_SPEC_MISS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3))
+}
+
+/// `LB_PRED_DUMP=<path>`: predictor study (docs/ENGINE_PREDICTOR.md). One binary record per decode
+/// token and MoE layer: u32 token, u32 position, u32 layer, `k` u32 experts as routed, then the
+/// n_embd f32 residual stream `x_mid` (the E3 read) of that layer. `<path>.weights` holds, once, the
+/// FFN pre-norm, router and selection bias of every MoE layer so routing can be replayed offline.
+fn pred_dump(m: &Lfm2, tok: u32, pos: usize, layer: usize, ids: &[u32], x_mid: &[u8]) {
+    use std::io::Write;
+    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    let f = F.get_or_init(|| {
+        let p = std::env::var("LB_PRED_DUMP").ok().filter(|p| !p.is_empty())?;
+        if let Ok(mut w) = std::fs::File::create(format!("{p}.weights")) {
+            let cfg = &m.w.cfg;
+            let _ = w.write_all(&[cfg.n_layer as u32, cfg.n_expert as u32, cfg.n_expert_used as u32, cfg.n_embd as u32].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+            let _ = w.write_all(&cfg.rms_eps.to_le_bytes());
+            for (li, l) in m.w.layers.iter().enumerate() {
+                if let Ffn::Moe { router, bias, .. } = &l.ffn {
+                    let _ = w.write_all(&(li as u32).to_le_bytes());
+                    for v in l.ffn_norm.iter().chain(router.iter()).chain(bias.iter()) {
+                        let _ = w.write_all(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        std::fs::File::create(&p).ok().map(|f| std::sync::Mutex::new(std::io::BufWriter::with_capacity(1 << 20, f)))
+    });
+    if let Some(f) = f {
+        let mut w = f.lock().expect("pred dump");
+        let _ = w.write_all(&tok.to_le_bytes());
+        let _ = w.write_all(&(pos as u32).to_le_bytes());
+        let _ = w.write_all(&(layer as u32).to_le_bytes());
+        for &e in ids {
+            let _ = w.write_all(&e.to_le_bytes());
+        }
+        let _ = w.write_all(x_mid);
+    }
 }
