@@ -299,3 +299,26 @@ Q6_K: native costs 1.13x the time of the widened kernel at 66 % of the memory (w
 has no use; **keep `GpuQ8Mat` for Q8_0.** Correctness [max |gpu - cpu|]: real Qwen3.6 rows (3000 each, 2 tokens) Q6_K `output` 4.1e-6, `attn_q` 3.1e-6, expert down 4.8e-7; Q8_0 `attn_qkv` 3.7e-6, shared gate 1.9e-6, `ssm_out` 5.1e-6
 (same as the existing kernels); random shapes within the f32 summation tolerance. With Q5_K native (section 10), every dense and routed type of this file now has a file-density kernel
 (routed Q5_K/Q6_K experts still use the widened layout; native routed variants follow with the MoE layer in step B).
+
+## 12. Step B: the device layers, checked against the CPU decoder
+
+Code: `lb-q4-gpu/src/qwen_ops.rs` (norms, f32 matvec, the delta-net pieces, partial-rotary gated attention with KV append, router, MoE combine), `kquant.rs` (`GpuNativeExperts`: all 256 experts of a layer at file
+density, gate+up+SiLU in Q5_K, down in Q5_K or Q6_K as the file has it, routes read from a device buffer), `lb-qwen35/src/device.rs` (`DevModel`: one layer = rms norm, delta-net or gated attention, residual, rms
+norm, router + top-8 on the device, routed experts, gated shared expert, combine, residual; no host round trip inside a layer). Test `lb-qwen35/tests/device_layers.rs`, feature `cuda`, run on c4 card AF.
+
+Method: the CPU decoder (f32 activations, section 4) runs 24 real tokens (first text of `tf_ids.txt`) and records every layer's input, post-mixer residual and output. **Isolated:** each device layer is fed the CPU's own input
+for that layer, token by token, its state and KV cache evolving on the device, outputs compared. **Chain:** the device runs a block of consecutive layers from the CPU's input of the first, with its own states, compared with the CPU
+at every layer. Errors are max |device - cpu| over the 2048-wide outputs and tokens, and relative L2 (worst token). [measured]
+
+| layers (kinds) | isolated: layer output max abs / rel L2, worst | chain: after the last layer |
+|---|---|---|
+| 0-11 (9 delta-net, 3 attention, down experts Q5_K and Q6_K both present) | delta-net 9.5e-6 / 1.2e-6; attention 3.8e-6 / 9.7e-7 | 1.1e-5 / 1.5e-6 (12 layers) |
+| 14-25 (9 delta-net, 3 attention) | delta-net 1.7e-6 / 7.6e-7; attention 9.5e-7 / 7.5e-7 | 2.2e-6 / 1.1e-6 (after layer 25) |
+| 28-39 (9 delta-net, 3 attention, incl. the last layer) | delta-net 5.7e-6 / 8.7e-7; attention 1.7e-5 / 3.7e-6 (layer 31) | 9.5e-6 / 2.0e-6 (after layer 39) |
+
+Per layer the mixer output alone (before the MoE block) is at the same level (rel L2 3e-7 to 3.8e-6). Layers 12, 13, 26, 27 were not in a block; 36 of 40 layers were run. Error does not grow along the chain (rel L2 stays
+1e-6 to 3e-6 over 12 layers): it is f32 summation order and device `exp`/`sin`/`cos`, as in the dense kernels. The router's top-8 choice agreed with the CPU's at every token and layer tested (a differing expert would have shown as
+an error of the size of an expert output, 1e-2 or more). The tests assert isolated rel L2 < 1e-3 and chain < 2e-2.
+
+Not part of this step: the embedding and the LM head on the device, the layer pipeline across cards, any use of this from `lb-server`, speed (these launches run one layer at a time with scratch allocations and a host read per layer
+in the test; no throughput claim is made). Step B passes; Step C (N-card pipeline, whole model on two P100s, A-B-B-A) is next.

@@ -8,6 +8,8 @@
 //! and are dequantised row by row (`lb_gguf`, bit-identical to ggml's `to_float` on every row of the Q5_K_M file).
 
 pub mod chat;
+#[cfg(feature = "gpu")]
+pub mod device;
 pub mod tokenizer;
 
 use anyhow::{anyhow, bail, Result};
@@ -87,44 +89,44 @@ impl Config {
     }
 }
 
-struct Mat<'a>(QuantMat<'a>);
+pub(crate) struct Mat<'a>(pub(crate) QuantMat<'a>);
 
-struct Layer<'a> {
-    attn_norm: Vec<f32>,
-    post_norm: Vec<f32>,
+pub(crate) struct Layer<'a> {
+    pub(crate) attn_norm: Vec<f32>,
+    pub(crate) post_norm: Vec<f32>,
     // attention (every 4th) or delta-net
-    attn: Option<AttnW<'a>>,
-    lin: Option<LinW<'a>>,
+    pub(crate) attn: Option<AttnW<'a>>,
+    pub(crate) lin: Option<LinW<'a>>,
     // moe
-    router: Vec<f32>, // [n_expert][n_embd]
-    gate_exps: QuantMat<'a>,
-    up_exps: QuantMat<'a>,
-    down_exps: QuantMat<'a>,
-    sh_gate: Mat<'a>,
-    sh_up: Mat<'a>,
-    sh_down: Mat<'a>,
-    sh_gate_inp: Vec<f32>, // [n_embd]
+    pub(crate) router: Vec<f32>, // [n_expert][n_embd]
+    pub(crate) gate_exps: QuantMat<'a>,
+    pub(crate) up_exps: QuantMat<'a>,
+    pub(crate) down_exps: QuantMat<'a>,
+    pub(crate) sh_gate: Mat<'a>,
+    pub(crate) sh_up: Mat<'a>,
+    pub(crate) sh_down: Mat<'a>,
+    pub(crate) sh_gate_inp: Vec<f32>, // [n_embd]
 }
 
-struct AttnW<'a> {
-    q: Mat<'a>, // [n_head * head_dim * 2] rows: per head [q | gate]
-    k: Mat<'a>,
-    v: Mat<'a>,
-    o: Mat<'a>,
-    q_norm: Vec<f32>,
-    k_norm: Vec<f32>,
+pub(crate) struct AttnW<'a> {
+    pub(crate) q: Mat<'a>, // [n_head * head_dim * 2] rows: per head [q | gate]
+    pub(crate) k: Mat<'a>,
+    pub(crate) v: Mat<'a>,
+    pub(crate) o: Mat<'a>,
+    pub(crate) q_norm: Vec<f32>,
+    pub(crate) k_norm: Vec<f32>,
 }
 
-struct LinW<'a> {
-    qkv: Mat<'a>,  // attn_qkv: [conv_channels]
-    z: Mat<'a>,    // attn_gate
-    beta: Vec<f32>,  // ssm_beta [n_v_heads][n_embd]
-    alpha: Vec<f32>, // ssm_alpha [n_v_heads][n_embd]
-    conv: Vec<f32>,  // ssm_conv1d [conv_channels][d_conv]
-    a: Vec<f32>,     // ssm_a [n_v_heads] (already -exp(A_log))
-    dt_bias: Vec<f32>,
-    norm: Vec<f32>,  // ssm_norm [head_v]
-    out: Mat<'a>,    // ssm_out
+pub(crate) struct LinW<'a> {
+    pub(crate) qkv: Mat<'a>,  // attn_qkv: [conv_channels]
+    pub(crate) z: Mat<'a>,    // attn_gate
+    pub(crate) beta: Vec<f32>,  // ssm_beta [n_v_heads][n_embd]
+    pub(crate) alpha: Vec<f32>, // ssm_alpha [n_v_heads][n_embd]
+    pub(crate) conv: Vec<f32>,  // ssm_conv1d [conv_channels][d_conv]
+    pub(crate) a: Vec<f32>,     // ssm_a [n_v_heads] (already -exp(A_log))
+    pub(crate) dt_bias: Vec<f32>,
+    pub(crate) norm: Vec<f32>,  // ssm_norm [head_v]
+    pub(crate) out: Mat<'a>,    // ssm_out
 }
 
 pub struct Model<'a> {
@@ -132,7 +134,7 @@ pub struct Model<'a> {
     tok_embd: QuantMat<'a>,
     out_norm: Vec<f32>,
     output: QuantMat<'a>,
-    layers: Vec<Layer<'a>>,
+    pub(crate) layers: Vec<Layer<'a>>,
 }
 
 pub enum LayerState {
@@ -229,6 +231,7 @@ impl<'a> Model<'a> {
         let mut x = vec![0f32; c.n_embd];
         self.tok_embd.dequant_row(tok as usize, &mut x);
         for (il, l) in self.layers.iter().enumerate() {
+            tr("layer_in", il, &x);
             let h = rms_norm(&x, &l.attn_norm, c.eps);
             let a = match (&l.attn, &l.lin, &mut st.layers[il]) {
                 (Some(w), _, LayerState::Attn { k, v }) => self.attention(w, &h, st.pos, k, v),

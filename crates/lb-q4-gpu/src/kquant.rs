@@ -266,6 +266,62 @@ fn perm16_kernel(x: &[f32], y: &mut [f32]) {
     }
 }
 
+#[cube]
+fn q5n_partial(w: &[V4U], x: &[V4F], blk0: usize, xrow4: usize, bpr: usize, lane: usize, width: usize) -> f32 {
+let mut acc = 0.0f32;
+let mut it = lane;
+let items = bpr * 4usize;
+    while it < items {
+        let b = it / 4usize;
+        let j = it % 4usize;
+        let base = (blk0 + b) * 11usize;
+        let hdr = w[base];
+        let w0 = hdr.extract(0usize);
+        let d = f16_to_f32(w0 & 65535u32);
+        let dmin = f16_to_f32((w0 >> 16u32) & 65535u32);
+        let s0 = hdr.extract(1usize);
+        let s1 = hdr.extract(2usize);
+        let s2 = hdr.extract(3usize);
+        let g1 = (2usize * j) as u32;
+        let g2 = g1 + 1u32;
+        let sc1 = d * (k4_scale(s0, s1, s2, g1) as f32);
+        let sc2 = d * (k4_scale(s0, s1, s2, g2) as f32);
+        let mn1 = dmin * (k4_min(s0, s1, s2, g1) as f32);
+        let mn2 = dmin * (k4_min(s0, s1, s2, g2) as f32);
+        let xb = xrow4 + b * 64usize + 16usize * j;
+        let mut p1 = V4F::new(0.0f32);
+        let mut p2 = V4F::new(0.0f32);
+        let mut x1 = V4F::new(0.0f32);
+        let mut x2 = V4F::new(0.0f32);
+        #[unroll]
+        for a in 0..2usize {
+            let hv = w[base + 1usize + a];
+            let qv = w[base + 3usize + 2usize * j + a];
+            #[unroll]
+            for k in 0..4u32 {
+                let byte = (qv >> V4U::new(8u32 * k)) & V4U::new(255u32);
+                let h1 = (hv >> V4U::new(8u32 * k + g1)) & V4U::new(1u32);
+                let h2 = (hv >> V4U::new(8u32 * k + g2)) & V4U::new(1u32);
+                let q1 = (byte & V4U::new(15u32)) + h1 * V4U::new(16u32);
+                let q2 = (byte >> V4U::new(4u32)) + h2 * V4U::new(16u32);
+                let xv1 = x[xb + 4usize * a + k as usize];
+                let xv2 = x[xb + 8usize + 4usize * a + k as usize];
+                p1 += V4F::cast_from(q1) * xv1;
+                p2 += V4F::cast_from(q2) * xv2;
+                x1 += xv1;
+                x2 += xv2;
+            }
+        }
+        let sp1 = p1.extract(0usize) + p1.extract(1usize) + p1.extract(2usize) + p1.extract(3usize);
+        let sp2 = p2.extract(0usize) + p2.extract(1usize) + p2.extract(2usize) + p2.extract(3usize);
+        let sx1 = x1.extract(0usize) + x1.extract(1usize) + x1.extract(2usize) + x1.extract(3usize);
+        let sx2 = x2.extract(0usize) + x2.extract(1usize) + x2.extract(2usize) + x2.extract(3usize);
+        acc += sc1 * sp1 - mn1 * sx1 + sc2 * sp2 - mn2 * sx2;
+        it += width;
+    }
+    acc
+}
+
 /// Native-layout Q5_K matvec: the GGUF bytes as they are (176-byte blocks = 11 `Vector<u32,4>`, 0.6875 bytes a value), no repack.
 ///
 /// The widened layout above costs 1.5 bytes a value (2.2x the file): 26 GB of Qwen3.6 Q5_K_M would be about 50 GB on the card.
@@ -293,56 +349,7 @@ fn q5_k_native_matvec_kernel(w: &[V4U], x: &[V4F], dims: &[u32], out: &mut [f32]
     while o < out.len() {
         let t = o / rows;
         let r = o % rows;
-        let mut acc = 0.0f32;
-        let mut it = lane;
-        while it < items {
-            let b = it / 4usize;
-            let j = it % 4usize;
-            let base = (r * bpr + b) * 11usize;
-            let hdr = w[base];
-            let w0 = hdr.extract(0usize);
-            let d = f16_to_f32(w0 & 65535u32);
-            let dmin = f16_to_f32((w0 >> 16u32) & 65535u32);
-            let s0 = hdr.extract(1usize);
-            let s1 = hdr.extract(2usize);
-            let s2 = hdr.extract(3usize);
-            let g1 = (2usize * j) as u32;
-            let g2 = g1 + 1u32;
-            let sc1 = d * (k4_scale(s0, s1, s2, g1) as f32);
-            let sc2 = d * (k4_scale(s0, s1, s2, g2) as f32);
-            let mn1 = dmin * (k4_min(s0, s1, s2, g1) as f32);
-            let mn2 = dmin * (k4_min(s0, s1, s2, g2) as f32);
-            let xb = (t * cols + b * 256usize) / 4usize + 16usize * j;
-            let mut p1 = V4F::new(0.0f32);
-            let mut p2 = V4F::new(0.0f32);
-            let mut x1 = V4F::new(0.0f32);
-            let mut x2 = V4F::new(0.0f32);
-            #[unroll]
-            for a in 0..2usize {
-                let hv = w[base + 1usize + a];
-                let qv = w[base + 3usize + 2usize * j + a];
-                #[unroll]
-                for k in 0..4u32 {
-                    let byte = (qv >> V4U::new(8u32 * k)) & V4U::new(255u32);
-                    let h1 = (hv >> V4U::new(8u32 * k + g1)) & V4U::new(1u32);
-                    let h2 = (hv >> V4U::new(8u32 * k + g2)) & V4U::new(1u32);
-                    let q1 = (byte & V4U::new(15u32)) + h1 * V4U::new(16u32);
-                    let q2 = (byte >> V4U::new(4u32)) + h2 * V4U::new(16u32);
-                    let xv1 = x[xb + 4usize * a + k as usize];
-                    let xv2 = x[xb + 8usize + 4usize * a + k as usize];
-                    p1 += V4F::cast_from(q1) * xv1;
-                    p2 += V4F::cast_from(q2) * xv2;
-                    x1 += xv1;
-                    x2 += xv2;
-                }
-            }
-            let sp1 = p1.extract(0usize) + p1.extract(1usize) + p1.extract(2usize) + p1.extract(3usize);
-            let sp2 = p2.extract(0usize) + p2.extract(1usize) + p2.extract(2usize) + p2.extract(3usize);
-            let sx1 = x1.extract(0usize) + x1.extract(1usize) + x1.extract(2usize) + x1.extract(3usize);
-            let sx2 = x2.extract(0usize) + x2.extract(1usize) + x2.extract(2usize) + x2.extract(3usize);
-            acc += sc1 * sp1 - mn1 * sx1 + sc2 * sp2 - mn2 * sx2;
-            it += width;
-        }
+        let acc = q5n_partial(w, x, r * bpr, t * cols / 4usize, bpr, lane, width);
         let total = lane_sum(&mut sm, acc, use_plane);
         if lane == 0usize {
             out[o] = total;
@@ -590,6 +597,70 @@ impl GpuKExpertLayer {
 // f16 `d` packed two to a word (34 B a block). Both read activations permuted by `perm16_kernel`.
 // ---------------------------------------------------------------------------------------------------------------------------
 
+#[cube]
+fn q6n_partial(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], blk0: usize, xrow4: usize, bpr: usize, lane: usize, width: usize) -> f32 {
+let mut acc = 0.0f32;
+let mut it = lane;
+let items = bpr * 2usize;
+    while it < items {
+        let gb = blk0 + it / 2usize;
+        let h = it % 2usize;
+        let d = f16_to_f32((dd[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+        let sv = sc[gb];
+        // scale bytes 8h + c live in word 2h + c/4 of the scale vector
+        let mut w0 = sv.extract(0usize);
+        let mut w1 = sv.extract(1usize);
+        if h == 1usize {
+            w0 = sv.extract(2usize);
+            w1 = sv.extract(3usize);
+        }
+        let xb = xrow4 + (it / 2usize) * 64usize + 32usize * h;
+        let qb = gb * 12usize;
+        let mut part = 0.0f32;
+        #[unroll]
+        for a in 0..2usize {
+            let qla = qq[qb + 4usize * h + a];
+            let qlb = qq[qb + 4usize * h + a + 2usize];
+            let qhv = qq[qb + 8usize + 2usize * h + a];
+            let mut p0 = V4F::new(0.0f32);
+            let mut p1 = V4F::new(0.0f32);
+            let mut p2 = V4F::new(0.0f32);
+            let mut p3 = V4F::new(0.0f32);
+            #[unroll]
+            for k in 0..4u32 {
+                let sh = 8u32 * k;
+                let v0 = ((qla >> V4U::new(sh)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh)) & V4U::new(3u32)) << V4U::new(4u32));
+                let v1 = ((qlb >> V4U::new(sh)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 2u32)) & V4U::new(3u32)) << V4U::new(4u32));
+                let v2 = ((qla >> V4U::new(sh + 4u32)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 4u32)) & V4U::new(3u32)) << V4U::new(4u32));
+                let v3 = ((qlb >> V4U::new(sh + 4u32)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 6u32)) & V4U::new(3u32)) << V4U::new(4u32));
+                let xo = xb + 4usize * a + k as usize;
+                p0 += (V4F::cast_from(v0) - V4F::new(32.0f32)) * x[xo];
+                p1 += (V4F::cast_from(v1) - V4F::new(32.0f32)) * x[xo + 8usize];
+                p2 += (V4F::cast_from(v2) - V4F::new(32.0f32)) * x[xo + 16usize];
+                p3 += (V4F::cast_from(v3) - V4F::new(32.0f32)) * x[xo + 24usize];
+            }
+            // scale index within the half: a + 2m, m = 0..3  -> byte (a + 2m) of w0 (a+2m < 4) or w1
+            let s0 = ((w0 >> ((8usize * a) as u32)) & 255u32) as f32;
+            let s1 = ((w0 >> ((8usize * (a + 2usize)) as u32)) & 255u32) as f32;
+            let s2 = ((w1 >> ((8usize * a) as u32)) & 255u32) as f32;
+            let s3 = ((w1 >> ((8usize * (a + 2usize)) as u32)) & 255u32) as f32;
+            // i8 -> signed
+            let f0 = s0 - 256.0f32 * (((s0 as u32) >> 7u32) as f32);
+            let f1 = s1 - 256.0f32 * (((s1 as u32) >> 7u32) as f32);
+            let f2 = s2 - 256.0f32 * (((s2 as u32) >> 7u32) as f32);
+            let f3 = s3 - 256.0f32 * (((s3 as u32) >> 7u32) as f32);
+            let e0 = p0.extract(0usize) + p0.extract(1usize) + p0.extract(2usize) + p0.extract(3usize);
+            let e1 = p1.extract(0usize) + p1.extract(1usize) + p1.extract(2usize) + p1.extract(3usize);
+            let e2 = p2.extract(0usize) + p2.extract(1usize) + p2.extract(2usize) + p2.extract(3usize);
+            let e3 = p3.extract(0usize) + p3.extract(1usize) + p3.extract(2usize) + p3.extract(3usize);
+            part += f0 * e0 + f1 * e1 + f2 * e2 + f3 * e3;
+        }
+        acc += d * part;
+        it += width;
+    }
+    acc
+}
+
 /// Q6_K lane = one 128-value half block. `dims` = [rows, cols].
 #[cube(launch)]
 fn q6_k_native_matvec_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
@@ -612,64 +683,7 @@ fn q6_k_native_matvec_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], dims
     while o < out.len() {
         let t = o / rows;
         let r = o % rows;
-        let mut acc = 0.0f32;
-        let mut it = lane;
-        while it < items {
-            let gb = r * bpr + it / 2usize;
-            let h = it % 2usize;
-            let d = f16_to_f32((dd[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
-            let sv = sc[gb];
-            // scale bytes 8h + c live in word 2h + c/4 of the scale vector
-            let mut w0 = sv.extract(0usize);
-            let mut w1 = sv.extract(1usize);
-            if h == 1usize {
-                w0 = sv.extract(2usize);
-                w1 = sv.extract(3usize);
-            }
-            let xb = (t * cols + (it / 2usize) * 256usize + 128usize * h) / 4usize;
-            let qb = gb * 12usize;
-            let mut part = 0.0f32;
-            #[unroll]
-            for a in 0..2usize {
-                let qla = qq[qb + 4usize * h + a];
-                let qlb = qq[qb + 4usize * h + a + 2usize];
-                let qhv = qq[qb + 8usize + 2usize * h + a];
-                let mut p0 = V4F::new(0.0f32);
-                let mut p1 = V4F::new(0.0f32);
-                let mut p2 = V4F::new(0.0f32);
-                let mut p3 = V4F::new(0.0f32);
-                #[unroll]
-                for k in 0..4u32 {
-                    let sh = 8u32 * k;
-                    let v0 = ((qla >> V4U::new(sh)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh)) & V4U::new(3u32)) << V4U::new(4u32));
-                    let v1 = ((qlb >> V4U::new(sh)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 2u32)) & V4U::new(3u32)) << V4U::new(4u32));
-                    let v2 = ((qla >> V4U::new(sh + 4u32)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 4u32)) & V4U::new(3u32)) << V4U::new(4u32));
-                    let v3 = ((qlb >> V4U::new(sh + 4u32)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 6u32)) & V4U::new(3u32)) << V4U::new(4u32));
-                    let xo = xb + 4usize * a + k as usize;
-                    p0 += (V4F::cast_from(v0) - V4F::new(32.0f32)) * x[xo];
-                    p1 += (V4F::cast_from(v1) - V4F::new(32.0f32)) * x[xo + 8usize];
-                    p2 += (V4F::cast_from(v2) - V4F::new(32.0f32)) * x[xo + 16usize];
-                    p3 += (V4F::cast_from(v3) - V4F::new(32.0f32)) * x[xo + 24usize];
-                }
-                // scale index within the half: a + 2m, m = 0..3  -> byte (a + 2m) of w0 (a+2m < 4) or w1
-                let s0 = ((w0 >> ((8usize * a) as u32)) & 255u32) as f32;
-                let s1 = ((w0 >> ((8usize * (a + 2usize)) as u32)) & 255u32) as f32;
-                let s2 = ((w1 >> ((8usize * a) as u32)) & 255u32) as f32;
-                let s3 = ((w1 >> ((8usize * (a + 2usize)) as u32)) & 255u32) as f32;
-                // i8 -> signed
-                let f0 = s0 - 256.0f32 * (((s0 as u32) >> 7u32) as f32);
-                let f1 = s1 - 256.0f32 * (((s1 as u32) >> 7u32) as f32);
-                let f2 = s2 - 256.0f32 * (((s2 as u32) >> 7u32) as f32);
-                let f3 = s3 - 256.0f32 * (((s3 as u32) >> 7u32) as f32);
-                let e0 = p0.extract(0usize) + p0.extract(1usize) + p0.extract(2usize) + p0.extract(3usize);
-                let e1 = p1.extract(0usize) + p1.extract(1usize) + p1.extract(2usize) + p1.extract(3usize);
-                let e2 = p2.extract(0usize) + p2.extract(1usize) + p2.extract(2usize) + p2.extract(3usize);
-                let e3 = p3.extract(0usize) + p3.extract(1usize) + p3.extract(2usize) + p3.extract(3usize);
-                part += f0 * e0 + f1 * e1 + f2 * e2 + f3 * e3;
-            }
-            acc += d * part;
-            it += width;
-        }
+        let acc = q6n_partial(qq, sc, dd, x, r * bpr, t * cols / 4usize, bpr, lane, width);
         let total = lane_sum(&mut sm, acc, use_plane);
         if lane == 0usize {
             out[o] = total;
@@ -855,5 +869,212 @@ impl GpuQ8Native {
         let xh = gpu.upload_f32(x);
         let out = self.launch(gpu, &xh, m);
         Ok(gpu.read_all(vec![(out, m * self.rows)])?.remove(0))
+    }
+}
+
+// ---- routed (MoE) kernels at file density: all experts of a layer in one native-layout buffer, rows of expert e start at block
+// `(e * rows + r) * bpr`; routes are `[expert, token]` pairs. `x` is permuted (`perm16_kernel`); the gate+up pass reads one
+// permuted token row, the down pass reads the previous pass's output permuted per slot (the caller permutes it).
+
+#[cube(launch)]
+fn q5n_routed_gate_up_silu_kernel(gw: &[V4U], uw: &[V4U], x: &[V4F], routes: &[u32], dims: &[u32], h: &mut [f32], #[comptime] use_plane: bool) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < h.len() {
+        let slot = o / rows;
+        let r = o % rows;
+        let e = routes[2usize * slot] as usize;
+        let tok = routes[2usize * slot + 1usize] as usize;
+        let blk0 = (e * rows + r) * bpr;
+        let pg = q5n_partial(gw, x, blk0, tok * cols / 4usize, bpr, lane, width);
+        let pu = q5n_partial(uw, x, blk0, tok * cols / 4usize, bpr, lane, width);
+        let g = lane_sum(&mut sm, pg, use_plane);
+        let u = lane_sum(&mut sm, pu, use_plane);
+        if lane == 0usize {
+            h[o] = g / (1.0f32 + Exp::exp(-g)) * u;
+        }
+        o += step;
+    }
+}
+
+#[cube(launch)]
+fn q5n_routed_down_kernel(w: &[V4U], h: &[V4F], routes: &[u32], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < out.len() {
+        let slot = o / rows;
+        let r = o % rows;
+        let e = routes[2usize * slot] as usize;
+        let p = q5n_partial(w, h, (e * rows + r) * bpr, slot * cols / 4usize, bpr, lane, width);
+        let v = lane_sum(&mut sm, p, use_plane);
+        if lane == 0usize {
+            out[o] = v;
+        }
+        o += step;
+    }
+}
+
+#[cube(launch)]
+fn q6n_routed_down_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], h: &[V4F], routes: &[u32], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut width = CUBE_DIM_X as usize;
+    let mut plane_id = 0usize;
+    let mut lane = UNIT_POS as usize;
+    if use_plane {
+        width = PLANE_DIM as usize;
+        plane_id = (UNIT_POS / PLANE_DIM) as usize;
+        lane = UNIT_POS_PLANE as usize;
+    }
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut o = CUBE_POS as usize * ppc + plane_id;
+    while o < out.len() {
+        let slot = o / rows;
+        let r = o % rows;
+        let e = routes[2usize * slot] as usize;
+        let p = q6n_partial(qq, sc, dd, h, (e * rows + r) * bpr, slot * cols / 4usize, bpr, lane, width);
+        let v = lane_sum(&mut sm, p, use_plane);
+        if lane == 0usize {
+            out[o] = v;
+        }
+        o += step;
+    }
+}
+
+/// Expert down matrices at file density: Q5_K or Q6_K (the file mixes them by layer).
+pub enum NativeDown {
+    Q5 { w: Handle, n: usize },
+    Q6 { qq: Handle, sc: Handle, dd: Handle, n: (usize, usize, usize) },
+}
+
+/// All experts of one `qwen35moe` layer at file density, routes read from a device buffer (`[expert, token]` pairs, `slots` of them).
+pub struct GpuNativeExperts {
+    pub n_expert: usize,
+    pub embd: usize,
+    pub ff: usize,
+    gw: Handle,
+    uw: Handle,
+    n_gu: usize,
+    down: NativeDown,
+}
+
+impl GpuNativeExperts {
+    pub fn upload(gpu: &Gpu, n_expert: usize, gate: QuantMat<'_>, up: QuantMat<'_>, down: QuantMat<'_>) -> Result<Self, String> {
+        if gate.ty != GgmlType::Q5K || up.ty != GgmlType::Q5K || !matches!(down.ty, GgmlType::Q5K | GgmlType::Q6K) {
+            return Err("expected Q5_K gate/up and Q5_K or Q6_K down".into());
+        }
+        let (ff, embd) = (gate.rows / n_expert, gate.cols);
+        let gw = bytes_to_words(gate.bytes);
+        let uw = bytes_to_words(up.bytes);
+        let n_gu = gw.len();
+        let down = if down.ty == GgmlType::Q5K {
+            let w = bytes_to_words(down.bytes);
+            let n = w.len();
+            NativeDown::Q5 { w: gpu.upload_u32(w), n }
+        } else {
+            let nb = down.rows * (down.cols / 256);
+            let mut qq = Vec::with_capacity(nb * 192);
+            let mut sc = Vec::with_capacity(nb * 16);
+            for blk in down.bytes.chunks_exact(210) {
+                qq.extend_from_slice(&blk[..192]);
+                sc.extend_from_slice(&blk[192..208]);
+            }
+            let dd = pack_f16_pairs(down.bytes, 210, 208, nb);
+            let (qq, sc) = (bytes_to_words(&qq), bytes_to_words(&sc));
+            let n = (qq.len(), sc.len(), dd.len());
+            NativeDown::Q6 { qq: gpu.upload_u32(qq), sc: gpu.upload_u32(sc), dd: gpu.upload_u32(dd), n }
+        };
+        Ok(Self { n_expert, embd, ff, gw: gpu.upload_u32(gw), uw: gpu.upload_u32(uw), n_gu, down })
+    }
+
+    pub fn bytes_on_device(&self) -> usize {
+        2 * self.n_gu * 4
+            + match &self.down {
+                NativeDown::Q5 { n, .. } => n * 4,
+                NativeDown::Q6 { n, .. } => (n.0 + n.1 + n.2) * 4,
+            }
+    }
+
+    /// `x` (one token, `embd` values, already on the device) through the experts named by `routes` (`2 * slots` u32):
+    /// returns `[slots, embd]` per-slot outputs (router weights not applied).
+    pub fn launch(&self, gpu: &Gpu, x: &Handle, routes: &Handle, slots: usize) -> Handle {
+        let xp = GpuQ5KNative::permute_x(gpu, x, self.embd);
+        let h = gpu.scratch(slots * self.ff * 4);
+        let out = gpu.scratch(slots * self.embd * 4);
+        let d_gu = gpu.const_u32(&[self.ff as u32, self.embd as u32]);
+        let d_dn = gpu.const_u32(&[self.embd as u32, self.ff as u32]);
+        unsafe {
+            q5n_routed_gate_up_silu_kernel::launch(
+                &gpu.client,
+                cube_count(slots * self.ff, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(self.gw.clone(), self.n_gu / 4),
+                BufferArg::from_raw_parts(self.uw.clone(), self.n_gu / 4),
+                BufferArg::from_raw_parts(xp, self.embd / 4),
+                BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                BufferArg::from_raw_parts(d_gu, 2),
+                BufferArg::from_raw_parts(h.clone(), slots * self.ff),
+                gpu.use_plane,
+            );
+        }
+        let hp = GpuQ5KNative::permute_x(gpu, &h, slots * self.ff);
+        unsafe {
+            match &self.down {
+                NativeDown::Q5 { w, n } => q5n_routed_down_kernel::launch(
+                    &gpu.client,
+                    cube_count(slots * self.embd, gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(w.clone(), n / 4),
+                    BufferArg::from_raw_parts(hp, slots * self.ff / 4),
+                    BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                    BufferArg::from_raw_parts(d_dn, 2),
+                    BufferArg::from_raw_parts(out.clone(), slots * self.embd),
+                    gpu.use_plane,
+                ),
+                NativeDown::Q6 { qq, sc, dd, n } => q6n_routed_down_kernel::launch(
+                    &gpu.client,
+                    cube_count(slots * self.embd, gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(qq.clone(), n.0 / 4),
+                    BufferArg::from_raw_parts(sc.clone(), n.1 / 4),
+                    BufferArg::from_raw_parts(dd.clone(), n.2),
+                    BufferArg::from_raw_parts(hp, slots * self.ff / 4),
+                    BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                    BufferArg::from_raw_parts(d_dn, 2),
+                    BufferArg::from_raw_parts(out.clone(), slots * self.embd),
+                    gpu.use_plane,
+                ),
+            }
+        }
+        out
     }
 }

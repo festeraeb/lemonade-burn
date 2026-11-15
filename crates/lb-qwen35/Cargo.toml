@@ -6,7 +6,13 @@ license.workspace = true
 publish.workspace = true
 description = "qwen35moe (Qwen3.5/3.6 MoE: gated delta-net + gated attention hybrid) CPU reference decoder and teacher-forced check"
 
+[features]
+default = []
+gpu = ["dep:lb-q4-gpu"]
+cuda = ["gpu", "lb-q4-gpu/cuda"]
+
 [dependencies]
+lb-q4-gpu = { workspace = true, optional = true }
 lb-gguf.workspace = true
 rayon.workspace = true
 half = "2"
