@@ -262,3 +262,24 @@ Order of value per day: Tiel (1 day, same cards), Qwen3-Coder-Next (about 1 week
 4. Wire the family into `lb-server` (architecture dispatch is LFM2-only), `/v1/chat/completions` template, then the gate again on the device path against the CPU decoder (this one), where
    f32-order agreement (not llama.cpp's rounding) is the right standard: the CPU decoder here is the oracle.
 5. Then the manifest entry and demand class (section 7).
+
+## 10. Continuation (same day): native Q5_K tuned
+
+The native-layout Q5_K kernel was rewritten: one lane per 64-value chunk, `Vector<u32,4>` loads of the header, `qh` and `qs` (a 176-byte block is 11 aligned
+16-byte vectors), four-wide x vectors, with the activation row permuted inside every 16 values by a small launch (`perm16_kernel`, folded into `launch`; callers sharing one x across
+matrices can permute once and use `launch_permuted`). [measured, P100 AF, 16384 x 2048, includes the permute launch]
+
+| layout | us per matvec | bytes on device | bandwidth of resident bytes |
+|---|---|---|---|
+| widened | 149.0 | 50.3 MB | 338 GB/s |
+| native, before | 505.7 | 23.1 MB | 46 GB/s |
+| **native, now** | **144.5** | 23.1 MB | 160 GB/s |
+
+The native kernel is now as fast as the widened one at 46 % of the memory (the target was within 2x of the widened kernel's bandwidth: it exceeds it in time). Correctness unchanged: the same tests
+(random shapes, real `attn_gate`, `token_embd`, expert rows) pass, max error 1.4e-6 to 2.4e-6 on real rows. That removes the capacity objection to Q5_K on two 16 GB cards.
+
+Not done from the coordinator's follow-up list, stated plainly: native Q6_K and Q8_0 kernels (210- and 34-byte blocks are only 2-byte aligned: they need u16 loads, a different design from the vector
+one above), the device delta-net / gated-attention / MoE layers, the N-card layer pipeline, `lb-server` dispatch, the measurement against llama.cpp's 54.1 tok/s, the manifest and demand entries, the Tiel run, and the
+`LB_WARMUP` first-long-prompt cost. None of them was started; the speed gate (>= 54 tok/s) is therefore neither met nor measured. The revised gates (device against the CPU decoder at top-1 >= 99.9 %; against
+llama.cpp no worse than its own 97.37 % / 0.0064) are stated here as the acceptance tests for that work; the 99.5 % gate against a single llama.cpp path stands as not met, for the reason in section 5
+(its own two paths agree at 97.37 %).

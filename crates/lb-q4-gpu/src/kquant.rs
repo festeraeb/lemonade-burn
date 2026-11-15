@@ -222,17 +222,62 @@ fn q5_k_routed_matvec_kernel(qv: &[V4U], sd: &[f32], mn: &[f32], h: &[V4F], rout
     }
 }
 
-/// Native-layout Q5_K matvec: the GGUF bytes as they are (176-byte blocks = 44 u32 words, 0.6875 bytes a value), no repack.
+/// Byte `i` (0..12) of the packed Q4_K/Q5_K scale block held in three words.
+#[cube]
+fn sbyte(s0: u32, s1: u32, s2: u32, i: u32) -> u32 {
+    let mut w = s0;
+    if i >= 8u32 {
+        w = s2;
+    } else if i >= 4u32 {
+        w = s1;
+    }
+    (w >> ((i % 4u32) * 8u32)) & 255u32
+}
+
+#[cube]
+fn k4_scale(s0: u32, s1: u32, s2: u32, g: u32) -> u32 {
+    let mut r = sbyte(s0, s1, s2, g) & 63u32;
+    if g >= 4u32 {
+        r = (sbyte(s0, s1, s2, g + 4u32) & 15u32) | ((sbyte(s0, s1, s2, g - 4u32) >> 6u32) << 4u32);
+    }
+    r
+}
+
+#[cube]
+fn k4_min(s0: u32, s1: u32, s2: u32, g: u32) -> u32 {
+    let mut r = sbyte(s0, s1, s2, g + 4u32) & 63u32;
+    if g >= 4u32 {
+        r = (sbyte(s0, s1, s2, g + 4u32) >> 4u32) | ((sbyte(s0, s1, s2, g) >> 6u32) << 4u32);
+    }
+    r
+}
+
+/// Permute an activation row inside every 16 values (a 4x4 transpose): `y[16a + 4j + i] = x[16a + 4i + j]`. The native Q5_K kernel
+/// reads four file words at once (lane i = word i, byte j = value 4i + j), so its x vectors must hold values `4i + j` across `i`.
+#[cube(launch)]
+fn perm16_kernel(x: &[f32], y: &mut [f32]) {
+    let o = ABSOLUTE_POS as usize;
+    if o < y.len() {
+        let a = o / 16usize;
+        let r = o % 16usize;
+        let j = r / 4usize;
+        let i = r % 4usize;
+        y[o] = x[a * 16usize + 4usize * i + j];
+    }
+}
+
+/// Native-layout Q5_K matvec: the GGUF bytes as they are (176-byte blocks = 11 `Vector<u32,4>`, 0.6875 bytes a value), no repack.
 ///
 /// The widened layout above costs 1.5 bytes a value (2.2x the file): 26 GB of Qwen3.6 Q5_K_M would be about 50 GB on the card.
-/// This kernel keeps the file's density (so 25 GB of weights fit across two 16 GB cards) and pays bit extraction in the kernel.
-/// One lane per (block, 32-value group) work item; `dims` = [rows, cols].
+/// This kernel keeps the file's density. One lane takes one 64-value chunk of a block (low nibbles = group 2j, high = group 2j+1):
+/// five 16-byte loads (header, two of `qh`, two of `qs`) and sixteen activation vector loads, four values per lane-vector.
+/// `x` must be permuted with `perm16_kernel`. `dims` = [rows, cols].
 #[cube(launch)]
-fn q5_k_native_matvec_kernel(w: &[u32], x: &[f32], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
+fn q5_k_native_matvec_kernel(w: &[V4U], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
     let bpr = cols / 256usize;
-    let items = bpr * 8usize;
+    let items = bpr * 4usize;
     let mut sm = Shared::<[f32]>::new_slice(256usize);
     let mut width = CUBE_DIM_X as usize;
     let mut plane_id = 0usize;
@@ -249,55 +294,54 @@ fn q5_k_native_matvec_kernel(w: &[u32], x: &[f32], dims: &[u32], out: &mut [f32]
         let t = o / rows;
         let r = o % rows;
         let mut acc = 0.0f32;
-        let mut j = lane;
-        while j < items {
-            let b = j / 8usize;
-            let g = j % 8usize;
-            let base = (r * bpr + b) * 44usize;
-            let w0 = w[base];
+        let mut it = lane;
+        while it < items {
+            let b = it / 4usize;
+            let j = it % 4usize;
+            let base = (r * bpr + b) * 11usize;
+            let hdr = w[base];
+            let w0 = hdr.extract(0usize);
             let d = f16_to_f32(w0 & 65535u32);
             let dmin = f16_to_f32((w0 >> 16u32) & 65535u32);
-            // 6-bit scale and min of group g from the 12 packed bytes (words base+1 .. base+3)
-            let mut sc = 0u32;
-            let mut mn = 0u32;
-            if g < 4usize {
-                // bytes g and g + 4
-                sc = (w[base + 1usize + g / 4usize] >> (((g % 4usize) * 8usize) as u32)) & 63u32;
-                mn = (w[base + 1usize + (g + 4usize) / 4usize] >> ((((g + 4usize) % 4usize) * 8usize) as u32)) & 63u32;
-            } else {
-                // low nibbles from byte g + 4, top two bits from byte g - 4 (scale) and byte g (min)
-                let bs = (w[base + 1usize + (g + 4usize) / 4usize] >> ((((g + 4usize) % 4usize) * 8usize) as u32)) & 255u32;
-                let bt = (w[base + 1usize + (g - 4usize) / 4usize] >> ((((g - 4usize) % 4usize) * 8usize) as u32)) & 255u32;
-                let bm = (w[base + 1usize + g / 4usize] >> (((g % 4usize) * 8usize) as u32)) & 255u32;
-                sc = (bs & 15u32) | ((bt >> 6u32) << 4u32);
-                mn = (bs >> 4u32) | ((bm >> 6u32) << 4u32);
-            }
-            let s = d * (sc as f32);
-            let m = dmin * (mn as f32);
-            let hi = (g % 2usize) as u32 * 4u32;
-            let gshift = g as u32;
-            let qs0 = base + 12usize + 8usize * (g / 2usize);
-            let qh0 = base + 4usize;
-            let xb = t * cols + b * 256usize + 32usize * g;
-            let mut qx = 0.0f32;
-            let mut xs = 0.0f32;
+            let s0 = hdr.extract(1usize);
+            let s1 = hdr.extract(2usize);
+            let s2 = hdr.extract(3usize);
+            let g1 = (2usize * j) as u32;
+            let g2 = g1 + 1u32;
+            let sc1 = d * (k4_scale(s0, s1, s2, g1) as f32);
+            let sc2 = d * (k4_scale(s0, s1, s2, g2) as f32);
+            let mn1 = dmin * (k4_min(s0, s1, s2, g1) as f32);
+            let mn2 = dmin * (k4_min(s0, s1, s2, g2) as f32);
+            let xb = (t * cols + b * 256usize) / 4usize + 16usize * j;
+            let mut p1 = V4F::new(0.0f32);
+            let mut p2 = V4F::new(0.0f32);
+            let mut x1 = V4F::new(0.0f32);
+            let mut x2 = V4F::new(0.0f32);
             #[unroll]
-            for wi in 0..8usize {
-                let qw = w[qs0 + wi];
-                let hw = w[qh0 + wi];
+            for a in 0..2usize {
+                let hv = w[base + 1usize + a];
+                let qv = w[base + 3usize + 2usize * j + a];
                 #[unroll]
-                for k in 0..4usize {
-                    let sh = (k * 8usize) as u32;
-                    let nib = (qw >> (sh + hi)) & 15u32;
-                    let hb = (hw >> (sh + gshift)) & 1u32;
-                    let q = (nib + hb * 16u32) as f32;
-                    let xv = x[xb + wi * 4usize + k];
-                    qx += q * xv;
-                    xs += xv;
+                for k in 0..4u32 {
+                    let byte = (qv >> V4U::new(8u32 * k)) & V4U::new(255u32);
+                    let h1 = (hv >> V4U::new(8u32 * k + g1)) & V4U::new(1u32);
+                    let h2 = (hv >> V4U::new(8u32 * k + g2)) & V4U::new(1u32);
+                    let q1 = (byte & V4U::new(15u32)) + h1 * V4U::new(16u32);
+                    let q2 = (byte >> V4U::new(4u32)) + h2 * V4U::new(16u32);
+                    let xv1 = x[xb + 4usize * a + k as usize];
+                    let xv2 = x[xb + 8usize + 4usize * a + k as usize];
+                    p1 += V4F::cast_from(q1) * xv1;
+                    p2 += V4F::cast_from(q2) * xv2;
+                    x1 += xv1;
+                    x2 += xv2;
                 }
             }
-            acc += s * qx - m * xs;
-            j += width;
+            let sp1 = p1.extract(0usize) + p1.extract(1usize) + p1.extract(2usize) + p1.extract(3usize);
+            let sp2 = p2.extract(0usize) + p2.extract(1usize) + p2.extract(2usize) + p2.extract(3usize);
+            let sx1 = x1.extract(0usize) + x1.extract(1usize) + x1.extract(2usize) + x1.extract(3usize);
+            let sx2 = x2.extract(0usize) + x2.extract(1usize) + x2.extract(2usize) + x2.extract(3usize);
+            acc += sc1 * sp1 - mn1 * sx1 + sc2 * sp2 - mn2 * sx2;
+            it += width;
         }
         let total = lane_sum(&mut sm, acc, use_plane);
         if lane == 0usize {
@@ -329,7 +373,22 @@ impl GpuQ5KNative {
         self.n_words * 4
     }
 
+    /// `out = x @ W^T`; permutes `x` first (one small launch). Callers sharing one activation across matrices use
+    /// [`permute_x`](Self::permute_x) once and [`launch_permuted`](Self::launch_permuted).
     pub fn launch(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        let xp = Self::permute_x(gpu, x, m * self.cols);
+        self.launch_permuted(gpu, &xp, m)
+    }
+
+    pub fn permute_x(gpu: &Gpu, x: &Handle, n: usize) -> Handle {
+        let y = gpu.scratch(n * 4);
+        unsafe {
+            perm16_kernel::launch(&gpu.client, cube_count(n, gpu.cube_dim), CubeDim::new_1d(gpu.cube_dim as u32), BufferArg::from_raw_parts(x.clone(), n), BufferArg::from_raw_parts(y.clone(), n));
+        }
+        y
+    }
+
+    pub fn launch_permuted(&self, gpu: &Gpu, xp: &Handle, m: usize) -> Handle {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
         unsafe {
@@ -337,8 +396,8 @@ impl GpuQ5KNative {
                 &gpu.client,
                 cube_count(n_out, gpu.per_cube()),
                 CubeDim::new_1d(gpu.cube_dim as u32),
-                BufferArg::from_raw_parts(self.w.clone(), self.n_words),
-                BufferArg::from_raw_parts(x.clone(), m * self.cols),
+                BufferArg::from_raw_parts(self.w.clone(), self.n_words / 4),
+                BufferArg::from_raw_parts(xp.clone(), m * self.cols / 4),
                 BufferArg::from_raw_parts(self.dims.clone(), 2),
                 BufferArg::from_raw_parts(out.clone(), n_out),
                 gpu.use_plane,

@@ -3985,6 +3985,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-qwen35"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "clap",
+ "half",
+ "lb-gguf",
+ "rayon",
+ "tokenizers",
+]
+
+[[package]]
 name = "lb-server"
 version = "0.1.0"
 dependencies = [
