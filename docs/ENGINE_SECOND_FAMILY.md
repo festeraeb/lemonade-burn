@@ -373,3 +373,17 @@ speed gate (>= 54, matching llama.cpp) is missed by a hair through the server. W
 
 **The Part 0 leftover (first long prompt after boot 8-9 s).** Measured on the LFM2.5 seat entry, first 419-token request: `LB_WARMUP` 0: 7.0 s, 8: 7.8 s, 96: 8.8 s, 512: 13.9 s, 1024: 24.0 s. So it is not a missing one-time kernel compile that a longer warm-up could pay: the first request costs about 7 s whatever, and each warm-up token adds ~10-20 ms to it
 (the warm-up's own long run is paid again at the first request, which points at per-sequence device state or checkpoint release in the first request after a warm-up sequence). Not fixed; cause not isolated; a longer warm-up makes it worse. The same server shape on the Qwen path shows a 4.8-5.3 s first request (about 25 prompt tokens) against 0.6-0.8 s afterwards, so it is a property of the server's first request, not of the LFM2 kernels.
+
+Repeat server runs of the same client after the A-B-B-A (build `20261115-qwen35-26dc5f2`, the build the manifest entry names): 52.8 while c4's load average was 10 (a neighbour job), 54.5 on a quiet c4 (median of five prompts, 54.1-54.7). So through the server it sits between 53 and 54.5 tok/s depending on c4's host load,
+which is the llama.cpp figure (54.0) within noise, not above it with any margin; the in-process figure is 55.8. The manifest entry points at `26dc5f2`.
+
+## 14. Tiel-Coder-35B-A3B (UD-Q5_K_XL) through the same path
+
+Same architecture string and keys; the file's types differ (section 8): gate/up Q5_K except Q6_K in layer 1, down Q6_K except Q8_0 in layers 1, 34, 38, 39, shared experts and attention Q8_0, head and embedding Q8_0. Code added for it: routed Q6_K gate+up kernel, routed Q8_0 down kernel (`q8n_routed_down_mr_kernel`), Q8_0 head in the pipeline.
+No change to the decoder or the layer code. [measured]
+
+* Layers isolated against the CPU decoder (all four of its Q6_K/Q8_0 expert layers included, layer blocks 0-11, 14-25, 28-39): relative L2 <= 1.4e-6 for delta-net and attention layers except attention layer 31 (8.6e-6, max abs 4.0e-5), chains of 12 layers <= 1.1e-5 (after layer 34).
+* Teacher-forced, same 570 positions, two cards, graphs on: **device vs the CPU decoder 570 / 570 = 100 %**, max logit difference 3.2e-4 (mean 2.4e-5), mean KL 1.2e-11. Device vs llama.cpp (batch path): 95.09 % (542/570), mean KL 0.01503; llama.cpp batch vs its own single-token path (same run): 94.56 % (539/570), mean KL 0.01783. The device is no
+  worse than llama.cpp's own self-agreement on both measures. Tiel agrees less with llama.cpp than Qwen3.6 does (95.1 % vs 98.4 %), and llama.cpp agrees less with itself on it by about the same amount (94.6 % vs 97.4 %): the fine-tune has more near-tie positions, the cause is the reference's own rounding, as for Qwen.
+* Speed: in-process 65.6 tok/s, through `lb-server` 63.5-64.2 (median 63.7) on AF + D8 with the same five prompts (cheaper than Qwen3.6 because its attention and shared experts are Q8_0, which has the fast kernel). llama.cpp and Nauti-Strata were not run on Tiel.
+* No manifest entry was added for Tiel (the on-demand report's `tiel-c4` standing seat is the one-card spill setup; a two-card own-engine Tiel entry is the same shape as `hard-qwen36-own-2card-c4` with the Tiel file and model id, to add if wanted).
