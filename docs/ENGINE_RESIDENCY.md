@@ -76,13 +76,13 @@ Speed, A-B-B-A [measured] (same `cm.py` prompts, 288 tokens x 5, text identical 
 
 | budget | arm | tok/s median | x base | ms/token |
 |---|---|---|---|---|
-| 12500 (cache forced, hit ~1.0) | base | 50.93 | 1.000 | 19.6 |
-| 12500 | spec | 54.82 | **1.076** (1.059-1.088) | 18.2 |
-| 8192 | base / spec | 39.67 / 39.64 | 0.999 | 25.2 |
-| 5120 | base | 24.44 | 1.000 | 40.9 |
-| 5120 | spec | 24.16 | 0.989 | 41.4 |
-| 5120 | CPU exact | 28.75 | 1.176 | 34.8 |
-| 5120 | CPU exact + spec | 27.54 | 1.127 | 36.3 |
+| 12500 (cache forced, hit ~1.0) | base | 50.76 | 1.000 | 19.7 |
+| 12500 | spec | 54.86 | **1.081** (paired 1.059-1.122) | 18.2 |
+| 8192 | base / spec | 39.66 / 39.66 | 1.000 | 25.2 |
+| 5120 | base | 24.52 | 1.000 | 40.8 |
+| 5120 | spec | 24.09 | 0.982 | 41.5 |
+| 5120 | CPU exact | 28.96 | 1.182 | 34.5 |
+| 5120 | CPU exact + spec | 27.65 | 1.128 | 36.2 |
 | 3072 | base | 17.94 | 1.000 | 55.7 |
 | 3072 | spec | 17.64 | 0.983 | 56.7 |
 | 3072 | CPU exact | 20.57 | 1.147 | 48.6 |
@@ -96,7 +96,7 @@ At 100 % hit the E2 token went from 19.9 to 18.2 ms; the 9.9 ms all-resident flo
 host, is the limit once the read is no longer behind the experts, and the E2 layer still launches ~3 more kernels than
 the fused all-resident layer (router, translate, sum, next-layer norm unfused).
 
-Verdict: stays behind the switch, default off. It only pays when the cache holds nearly every expert (+7.6 % at 12500 MiB),
+Verdict: stays behind the switch, default off. It only pays when the cache holds nearly every expert (+8 % at 12500 MiB),
 is neutral at 8192, and is 1-4 % slower at 5120 and 3072 even with the per-layer rule, so it fails the "never slower"
 condition for a default.
 
