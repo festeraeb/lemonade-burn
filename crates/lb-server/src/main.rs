@@ -39,6 +39,8 @@ use tokio::sync::mpsc;
 
 pub const RUNTIME_NAME: &str = "lemonade-burn";
 
+#[cfg(feature = "qwen")]
+mod qwen;
 pub mod tunables;
 use tunables::{LiveTargets, Tunables};
 
@@ -706,7 +708,24 @@ fn main() -> Result<()> {
     let default_max_tokens = Arc::new(AtomicUsize::new(args.default_max_tokens));
     type Loaded = (Arc<TextCodec>, usize, String, &'static str, Option<Arc<lb_lfm2::moe::PlacementStats>>, Option<Arc<lb_lfm2::model::Timings>>, LiveTargets);
     let mut w2w: Option<Arc<lb_lfm2::remote::RemoteTier>> = None;
-    let (codec, ctx, model_id, kernel, placement, timings, live): Loaded = if is_gguf {
+    #[cfg(feature = "qwen")]
+    let is_qwen = is_gguf && qwen::is_qwen(&args.model);
+    #[cfg(not(feature = "qwen"))]
+    let is_qwen = false;
+    let (codec, ctx, model_id, kernel, placement, timings, live): Loaded = if is_qwen {
+        #[cfg(feature = "qwen")]
+        {
+            let (model, codec, ctx) = qwen::load(&args.model, args.ctx)?;
+            let model_id = args.model_id.clone().unwrap_or_else(|| args.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "qwen35moe".into()));
+            let kernel = model.kernel_name();
+            let live = LiveTargets { knobs: None, scraper: None, default_max_tokens: default_max_tokens.clone(), ctx };
+            let wc = codec.clone();
+            std::thread::Builder::new().name("lb-model".into()).spawn(move || worker(model, wc, jrx))?;
+            (codec, ctx, model_id, kernel, None, None, live)
+        }
+        #[cfg(not(feature = "qwen"))]
+        unreachable!()
+    } else if is_gguf {
         let mut model = lb_lfm2::Lfm2::load(&args.model, &dev)?;
         let cfg = model.cfg().clone();
         model.store.knobs.set_miss_policy(lb_lfm2::moe::MissPolicy::parse(&args.miss_policy).map_err(|e| anyhow::anyhow!(e))?);

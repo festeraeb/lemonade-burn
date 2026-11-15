@@ -17,6 +17,9 @@ pub enum ChatStyle {
     BitNet,
     /// ChatML (LFM2): `<|im_start|>role\ncontent<|im_end|>\n` ... `<|im_start|>assistant\n`.
     ChatMl,
+    /// Qwen3.5/3.6 (`qwen35moe`): ChatML, no BOS token, generation prompt `<think>\n` (or `<think>\n\n</think>\n\n` when the
+    /// caller asks for no thinking via the `<think></think>` suffix).
+    Qwen35,
 }
 
 pub struct TextCodec {
@@ -56,7 +59,7 @@ impl TextCodec {
     }
 
     pub fn render_chat(&self, messages: &[ChatMessage]) -> String {
-        if self.style == ChatStyle::ChatMl {
+        if self.style == ChatStyle::ChatMl || self.style == ChatStyle::Qwen35 {
             let mut s = String::new();
             for m in messages {
                 s.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content.trim()));
@@ -86,6 +89,15 @@ impl TextCodec {
     /// `<think></think>` to answer without reasoning).
     pub fn encode_chat_suffix(&self, messages: &[ChatMessage], suffix: &str) -> Result<Vec<u32>> {
         let mut text = self.render_chat(messages);
+        if self.style == ChatStyle::Qwen35 {
+            text.push_str(match suffix {
+                "" => "<think>\n",
+                "<think></think>" => "<think>\n\n</think>\n\n",
+                other => other,
+            });
+            let enc = self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("encode: {e}"))?;
+            return Ok(enc.get_ids().to_vec());
+        }
         text.push_str(suffix);
         let enc = self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("encode: {e}"))?;
         let mut ids = vec![self.bos];

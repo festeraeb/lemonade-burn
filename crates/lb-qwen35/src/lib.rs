@@ -207,6 +207,11 @@ impl<'a> Model<'a> {
         Ok(Model { tok_embd: qmat(g, "token_embd.weight")?, out_norm: f32v(g, "output_norm.weight")?, output: qmat(g, "output.weight")?, layers, cfg })
     }
 
+    /// `qwen35moe.context_length` of the file (the model's trained limit).
+    pub fn cfg_context(&self, g: &Gguf) -> usize {
+        g.meta_u64("qwen35moe.context_length").map(|v| v as usize).unwrap_or(4096)
+    }
+
     pub fn new_state(&self) -> State {
         let c = &self.cfg;
         let layers = (0..c.n_layer)
