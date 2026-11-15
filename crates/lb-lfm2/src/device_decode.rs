@@ -436,6 +436,9 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
     // tier is asked first; the device router and the stacked layers are not used
     let remote_on = m.store.remote.is_some();
     let e2 = knobs.e2_device_router() && !remote_on && m.store.cache.lock().expect("expert cache").is_some();
+    // LB_E2_SPEC: launch a layer's experts from the device slot table before the routes are read (needs the
+    // look-ahead off: its landings rename slots under the table)
+    let spec = e2 && knobs.e2_spec() && !m.store.la.on && m.store.cache.lock().expect("expert cache").as_ref().is_some_and(|c| c.landings.is_none());
     let mut slot_words = vec![0u32; 2 * prep.n_slots];
     let mut guessed: Option<Vec<u32>> = None;
     // a guess job on the worker, to be picked up and issued before the next layer's read
@@ -456,6 +459,9 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
             if let Err(err) = gpu.client.start_capture() {
                 return graph_refused(m, cache, tok, guard, ring_guard, &format!("start_capture: {err:?}"));
             }
+        }
+        if spec {
+            m.store.cache.lock().expect("expert cache").as_mut().expect("checked").sync_table(gpu);
         }
         for (li, layer) in m.w.layers.iter().enumerate() {
             let lp = &prep.layers[li];
@@ -578,7 +584,26 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                         // from host memory cannot avoid
                         let t_read = Instant::now();
                         let busy_us = t_read.duration_since(last_ret).as_micros() as u64;
-                        let mut bufs = match gpu.read_raw_keep(want) {
+                        // LB_E2_SPEC: the routes read is enqueued right behind the router, and only then are the experts
+                        // launched from the device table, so the host gets the routes while the card runs the experts
+                        // per layer: speculate only where the layer has mostly hit lately (an EMA of "this pass had a
+                        // miss", `LB_E2_SPEC_MISS` threshold, 0.3): a speculated layer that misses launches its
+                        // experts twice, which costs more than the bubble it hides
+                        let spec_here = spec && m.store.cache.lock().expect("expert cache").as_ref().is_some_and(|c| c.layer_miss.get(li).copied().unwrap_or(0.0) < spec_miss_threshold());
+                        let (spec_outs, read) = if spec_here {
+                            let pr = gpu.read_begin(want);
+                            let so: Option<Handle> = {
+                                let g = m.store.cache.lock().expect("expert cache");
+                                let c = g.as_ref().expect("checked above");
+                                let tab = c.tab_dev.as_ref().expect("table synced at token start");
+                                gpu.slot_translate(&prep.routes, tab, c.tab_host.len(), &prep.slot_routes, (li * cfg.n_expert, k_used, base, 0, prep.n_slots));
+                                Some(c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used).0)
+                            };
+                            (so, gpu.read_finish(pr))
+                        } else {
+                            (None, gpu.read_raw_keep(want))
+                        };
+                        let mut bufs = match read {
                             Ok(b) => b,
                             Err(err) => return abandon(m, cache, &format!("MoE layer {li} routes read: {err}")),
                         };
@@ -745,11 +770,28 @@ pub fn token(m: &Lfm2, tok: u32, cache: &mut Cache) -> Option<Tensor<2>> {
                                 }
                             };
                         }
-                        gpu.write_u32(&prep.slot_routes, &slot_words);
-                        if let Some(f) = fence.take() {
-                            c.slots.fence(gpu, &f);
+                        // speculative launch with no copy needed (hits, and misses the CPU serves): its output stands;
+                        // otherwise the layer is repaired: real slots written, experts launched again
+                        let outs = match spec_outs {
+                            Some(o) if n_fill == 0 => o,
+                            _ => {
+                                gpu.write_u32(&prep.slot_routes, &slot_words);
+                                if let Some(f) = fence.take() {
+                                    c.slots.fence(gpu, &f);
+                                }
+                                c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used).0
+                            }
+                        };
+                        if spec {
+                            if c.layer_miss.len() <= li {
+                                c.layer_miss.resize(cfg.n_layer, 0.0);
+                            }
+                            let miss = (n_fill > 0) as u32 as f32;
+                            c.layer_miss[li] += 0.05 * (miss - c.layer_miss[li]);
+                            if n_fill > 0 {
+                                c.sync_table(gpu);
+                            }
                         }
-                        let (outs, _) = c.slots.bank().launch_device(gpu, &h2, 1, &prep.slot_routes, prep.n_slots, base, k_used);
                         // the card runs the hits while the CPU computes the misses; each CPU output
                         // overwrites its route's row of `outs` (stream-ordered after the kernels) before
                         // the weighted sum, which keeps the ascending-expert-id order
@@ -1096,4 +1138,10 @@ fn prof_write(layers: &[[u64; 5]], issue_us: u64) {
     if let Some(f) = prof_file() {
         let _ = writeln!(f.lock().expect("profile"), "{}", serde_json::json!({"layers": layers, "issue_to_last_sync_us": issue_us}));
     }
+}
+
+/// `LB_E2_SPEC_MISS`: a layer is speculated while its recent miss frequency is below this (default 0.3).
+fn spec_miss_threshold() -> f32 {
+    static T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("LB_E2_SPEC_MISS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3))
 }

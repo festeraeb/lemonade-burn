@@ -62,6 +62,11 @@ pub struct Knobs {
     /// default); before that it is computed on the CPU. 0 = never copy (cache frozen at its seed),
     /// 1 = always copy (no CPU work). `LB_CPU_MISS_ADMIT=N`. Live.
     cpu_miss_admit: AtomicU32,
+    /// Engine step E2, speculative layers: the experts of a MoE layer are launched from a device-side
+    /// (layer, expert) -> slot table right after the router, before the host has read the routes, so the card
+    /// runs the hits while the host reads and plans; only a layer with a miss is repaired afterwards. Bit-identical
+    /// to the synced layer. Needs the look-ahead off (`LB_LA_*` unset). `LB_E2_SPEC=1` at start; off by default. Live.
+    e2_spec: AtomicBool,
 }
 
 fn env_on(k: &str) -> bool {
@@ -88,6 +93,7 @@ impl Default for Knobs {
             dd_graph: AtomicBool::new(env_on("LB_DD_GRAPH")),
             dd_fast: AtomicBool::new(env_or("LB_DD_FAST", true)),
             cpu_miss: AtomicBool::new(env_on("LB_CPU_MISS")),
+            e2_spec: AtomicBool::new(env_on("LB_E2_SPEC")),
             cpu_miss_admit: AtomicU32::new(std::env::var("LB_CPU_MISS_ADMIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)),
         }
     }
@@ -185,6 +191,14 @@ impl Knobs {
         self.dd_fast.store(on, Ordering::Relaxed);
     }
 
+    pub fn e2_spec(&self) -> bool {
+        self.e2_spec.load(Ordering::Relaxed)
+    }
+
+    pub fn set_e2_spec(&self, on: bool) {
+        self.e2_spec.store(on, Ordering::Relaxed);
+    }
+
     pub fn cpu_miss(&self) -> bool {
         self.cpu_miss.load(Ordering::Relaxed)
     }
@@ -227,6 +241,7 @@ mod tests {
             (Knobs::dd_graph, Knobs::set_dd_graph),
             (Knobs::dd_fast, Knobs::set_dd_fast),
             (Knobs::cpu_miss, Knobs::set_cpu_miss),
+            (Knobs::e2_spec, Knobs::set_e2_spec),
         ] {
             let b = get(&k);
             set(&k, !b);

@@ -438,12 +438,17 @@ mod dev {
         pub oracle: Option<(Vec<(usize, Vec<usize>)>, usize)>,
         /// `LB_CPU_MISS`: misses seen per (layer, expert) since it last held a slot, for the admit rule.
         pub miss_seen: Vec<u8>,
+        /// `LB_E2_SPEC`: the device copy of the (layer, expert) -> physical slot table and its host mirror.
+        pub tab_dev: Option<Handle>,
+        pub tab_host: Vec<u32>,
+        /// `LB_E2_SPEC`: per layer, an EMA of passes that had a miss (decides which layers are speculated).
+        pub layer_miss: Vec<f32>,
     }
 
     impl ExpertCache {
         pub fn new(slru: Slru, slots: ExpertSlots) -> Self {
             let phys = (0..slru.n_slots() as u32).collect();
-            Self { slru, slots, fills: AtomicU64::new(0), seeds: 0, phys, spares: Vec::new(), landings: None, trace: None, worker: None, oracle: None, miss_seen: Vec::new() }
+            Self { slru, slots, fills: AtomicU64::new(0), seeds: 0, phys, spares: Vec::new(), landings: None, trace: None, worker: None, oracle: None, miss_seen: Vec::new(), tab_dev: None, tab_host: Vec::new(), layer_miss: Vec::new() }
         }
 
         /// Record one layer pass for the offline simulator (`LB_LA_TRACE`, off by default).
@@ -456,6 +461,17 @@ mod dev {
                 "g": guess.map(|g| serde_json::json!({"t": g.layer, "e": g.experts, "s": g.scores, "r": g.ref_score})),
             });
             let _ = writeln!(w, "{line}");
+        }
+
+        /// Bring the device slot table in line with the SLRU (`LB_E2_SPEC`); writes only when it changed.
+        pub fn sync_table(&mut self, gpu: &lb_q4_gpu::Gpu) {
+            let want: Vec<u32> = self.slru.slot_table().iter().map(|&s| if s < 0 { u32::MAX } else { self.phys[s as usize] }).collect();
+            match &self.tab_dev {
+                Some(h) if want != self.tab_host => gpu.write_u32(h, &want),
+                None => self.tab_dev = Some(gpu.upload_u32(want.clone())),
+                _ => {}
+            }
+            self.tab_host = want;
         }
 
         pub fn count_fill(&self) {

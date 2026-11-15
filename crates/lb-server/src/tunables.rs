@@ -89,6 +89,7 @@ enum Change {
     DdGraph(bool),
     CpuMiss(bool),
     CpuI8(bool),
+    E2Spec(bool),
     ScrapeDir(Option<PathBuf>),
     ScrapeModelId(String),
     ScrapeClassId(String),
@@ -164,6 +165,8 @@ impl Tunables {
                 "description": "device decode: the router spread over one cube per expert and the expert-sum order worked out once per cube; bit-identical logits, fewer device microseconds a token"}));
             v.push(json!({"name": "cpu_miss", "value": k.cpu_miss(), "type": "bool", "scope": "live", "source": "LB_CPU_MISS",
                 "description": "E2 expert cache: compute a cache miss on the CPU from the host GGUF bytes instead of copying the expert to the card (a miss is copied in on its LB_CPU_MISS_ADMIT-th miss, 2 by default); exact f32 SIMD kernel unless cpu_i8"}));
+            v.push(json!({"name": "e2_spec", "value": k.e2_spec(), "type": "bool", "scope": "live", "source": "LB_E2_SPEC",
+                "description": "E2 expert cache: launch a MoE layer's experts from a device-side slot table right after the router so the card runs the hits while the host reads the routes; bit-identical logits; ignored with the look-ahead on"}));
             v.push(json!({"name": "cpu_i8", "value": k.cpu_i8(), "type": "bool", "scope": "live", "source": "LB_CPU_I8",
                 "description": "CPU experts use the int8-activation kernel (faster on some CPUs, rounds activations to 8 bits: 98.0 % top-1 against all-resident on LFM2.5, so off by default)"}));
             v.push(json!({"name": "dd_graph", "value": k.dd_graph(), "type": "bool", "scope": "live", "source": "LB_DD_GRAPH",
@@ -233,6 +236,10 @@ impl Tunables {
             "cpu_miss" => {
                 knobs.ok_or_else(not_lfm2)?;
                 as_bool(value).map(Change::CpuMiss)
+            }
+            "e2_spec" => {
+                knobs.ok_or_else(not_lfm2)?;
+                as_bool(value).map(Change::E2Spec)
             }
             "cpu_i8" => {
                 knobs.ok_or_else(not_lfm2)?;
@@ -314,6 +321,10 @@ impl Tunables {
                     self.live.knobs.as_ref().expect("validated").set_cpu_miss(b);
                     json!(b)
                 }
+                Change::E2Spec(b) => {
+                    self.live.knobs.as_ref().expect("validated").set_e2_spec(b);
+                    json!(b)
+                }
                 Change::CpuI8(b) => {
                     self.live.knobs.as_ref().expect("validated").set_cpu_i8(b);
                     json!(b)
@@ -380,7 +391,7 @@ mod tests {
         if std::env::var_os("LB_DEVICE_DECODE").is_none() {
             assert_eq!(entry(&d, "device_decode")["value"], true, "on unless LB_DEVICE_DECODE=0");
         }
-        for live in ["miss_policy", "host_repack", "batch_miss", "device_decode", "dd_host_moe", "dd_router_seq", "dd_fast", "dd_graph", "cpu_miss", "cpu_i8", "scrape_dir", "scrape_model_id", "scrape_class_id", "default_max_tokens"] {
+        for live in ["miss_policy", "host_repack", "batch_miss", "device_decode", "dd_host_moe", "dd_router_seq", "dd_fast", "dd_graph", "cpu_miss", "cpu_i8", "e2_spec", "scrape_dir", "scrape_model_id", "scrape_class_id", "default_max_tokens"] {
             assert_eq!(entry(&d, live)["scope"], "live", "{live}");
         }
         for fixed in ["model", "gpu", "gpu_dense_mb", "placement_from_scrapes", "ctx", "cuda_device", "wgpu_device", "no_register", "pinned_pool_mb", "q4_cube", "q4_rows", "q4_xshared", "q4_xshared_max_cols", "expert_layers", "conv_block"] {

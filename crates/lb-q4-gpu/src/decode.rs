@@ -387,6 +387,27 @@ pub fn weighted_sum_kernel(outs: &[f32], weights: &[f32], routes: &[u32], y: &mu
     }
 }
 
+/// Engine step E2, speculative layers (`LB_E2_SPEC`): turn this layer's routed expert ids into slot numbers
+/// on the device. `table[layer_off + expert]` is the physical slot holding that expert or `u32::MAX` when it is
+/// not resident; a missing expert reads `dummy` (a valid slot whose output the host overwrites or recomputes).
+/// Slot `i` of the layer is `routes[2 (base + i)]` -> `slot_routes[2 (base + i)]`; the token word is copied.
+/// `p` = `[layer_off, k, base, dummy]`. One thread per slot.
+#[cube(launch)]
+pub fn slot_translate_kernel(routes: &[u32], table: &[u32], slot_routes: &mut [u32], p: &[u32]) {
+    let i = ABSOLUTE_POS as usize;
+    let k = p[1] as usize;
+    if i < k {
+        let base = p[2] as usize;
+        let s = table[p[0] as usize + routes[2usize * (base + i)] as usize];
+        let mut out = s;
+        if s == 4294967295u32 {
+            out = p[3];
+        }
+        slot_routes[2usize * (base + i)] = out;
+        slot_routes[2usize * (base + i) + 1usize] = routes[2usize * (base + i) + 1usize];
+    }
+}
+
 /// [`add_rms_norm_kernel`] and [`router_topk_kernel`] in one launch (one cube): `x <- x + y` (when
 /// `add`), `h = rms(x) * w`, then the router on `h`. The same arithmetic in the same order as the
 /// two kernels run one after the other, so the results are bit-identical; it exists because a
@@ -957,6 +978,26 @@ impl Gpu {
         }
         self.tr("sum_add_rms_norm_ord", n);
         h
+    }
+
+    /// [`slot_translate_kernel`]: `slot_routes[base .. base + k]` from `routes` through `table` (`n_table` words) for the
+    /// layer whose entries start at `layer_off`; a non-resident expert gets slot `dummy`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn slot_translate(&self, routes: &Handle, table: &Handle, n_table: usize, slot_routes: &Handle, (layer_off, k, base, dummy, n_slots): (usize, usize, usize, usize, usize)) {
+        assert!(base + k <= n_slots);
+        let p = self.const_u32(&[layer_off as u32, k as u32, base as u32, dummy as u32]);
+        unsafe {
+            slot_translate_kernel::launch(
+                &self.client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(32),
+                BufferArg::from_raw_parts(routes.clone(), 2 * n_slots),
+                BufferArg::from_raw_parts(table.clone(), n_table),
+                BufferArg::from_raw_parts(slot_routes.clone(), 2 * n_slots),
+                BufferArg::from_raw_parts(p, 4),
+            );
+        }
+        self.tr("slot_translate", k);
     }
 
     /// `y = sum_s w_s * outs[s]` over the `k` slots at `base` (ascending expert id); `outs` is

@@ -870,6 +870,12 @@ impl Gpu {
     }
 }
 
+/// A read started by [`Gpu::read_begin`].
+pub struct PendingRead<'a> {
+    fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Bytes>, String>> + Send + 'a>>,
+    lens: Vec<usize>,
+}
+
 /// A device stream other than the calling thread's (see [`Gpu::side_stream`]).
 #[derive(Clone, Copy, Debug)]
 pub struct SideStream(cubecl_environment::stream::StreamId);
@@ -1172,6 +1178,23 @@ impl Gpu {
         let hs: Vec<Handle> = handles.into_iter().map(|(h, _)| h).collect();
         let bytes = self.client.read(hs).map_err(|e| format!("GPU read failed: {e:?}"))?;
         Ok(bytes.iter().zip(lens).map(|(b, n)| b[..n].to_vec()).collect())
+    }
+
+    /// Start a read without waiting for it: the copies are enqueued on the stream now (cubecl's `read_async`
+    /// enqueues before it returns its future), so they run after the kernels queued so far and before any
+    /// launched after this call. [`Gpu::read_finish`] waits for the fence that follows the copies only.
+    /// Like [`Gpu::read_raw_keep`] it does not recycle the scratch pool.
+    pub fn read_begin(&self, handles: Vec<(Handle, usize)>) -> PendingRead<'_> {
+        let lens: Vec<usize> = handles.iter().map(|(_, n)| *n).collect();
+        let hs: Vec<Handle> = handles.into_iter().map(|(h, _)| h).collect();
+        let fut = self.client.read_async(hs);
+        PendingRead { fut: Box::pin(async move { fut.await.map_err(|e| format!("GPU read failed: {e:?}")) }), lens }
+    }
+
+    /// Wait for a [`Gpu::read_begin`] read and return its bytes (`lens` bytes of each buffer).
+    pub fn read_finish(&self, p: PendingRead<'_>) -> Result<Vec<Vec<u8>>, String> {
+        let bytes = cubecl_environment::future::reader::read_sync(p.fut)?;
+        Ok(bytes.iter().zip(p.lens).map(|(b, n)| b[..n].to_vec()).collect())
     }
 
     /// Overwrite a whole device buffer of `u32`s, stream-ordered after what is queued.
