@@ -56,7 +56,8 @@ fn main() -> Result<()> {
     let mut pos_global = 0usize;
     for (pi, p) in prompts.iter().enumerate() {
         // resume: if every position of this prompt is already done, skip it; recurrent state cannot be restored mid-prompt
-        if pos_global + p.len() <= done {
+        let only: Option<Vec<usize>> = std::env::var("QWEN_ONLY").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect());
+        if only.as_ref().is_some_and(|o| !o.contains(&pi)) || pos_global + p.len() <= done {
             pos_global += p.len();
             continue;
         }

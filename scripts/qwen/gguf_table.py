@@ -1,4 +1,4 @@
-import sys; sys.path.insert(0,'/home/cesarops/src/llama.cpp-mainline/gguf-py')
+import sys; sys.path.insert(0,'~/src/llama.cpp-mainline/gguf-py')
 import gguf, collections, json
 r=gguf.GGUFReader(sys.argv[1])
 meta={}

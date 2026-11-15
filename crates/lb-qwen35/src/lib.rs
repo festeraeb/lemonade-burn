@@ -219,6 +219,12 @@ impl<'a> Model<'a> {
 
     /// Run one token through the trunk; returns the logits when `want_logits`.
     pub fn forward(&self, st: &mut State, tok: u32, want_logits: bool) -> Option<Vec<f32>> {
+        self.forward_ex(st, tok, want_logits, &mut |_, _, _| {})
+    }
+
+    /// As [`forward`](Self::forward), reporting intermediate tensors to `tr(name, layer, values)`: `attn_out` (the mixer's
+    /// output), `attn_residual`, `ffn_out`, `post_moe` (the layer output), named like llama.cpp's graph callbacks.
+    pub fn forward_ex(&self, st: &mut State, tok: u32, want_logits: bool, tr: &mut dyn FnMut(&str, usize, &[f32])) -> Option<Vec<f32>> {
         let c = &self.cfg;
         let mut x = vec![0f32; c.n_embd];
         self.tok_embd.dequant_row(tok as usize, &mut x);
@@ -229,14 +235,18 @@ impl<'a> Model<'a> {
                 (_, Some(w), LayerState::Lin { conv, s }) => self.delta_net(w, &h, conv, s),
                 _ => unreachable!(),
             };
+            tr("attn_out", il, &a);
             for (xi, ai) in x.iter_mut().zip(&a) {
                 *xi += ai;
             }
+            tr("attn_residual", il, &x);
             let h2 = rms_norm(&x, &l.post_norm, c.eps);
             let f = self.moe(il, &h2);
+            tr("ffn_out", il, &f);
             for (xi, fi) in x.iter_mut().zip(&f) {
                 *xi += fi;
             }
+            tr("post_moe", il, &x);
         }
         st.pos += 1;
         if !want_logits {
@@ -275,6 +285,11 @@ impl<'a> Model<'a> {
             let n = rms_norm(s, &w.k_norm, c.eps);
             s.copy_from_slice(&n);
             rope_neox(s, pos, c);
+        }
+        if kv16_on() {
+            for t in k.iter_mut().chain(v.iter_mut()) {
+                *t = half::f16::from_f32(*t).to_f32();
+            }
         }
         kc.extend_from_slice(&k);
         vc.extend_from_slice(&v);
@@ -494,11 +509,65 @@ pub fn rope_neox(x: &mut [f32], pos: usize, c: &Config) {
     }
 }
 
+/// Emulate the activation quantisation llama.cpp's CPU kernels apply (`LB_QWEN_ACTQ=1`): K-quant weights are dotted with the
+/// activation row rounded to Q8_K (blocks of 256, `d = max/-127`, `nearest_int`), Q8_0 weights with Q8_0 (blocks of 32, f16 `d =
+/// amax/127`, `roundf`). Used only to separate "the reference rounds its activations" from "this decoder differs".
+pub fn act_quant_roundtrip(ty: GgmlType, x: &[f32]) -> Vec<f32> {
+    let mut y = x.to_vec();
+    match ty {
+        GgmlType::Q5K | GgmlType::Q6K | GgmlType::Q4K => {
+            for blk in y.chunks_exact_mut(256) {
+                let (mut amax, mut max) = (0f32, 0f32);
+                for &v in blk.iter() {
+                    if v.abs() > amax {
+                        amax = v.abs();
+                        max = v;
+                    }
+                }
+                if amax == 0.0 {
+                    continue;
+                }
+                let iscale = -127.0 / max;
+                let d = 1.0 / iscale;
+                for v in blk.iter_mut() {
+                    let q = ((iscale * *v).round_ties_even() as i32).min(127);
+                    *v = q as f32 * d;
+                }
+            }
+        }
+        GgmlType::Q8_0 => {
+            for blk in y.chunks_exact_mut(32) {
+                let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let d = amax / 127.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                let d16 = half::f16::from_f32(d).to_f32();
+                for v in blk.iter_mut() {
+                    *v = (*v * id).round() * d16;
+                }
+            }
+        }
+        _ => {}
+    }
+    y
+}
+
+fn act_quant_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LB_QWEN_ACTQ").map(|v| v == "1").unwrap_or(false))
+}
+
+fn kv16_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LB_QWEN_KV16").map(|v| v == "1").unwrap_or(false))
+}
+
 /// `out[r] = W[r, :] . x` with `W` quantised, one dequantised row at a time.
 pub fn matvec(w: &QuantMat<'_>, x: &[f32], out: &mut [f32]) {
     debug_assert_eq!(x.len(), w.cols);
     debug_assert_eq!(out.len(), w.rows);
     let cols = w.cols;
+    let xq;
+    let x = if act_quant_on() { xq = act_quant_roundtrip(w.ty, x); &xq[..] } else { x };
     if w.ty == GgmlType::F32 {
         out.par_iter_mut().enumerate().for_each(|(r, o)| {
             let row = w.row(r);

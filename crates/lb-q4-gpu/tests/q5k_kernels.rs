@@ -218,3 +218,32 @@ fn q5_k_native_layout_matches_reference() {
         }
     }
 }
+
+/// Throughput of the two Q5_K layouts (prints; run with `--ignored --nocapture` on a GPU host).
+#[test]
+#[ignore]
+fn q5_k_layout_throughput() {
+    let gpu = Gpu::open().unwrap();
+    let (rows, cols, reps) = (16384usize, 2048usize, 300usize);
+    let mut rng = Rng(77);
+    let bytes = random_rows(&mut rng, GgmlType::Q5K, rows, cols);
+    let w = QuantMat::new(GgmlType::Q5K, rows, cols, &bytes);
+    let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+    let xh = gpu.upload_f32(&x);
+    let wide = lb_q4_gpu::GpuQ5KMat::upload(&gpu, w).unwrap();
+    let native = GpuQ5KNative::upload(&gpu, w).unwrap();
+    for (name, bytes_dev) in [("widened", wide.bytes_on_device()), ("native", native.bytes_on_device())] {
+        for round in 0..2 {
+            let t0 = std::time::Instant::now();
+            let mut last = None;
+            for _ in 0..reps {
+                last = Some(if name == "widened" { wide.launch(&gpu, &xh, 1) } else { native.launch(&gpu, &xh, 1) });
+            }
+            gpu.read_all(vec![(last.unwrap(), rows)]).unwrap();
+            let dt = t0.elapsed().as_secs_f64() / reps as f64;
+            if round == 1 {
+                eprintln!("q5_k {name}: {:.1} us per {rows}x{cols} matvec, {:.1} MB on device, {:.0} GB/s of resident bytes", dt * 1e6, bytes_dev as f64 / 1e6, bytes_dev as f64 / dt / 1e9);
+            }
+        }
+    }
+}
