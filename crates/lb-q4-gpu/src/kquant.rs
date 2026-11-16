@@ -1455,7 +1455,7 @@ fn split_q6(gpu: &Gpu, bytes: &[u8], nb: usize) -> (Handle, Handle, Handle, (usi
 
 /// Routed gate+up+SiLU, Q5_K, 4 output rows a plane (gate and up of each: 8 row partials sharing the activation loads); writes `h` permuted.
 #[cube(launch)]
-fn q5n_routed_gate_up_rows4_kernel(gw: &[V4U], uw: &[V4U], x: &[V4F], routes: &[u32], dims: &[u32], h: &mut [f32]) {
+fn q5n_routed_gate_up_rows4_kernel(gw: &[V4U], uw: &[V4U], x: &[V4F], routes: &[u32], dims: &[u32], h: &mut [f32], #[comptime] rr: usize) {
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
     let bpr = cols / 256usize;
@@ -1463,25 +1463,25 @@ fn q5n_routed_gate_up_rows4_kernel(gw: &[V4U], uw: &[V4U], x: &[V4F], routes: &[
     let plane_id = (UNIT_POS / PLANE_DIM) as usize;
     let ppc = CUBE_DIM_X as usize / 32usize;
     let step = CUBE_COUNT as usize * ppc;
-    let groups = h.len() / 4usize;
+    let groups = h.len() / rr;
     let mut g = CUBE_POS as usize * ppc + plane_id;
     while g < groups {
-        let o0 = g * 4usize;
+        let o0 = g * rr;
         let slot = o0 / rows;
         let r0 = o0 % rows;
         let e = routes[2usize * slot] as usize;
         let tok = routes[2usize * slot + 1usize] as usize;
-        let mut acc = Array::<f32>::new(8usize);
+        let mut acc = Array::<f32>::new(2usize * rr);
         #[unroll]
-        for i in 0..8usize {
+        for i in 0..(2usize * rr) {
             acc[i] = 0.0f32;
         }
         // rows 0..4 of acc: gate rows r0..r0+4, rows 4..8: the same rows of up
-        q5n_rows2(gw, uw, x, (e * rows + r0) * bpr, tok * cols / 4usize, bpr, lane, 32usize, &mut acc, 8usize, 4usize);
+        q5n_rows2(gw, uw, x, (e * rows + r0) * bpr, tok * cols / 4usize, bpr, lane, 32usize, &mut acc, 2usize * rr, rr);
         #[unroll]
-        for i in 0..4usize {
+        for i in 0..rr {
             let gsum = plane_sum(acc[i]);
-            let usum = plane_sum(acc[i + 4usize]);
+            let usum = plane_sum(acc[i + rr]);
             if lane == 0usize {
                 let r = r0 + i;
                 let a16 = r / 16usize;
@@ -1668,11 +1668,13 @@ impl GpuNativeExperts {
         let d_dn = gpu.const_u32(&[self.embd as u32, self.ff as u32]);
         // row-batched kernels need plane ops, a 32-lane plane, and (for the down pass) lane groups that divide the plane
         let rb = gpu.use_plane && gpu.plane_size.1 == 32 && std::env::var("LB_QW_ROWS1").is_err();
+        let gu_r: usize = std::env::var("LB_QW_GU_R").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let dn_r: usize = std::env::var("LB_QW_DN_R").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         unsafe {
             match &self.gu {
                 NativeGateUp::Q5 { gw, uw, n } if rb && self.ff % 4 == 0 && std::env::var("LB_QW_NOGU").is_err() => q5n_routed_gate_up_rows4_kernel::launch(
                     &gpu.client,
-                    cube_count(slots * self.ff / 4, gpu.per_cube()),
+                    cube_count(slots * self.ff / gu_r, gpu.per_cube()),
                     CubeDim::new_1d(gpu.cube_dim as u32),
                     BufferArg::from_raw_parts(gw.clone(), n / 4),
                     BufferArg::from_raw_parts(uw.clone(), n / 4),
@@ -1680,6 +1682,7 @@ impl GpuNativeExperts {
                     BufferArg::from_raw_parts(routes.clone(), 2 * slots),
                     BufferArg::from_raw_parts(d_gu, 2),
                     BufferArg::from_raw_parts(h.clone(), slots * self.ff),
+                    gu_r,
                 ),
                 NativeGateUp::Q5 { gw, uw, n } => q5n_routed_gate_up_silu_kernel::launch(
                     &gpu.client,
@@ -1734,9 +1737,9 @@ impl GpuNativeExperts {
                         rpp,
                     )
                 }
-                NativeDown::Q5 { w, n } if rb && std::env::var("LB_QW_NODN").is_err() && 32 % (self.ff / 256 * 4) == 0 && self.embd % (32 / (self.ff / 256 * 4) * 4) == 0 => {
+                NativeDown::Q5 { w, n } if rb && std::env::var("LB_QW_NODN").is_err() && 32 % (self.ff / 256 * 4) == 0 && self.embd % (32 / (self.ff / 256 * 4) * dn_r) == 0 => {
                     let ipr = self.ff / 256 * 4;
-                    let per_plane = 32 / ipr * 4;
+                    let per_plane = 32 / ipr * dn_r;
                     q5n_routed_down_rb_kernel::launch(
                         &gpu.client,
                         cube_count(slots * self.embd / per_plane, gpu.per_cube()),
@@ -1747,7 +1750,7 @@ impl GpuNativeExperts {
                         BufferArg::from_raw_parts(d_dn, 2),
                         BufferArg::from_raw_parts(out.clone(), slots * self.embd),
                         ipr,
-                        4usize,
+                        dn_r,
                     )
                 }
                 NativeDown::Q5 { w, n } if mr(self.ff / 256 * 4) => {
@@ -1777,9 +1780,9 @@ impl GpuNativeExperts {
                     BufferArg::from_raw_parts(out.clone(), slots * self.embd),
                     gpu.use_plane,
                 ),
-                NativeDown::Q6 { qq, sc, dd, n } if rb && std::env::var("LB_QW_NODN").is_err() && 32 % (self.ff / 256 * 2) == 0 && self.embd % (32 / (self.ff / 256 * 2) * 4) == 0 => {
+                NativeDown::Q6 { qq, sc, dd, n } if rb && std::env::var("LB_QW_NODN").is_err() && 32 % (self.ff / 256 * 2) == 0 && self.embd % (32 / (self.ff / 256 * 2) * dn_r) == 0 => {
                     let ipr = self.ff / 256 * 2;
-                    let per_plane = 32 / ipr * 4;
+                    let per_plane = 32 / ipr * dn_r;
                     q6n_routed_down_rb_kernel::launch(
                         &gpu.client,
                         cube_count(slots * self.embd / per_plane, gpu.per_cube()),
@@ -1792,7 +1795,7 @@ impl GpuNativeExperts {
                         BufferArg::from_raw_parts(d_dn, 2),
                         BufferArg::from_raw_parts(out.clone(), slots * self.embd),
                         ipr,
-                        4usize,
+                        dn_r,
                     )
                 }
                 NativeDown::Q6 { qq, sc, dd, n } if mr(self.ff / 256 * 2) => {
