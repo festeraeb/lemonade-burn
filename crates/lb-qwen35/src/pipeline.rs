@@ -93,6 +93,16 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         Ok(Pipeline { model, stages, flush, graph_on, timing: std::env::var("LB_QW_TIMING").is_ok() })
     }
 
+    /// Run three single-token steps (plain, capture, replay) and reset: the CUDA graphs of every stage exist before any prefill runs (a capture started after
+    /// stage threads have written the shared buffers is invalidated by CUDA; a replay is not).
+    pub fn warm_decode(&self, tok: u32) -> Result<()> {
+        for i in 0..3 {
+            self.step(tok, i, true)?;
+        }
+        self.reset();
+        Ok(())
+    }
+
     pub fn reset(&self) {
         for s in &self.stages {
             s.dev.reset(&s.gpu);

@@ -54,6 +54,7 @@ pub fn load(path: &Path, ctx: usize) -> Result<(QwenDev, Arc<TextCodec>, usize)>
     };
     let cap = ctx.min(model.cfg_context(g));
     let pipe = Pipeline::new(model, &split, cap)?;
+    pipe.warm_decode(g.meta_u64("tokenizer.ggml.bos_token_id").unwrap_or(248044) as u32)?;
     let tok = lb_qwen35::tokenizer::from_gguf(g)?;
     let bos = g.meta_u64("tokenizer.ggml.bos_token_id").unwrap_or(248044) as u32;
     let eos = g.meta_u64("tokenizer.ggml.eos_token_id").unwrap_or(248046) as u32;
