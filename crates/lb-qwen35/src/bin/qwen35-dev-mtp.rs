@@ -36,6 +36,19 @@ fn main() -> Result<()> {
         let ids = tokenizer::encode(&tk, &text)?;
         let mut plain: Vec<u32> = Vec::new();
         for &d in &depths {
+            if d > 0 {
+                // warm-up (compiles kernels, records the graphs) so the timed run measures steady state
+                pipe.reset();
+                let rows = Mutex::new(Vec::new());
+                let lg = pipe.prefill_h(&ids, 0, chunk, Some(&rows))?;
+                let mut sd = SpecDev::new(d);
+                sd.after_prefill(&pipe, &ids, 0, &rows.into_inner().unwrap())?;
+                let (mut next, mut len) = (argmax(&lg), ids.len());
+                for _ in 0..12 {
+                    next = sd.next(&pipe, next, len)?;
+                    len += 1;
+                }
+            }
             pipe.reset();
             let rows = Mutex::new(Vec::new());
             let t0 = std::time::Instant::now();
@@ -56,6 +69,9 @@ fn main() -> Result<()> {
                 len += 1;
             }
             let dec_s = t1.elapsed().as_secs_f64();
+            if lb_qwen35::device::ptime_on() {
+                eprintln!("ptime depth {d}: {:?}", pipe.ptime_report());
+            }
             if d > 0 {
                 sd.trim(&pipe, len);
             }

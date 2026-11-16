@@ -38,7 +38,7 @@ macro_rules! gemm_launch {
 
 /// Most free buffers to keep per size. Decode reuses a handful of sizes, so this only caps
 /// pathological growth (a long prefill with many distinct `m`).
-const POOL_PER_SIZE: usize = 64;
+const POOL_PER_SIZE: usize = 1024; // a recorded verify pass holds a whole stage of same-size temporaries (17 layers x several)
 
 pub struct Gpu {
     pub client: Client,
@@ -831,7 +831,12 @@ impl Gpu {
     pub fn scratch(&self, bytes: usize) -> Handle {
         let h = match self.free.lock().expect("scratch pool").get_mut(&bytes).and_then(Vec::pop) {
             Some(h) => h,
-            None => self.client.empty(bytes),
+            None => {
+                if std::env::var("LB_SCRATCH_LOG").is_ok() {
+                    eprintln!("scratch pool miss: {bytes} bytes");
+                }
+                self.client.empty(bytes)
+            }
         };
         self.in_flight.lock().expect("scratch pool").push((bytes, h.clone()));
         h
@@ -948,6 +953,39 @@ impl GpuQ8Mat {
 
     pub fn bytes_on_device(&self) -> usize {
         (self.n_qs + self.n_sc) * 4
+    }
+
+    /// `launch` for 2..=4 token rows with every weight byte read once for all of them (`[m, rows_pad]`).
+    pub fn launch_mt(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        if !(2..=4).contains(&m) || self.rows_pad % 4 != 0 {
+            return self.launch(gpu, x, m);
+        }
+        let n_out = m * self.rows_pad;
+        let out = gpu.scratch(n_out * 4);
+        macro_rules! go {
+            ($mt:expr) => {
+                unsafe {
+                    crate::q8_0_matvec_rows_mt_kernel::launch(
+                        &gpu.client,
+                        cube_count(self.rows_pad / 4, gpu.per_cube()),
+                        CubeDim::new_1d(gpu.cube_dim as u32),
+                        BufferArg::from_raw_parts(self.qs.clone(), self.n_qs / 4),
+                        BufferArg::from_raw_parts(self.sc.clone(), self.n_sc),
+                        BufferArg::from_raw_parts(x.clone(), m * self.cols / 4),
+                        BufferArg::from_raw_parts(self.dims.clone(), 2),
+                        BufferArg::from_raw_parts(out.clone(), n_out),
+                        4usize,
+                        $mt,
+                    )
+                }
+            };
+        }
+        match m {
+            2 => go!(2usize),
+            3 => go!(3usize),
+            _ => go!(4usize),
+        }
+        out
     }
 
     /// `out = x @ W^T` for `m` rows of `x`; the output is `[m, rows_pad]`.

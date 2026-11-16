@@ -39,6 +39,16 @@ struct Stage {
     dev: DevModel,
     first: usize,
     head: Option<Head>,
+    /// the verify pass's input rows (`spec_m * n_embd`) and its CUDA graph (recorded on the second pass of the full chunk size)
+    vx_in: Handle,
+    vgraph: RefCell<VState>,
+}
+
+enum VState {
+    None,
+    Prepared,
+    Ready { graph: CubeGraph, out: (Handle, Option<Handle>), _held: Vec<Handle> },
+    Failed,
 }
 
 enum Out {
@@ -61,6 +71,8 @@ struct MtpDev {
     hnorm: Vec<f32>,
     shead: Handle,
     x_in: Handle,
+    /// the draft step as a CUDA graph (inputs: `x_in`, the position buffer): outputs (hidden, argmax)
+    graph: RefCell<VState>,
 }
 
 pub struct Pipeline<'m, 'a> {
@@ -70,6 +82,8 @@ pub struct Pipeline<'m, 'a> {
     flush: u32,
     graph_on: bool,
     timing: bool,
+    vm: usize,
+    vwarm: std::cell::Cell<bool>,
 }
 
 impl<'m, 'a> Pipeline<'m, 'a> {
@@ -102,12 +116,13 @@ impl<'m, 'a> Pipeline<'m, 'a> {
             };
             eprintln!("stage {i}: layers {first}..{} uploaded", first + cnt);
             let x_in = gpu.upload_f32(&vec![0.0; model.cfg.n_embd]);
-            stages.push(Stage { graph: RefCell::new(GraphState::None), x_in, gpu, dev, first, head });
+            let vx_in = gpu.upload_f32(&vec![0.0; spec_m.max(1) * model.cfg.n_embd]);
+            stages.push(Stage { graph: RefCell::new(GraphState::None), x_in, gpu, dev, first, head, vx_in, vgraph: RefCell::new(VState::None) });
             first += cnt;
         }
         let flush = std::env::var("LB_QW_FLUSH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         let graph_on = std::env::var("LB_QW_GRAPH").map(|v| v != "0").unwrap_or(true);
-        Ok(Pipeline { model, mtp: None, stages, flush, graph_on, timing: std::env::var("LB_QW_TIMING").is_ok() })
+        Ok(Pipeline { model, mtp: None, stages, flush, graph_on, timing: std::env::var("LB_QW_TIMING").is_ok(), vm: spec_m, vwarm: std::cell::Cell::new(false) })
     }
 
     /// Run three single-token steps (plain, capture, replay) and reset: the CUDA graphs of every stage exist before any prefill runs (a capture started after
@@ -388,7 +403,7 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         let dev = DevModel::upload_layers(&s.gpu, c, &[&mtp.layer], s.dev.cap, 0)?;
         let eh = DMat::new(&s.gpu, &mtp.eh_proj)?;
         let x_in = s.gpu.upload_f32(&vec![0.0; 2 * c.n_embd]);
-        self.mtp = Some(MtpDev { dev, eh, enorm: mtp.enorm.clone(), hnorm: mtp.hnorm.clone(), shead: s.gpu.upload_f32(&mtp.shead_norm), x_in });
+        self.mtp = Some(MtpDev { dev, eh, enorm: mtp.enorm.clone(), hnorm: mtp.hnorm.clone(), shead: s.gpu.upload_f32(&mtp.shead_norm), x_in, graph: RefCell::new(VState::None) });
         Ok(())
     }
 
@@ -412,20 +427,88 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         let c = &self.model.cfg;
         let m = self.mtp.as_ref().ok_or_else(|| anyhow!("no nextn block"))?;
         let s = self.stages.last().unwrap();
-        let h = s.head.as_ref().unwrap();
         s.gpu.write_f32(&m.x_in, &self.mtp_cat(hid, tok));
         m.dev.set_pos(&s.gpu, pos);
+        let (y, am) = self.run_draft(m, self.graph_on)?;
+        let mut r = s.gpu.read_all(vec![(am, 1), (y, c.n_embd)]).map_err(|e| anyhow!(e))?;
+        let hid = r.pop().unwrap();
+        Ok((r[0][0].to_bits(), hid))
+    }
+
+    fn build_draft(&self, m: &MtpDev) -> (Handle, Handle) {
+        let c = &self.model.cfg;
+        let s = self.stages.last().unwrap();
+        let h = s.head.as_ref().unwrap();
         let x = m.eh.launch(&s.gpu, &m.x_in);
-        let (_, y) = m.dev.layer_forward(&s.gpu, 0, &x, pos);
+        let (_, y) = m.dev.layer_forward(&s.gpu, 0, &x, 0);
         let nrm = s.gpu.qw_rms(&y, &m.shead, 1, c.n_embd, c.eps).0;
         let logits = match &h.out {
             HeadMat::Q6(w) => w.launch(&s.gpu, &nrm, 1),
             HeadMat::Q8(w) => w.launch(&s.gpu, &nrm, 1),
         };
         let am = s.gpu.qw_argmax(&logits, c.vocab);
-        let mut r = s.gpu.read_all(vec![(am, 1), (y, c.n_embd)]).map_err(|e| anyhow!(e))?;
-        let hid = r.pop().unwrap();
-        Ok((r[0][0].to_bits(), hid))
+        (y, am)
+    }
+
+    /// One draft step on the device: plain the first time (capture mode on), recorded as a graph the second time, replayed after.
+    fn run_draft(&self, m: &MtpDev, graph_on: bool) -> Result<(Handle, Handle)> {
+        let s = self.stages.last().unwrap();
+        if !graph_on {
+            return Ok(self.build_draft(m));
+        }
+        let kind = match &*m.graph.borrow() {
+            VState::Ready { .. } => 0,
+            VState::Failed => 1,
+            VState::None => 2,
+            VState::Prepared => 3,
+        };
+        if kind == 0 {
+            if let VState::Ready { graph, out, .. } = &*m.graph.borrow() {
+                // SAFETY: as in `run_stage`
+                unsafe { graph.replay() }.map_err(|e| anyhow!("draft graph replay: {e:?}"))?;
+                return Ok((out.0.clone(), out.1.clone().unwrap()));
+            }
+        }
+        if kind == 1 {
+            return Ok(self.build_draft(m));
+        }
+        if kind == 2 {
+            match s.gpu.client.graph_prepare() {
+                Ok(()) => {
+                    let o = self.build_draft(m);
+                    s.gpu.read_all(vec![(o.1, 1)]).map_err(|e| anyhow!(e))?;
+                }
+                Err(e) => {
+                    eprintln!("lb-qwen35: draft graph_prepare refused ({e:?})");
+                    *m.graph.borrow_mut() = VState::Failed;
+                    return Ok(self.build_draft(m));
+                }
+            }
+        }
+        match s.gpu.client.start_capture() {
+            Err(e) => {
+                eprintln!("lb-qwen35: draft start_capture refused ({e:?})");
+                *m.graph.borrow_mut() = VState::Failed;
+                Ok(self.build_draft(m))
+            }
+            Ok(()) => {
+                let (y, am) = self.build_draft(m);
+                match s.gpu.client.stop_capture() {
+                    Ok(graph) => {
+                        let held = s.gpu.take_in_flight();
+                        eprintln!("lb-qwen35: nextn draft step recorded as a CUDA graph");
+                        unsafe { graph.replay() }.map_err(|e| anyhow!("draft graph replay: {e:?}"))?;
+                        *m.graph.borrow_mut() = VState::Ready { graph, out: (y.clone(), Some(am.clone())), _held: held };
+                        Ok((y, am))
+                    }
+                    Err(e) => {
+                        eprintln!("lb-qwen35: draft stop_capture refused ({e:?})");
+                        *m.graph.borrow_mut() = VState::Failed;
+                        Ok(self.build_draft(m))
+                    }
+                }
+            }
+        }
     }
 
     /// The head-cache entry `pos` only (no draft): the catch-up after a verify.
@@ -474,30 +557,127 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         for (i, &t) in tokens.iter().enumerate() {
             self.model.tok_embd.dequant_row(t as usize, &mut xh[i * c.n_embd..(i + 1) * c.n_embd]);
         }
-        for s in &self.stages {
-            s.dev.spec_checkpoint(&s.gpu);
-            let mut cur = s.gpu.upload_f32(&xh);
+        let tm = std::env::var("LB_MTP_TIMING").is_ok();
+        let nst = self.stages.len();
+        let mut g: Vec<u32> = Vec::new();
+        for si in 0..nst {
+            let t0 = std::time::Instant::now();
+            let s = &self.stages[si];
             s.dev.set_chunk(&s.gpu, pos0, m);
-            for l in 0..s.dev.layers.len() {
-                cur = s.dev.prefill_layer(&s.gpu, l, &cur, m, true)?;
+            let full = m == self.vm && self.graph_on;
+            if full {
+                s.gpu.write_f32(&s.vx_in, &xh);
+            }
+            let (cur, am) = self.run_verify_stage(si, &xh, m, full)?;
+            let mut want = vec![(cur, m * c.n_embd)];
+            if let Some(am) = am {
+                want.push((am, m));
+            }
+            let mut r = s.gpu.read_all(want).map_err(|e| anyhow!(e))?;
+            if r.len() == 2 {
+                g = r.pop().unwrap().into_iter().map(|v| v.to_bits()).collect();
+            }
+            xh = r.remove(0);
+            if tm {
+                eprintln!("verify stage {si}: {:.2} ms", t0.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        Ok((g, xh))
+    }
+
+    /// The nextn block's graph-free helpers live above; the verify pass is recorded per stage:
+    fn build_verify(&self, si: usize, x: &Handle, m: usize, flush: bool) -> (Handle, Option<Handle>) {
+        let c = &self.model.cfg;
+        let s = &self.stages[si];
+        s.dev.spec_checkpoint(&s.gpu);
+        let mut cur = x.clone();
+        for l in 0..s.dev.layers.len() {
+            cur = s.dev.verify_layer(&s.gpu, l, &cur, m);
+            if flush {
                 s.gpu.flush_queue();
             }
-            xh = s.gpu.read_all(vec![(cur, m * c.n_embd)]).map_err(|e| anyhow!(e))?.remove(0);
         }
-        let s = self.stages.last().unwrap();
-        let h = s.head.as_ref().ok_or_else(|| anyhow!("no head"))?;
-        let mut ams = Vec::new();
-        for r in 0..m {
-            let x = s.gpu.upload_f32(&xh[r * c.n_embd..(r + 1) * c.n_embd]);
-            let nrm = s.gpu.qw_rms(&x, &h.norm, 1, c.n_embd, c.eps).0;
+        if let Some(h) = &s.head {
+            // final norm, the head over every row, and the argmax of each: part of the last stage's recording
+            let nrm = s.gpu.qw_rms(&cur, &h.norm, m, c.n_embd, c.eps).0;
             let logits = match &h.out {
-                HeadMat::Q6(w) => w.launch(&s.gpu, &nrm, 1),
-                HeadMat::Q8(w) => w.launch(&s.gpu, &nrm, 1),
+                HeadMat::Q6(w) => w.launch(&s.gpu, &nrm, m),
+                HeadMat::Q8(w) => w.launch(&s.gpu, &nrm, m),
             };
-            ams.push((s.gpu.qw_argmax(&logits, c.vocab), 1usize));
+            return (cur, Some(s.gpu.qw_argmax_rows(&logits, m, c.vocab)));
         }
-        let g = s.gpu.read_all(ams).map_err(|e| anyhow!(e))?.into_iter().map(|v| v[0].to_bits()).collect();
-        Ok((g, xh))
+        (cur, None)
+    }
+
+    /// One stage of a verify pass. The full chunk size runs eagerly the first time, is recorded as a CUDA graph the second time and replayed after.
+    fn run_verify_stage(&self, si: usize, xh: &[f32], m: usize, full: bool) -> Result<(Handle, Option<Handle>)> {
+        let s = &self.stages[si];
+        if !full {
+            let x = s.gpu.upload_f32(xh);
+            return Ok(self.build_verify(si, &x, m, true));
+        }
+        let kind = match &*s.vgraph.borrow() {
+            VState::Ready { .. } => 0,
+            VState::Failed => 1,
+            VState::None => 2,
+            VState::Prepared => 3,
+        };
+        if kind == 0 {
+            if let VState::Ready { graph, out, .. } = &*s.vgraph.borrow() {
+                // SAFETY: as in `run_stage`: the recording's buffers are held, replayed on the stream it was recorded on, inputs written on it above
+                unsafe { graph.replay() }.map_err(|e| anyhow!("verify graph replay: {e:?}"))?;
+                return Ok((out.0.clone(), out.1.clone()));
+            }
+        }
+        if kind == 1 {
+            return Ok(self.build_verify(si, &s.vx_in, m, true));
+        }
+        if kind == 2 {
+            // capture mode on, one plain pass (it fills the scratch pool and settles the cached constants), the chunk undone, and the
+            // recording follows at once: nothing else touches this stream between the prepare and the capture
+            match s.gpu.client.graph_prepare() {
+                Ok(()) => {
+                    let o = self.build_verify(si, &s.vx_in, m, true);
+                    s.dev.spec_restore(&s.gpu);
+                    s.gpu.read_all(vec![(o.0, 1)]).map_err(|e| anyhow!(e))?;
+                }
+                Err(e) => {
+                    eprintln!("lb-qwen35: verify graph_prepare refused ({e:?})");
+                    *s.vgraph.borrow_mut() = VState::Failed;
+                    return Ok(self.build_verify(si, &s.vx_in, m, true));
+                }
+            }
+        }
+        let mut vs = s.vgraph.borrow_mut();
+        match s.gpu.client.start_capture() {
+            Err(e) => {
+                eprintln!("lb-qwen35: verify start_capture refused ({e:?})");
+                *vs = VState::Failed;
+                drop(vs);
+                Ok(self.build_verify(si, &s.vx_in, m, true))
+            }
+            Ok(()) => {
+                if std::env::var("LB_SCRATCH_LOG").is_ok() {
+                    eprintln!("--- verify capture begins, stage {si}");
+                }
+                let out = self.build_verify(si, &s.vx_in, m, false);
+                match s.gpu.client.stop_capture() {
+                    Ok(graph) => {
+                        let held = s.gpu.take_in_flight();
+                        eprintln!("lb-qwen35: stage {si} verify pass (m = {m}) recorded as a CUDA graph");
+                        unsafe { graph.replay() }.map_err(|e| anyhow!("verify graph replay: {e:?}"))?;
+                        *vs = VState::Ready { graph, out: out.clone(), _held: held };
+                        Ok(out)
+                    }
+                    Err(e) => {
+                        eprintln!("lb-qwen35: verify stop_capture refused ({e:?})");
+                        *vs = VState::Failed;
+                        drop(vs);
+                        Ok(self.build_verify(si, &s.vx_in, m, true))
+                    }
+                }
+            }
+        }
     }
 
     /// After [`run_rows`](Self::run_rows) at `pos0`: leave the recurrent state as after only the first `keep` of its tokens.

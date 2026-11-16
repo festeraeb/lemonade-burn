@@ -1352,6 +1352,88 @@ pub fn repack_q8_0(bytes: &[u8], n_blocks: usize) -> (Vec<u32>, Vec<u32>) {
     (qs, sc)
 }
 
+/// [`q8_0_matvec_rows_kernel`] for `mt` token rows at once: a plane takes `r` weight rows and runs all `mt` tokens over them, so every weight byte
+/// is read once for the whole chunk (a verify pass of a few speculative tokens). `x` is `[mt, cols]`, `out` `[mt, rows]`.
+#[cube(launch)]
+fn q8_0_matvec_rows_mt_kernel(qs: &[V4U], sc: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] r: usize, #[comptime] mt: usize) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let width = PLANE_DIM as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let groups = rows / r;
+    let mut g = CUBE_POS as usize * ppc + plane_id;
+    let mut acc = Array::<f32>::new(r * mt);
+    while g < groups {
+        let r0 = g * r;
+        let mut accv = Array::<V4F>::new(r * mt);
+        #[unroll]
+        for i in 0..r * mt {
+            accv[i] = V4F::new(0.0f32);
+        }
+        let mut b = lane;
+        while b < bpr {
+            let mut xv = Array::<V4F>::new(8usize * mt);
+            #[unroll]
+            for t in 0..mt {
+                #[unroll]
+                for j in 0..8usize {
+                    xv[t * 8usize + j] = x[t * cols / 4usize + b * 8usize + j];
+                }
+            }
+            #[unroll]
+            for i in 0..r {
+                let gb = (r0 + i) * bpr + b;
+                let d = f16_to_f32((sc[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+                let mut s = Array::<V4F>::new(mt);
+                #[unroll]
+                for t in 0..mt {
+                    s[t] = V4F::new(0.0f32);
+                }
+                #[unroll]
+                for h in 0..2usize {
+                    let w = qs[2usize * gb + h];
+                    #[unroll]
+                    for bb in 0..4u32 {
+                        let byte = (w >> V4U::new(8u32 * bb)) & V4U::new(255u32);
+                        let f = V4F::cast_from(V4I::cast_from(byte ^ V4U::new(128u32)) - V4I::new(128i32));
+                        #[unroll]
+                        for t in 0..mt {
+                            s[t] += f * xv[t * 8usize + 4usize * h + bb as usize];
+                        }
+                    }
+                }
+                #[unroll]
+                for t in 0..mt {
+                    accv[t * r + i] += V4F::new(d) * s[t];
+                }
+            }
+            b += width;
+        }
+        #[unroll]
+        for i in 0..r * mt {
+            let a = accv[i];
+            acc[i] = a.extract(0usize) + a.extract(1usize) + a.extract(2usize) + a.extract(3usize);
+        }
+        #[unroll]
+        for c in 0..r * mt / 4 {
+            let v = plane_sum4(&acc, c);
+            if lane == 0usize {
+                let t = (4usize * c) / r;
+                let i0 = (4usize * c) % r;
+                #[unroll]
+                for k in 0..4usize {
+                    out[t * rows + r0 + i0 + k] = v.extract(k);
+                }
+            }
+        }
+        g += step;
+    }
+}
+
 /// Q8_0 matvec, `r` rows per plane (needs plane ops; `rows % r == 0`, `r % 4 == 0`). `dims` =
 /// [rows, cols]; output `o = t * rows + row`.
 #[cube(launch)]

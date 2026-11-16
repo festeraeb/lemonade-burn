@@ -641,6 +641,45 @@ fn qw_argmax_kernel(x: &[f32], out: &mut [f32], #[comptime] n: usize) {
     }
 }
 
+/// [`qw_argmax_kernel`] over the `m` rows of an `[m, n]` matrix, one cube a row; row `r`'s index is written in `out[r]`.
+#[cube(launch)]
+fn qw_argmax_rows_kernel(x: &[f32], out: &mut [f32], #[comptime] n: usize) {
+    let t = UNIT_POS as usize;
+    let base = CUBE_POS_X as usize * n;
+    let mut sv = Shared::<[f32]>::new_slice(256usize);
+    let mut si = Shared::<[u32]>::new_slice(256usize);
+    let mut bv = x[base] * 0.0f32 - 3.0e38f32;
+    let mut bi = 0u32;
+    let mut i = t;
+    while i < n {
+        let v = x[base + i];
+        if v > bv {
+            bv = v;
+            bi = i as u32;
+        }
+        i += 256usize;
+    }
+    sv[t] = bv;
+    si[t] = bi;
+    sync_cube();
+    let mut st = 128usize;
+    while st > 0usize {
+        if t < st {
+            let ov = sv[t + st];
+            let oi = si[t + st];
+            if ov > sv[t] || (ov == sv[t] && oi < si[t]) {
+                sv[t] = ov;
+                si[t] = oi;
+            }
+        }
+        sync_cube();
+        st = st / 2usize;
+    }
+    if t == 0usize {
+        out[CUBE_POS_X as usize] = f32::reinterpret(si[0usize]);
+    }
+}
+
 /// Softmax over `ne` (<= 512) router logits, top `k` by probability (ties: lowest index), weights renormalised; writes `[expert, 0]`
 /// pairs. One cube of 256 units (`ne` <= 256): max and sum reductions, then every expert counts how many outrank it.
 #[cube(launch)]
@@ -887,6 +926,15 @@ impl Gpu {
         let out = self.scratch(4);
         unsafe {
             qw_argmax_kernel::launch(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(x.clone(), n), BufferArg::from_raw_parts(out.clone(), 1), n);
+        }
+        out
+    }
+
+    /// Argmax of each of the `m` rows of `[m, n]`: `m` u32 bit patterns in an f32 buffer.
+    pub fn qw_argmax_rows(&self, x: &Handle, m: usize, n: usize) -> Handle {
+        let out = self.scratch(m * 4);
+        unsafe {
+            qw_argmax_rows_kernel::launch(&self.client, CubeCount::Static(m as u32, 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(x.clone(), m * n), BufferArg::from_raw_parts(out.clone(), m), n);
         }
         out
     }

@@ -1672,6 +1672,12 @@ impl GpuNativeExperts {
 
     /// As [`launch`](Self::launch) with the activation already in the permuted order (`qw_rms`'s / `qw_add_rms`'s second output).
     pub fn launch_permuted(&self, gpu: &Gpu, xp: Handle, routes: &Handle, slots: usize) -> Handle {
+        self.launch_permuted_m(gpu, xp, routes, slots, 1)
+    }
+
+    /// As [`launch_permuted`](Self::launch_permuted) for `xm` activation rows (`xp` `[xm, embd]` permuted): slot `s` reads row `routes[2 s + 1]`
+    /// (the `(expert, token)` pairs of `qp_route_rows`). No host round trip: a batched verify of a few tokens, safe inside a CUDA graph.
+    pub fn launch_permuted_m(&self, gpu: &Gpu, xp: Handle, routes: &Handle, slots: usize, xm: usize) -> Handle {
         let h = gpu.scratch(slots * self.ff * 4);
         let out = gpu.scratch(slots * self.embd * 4);
         let d_gu = gpu.const_u32(&[self.ff as u32, self.embd as u32]);
@@ -1688,7 +1694,7 @@ impl GpuNativeExperts {
                     CubeDim::new_1d(gpu.cube_dim as u32),
                     BufferArg::from_raw_parts(gw.clone(), n / 4),
                     BufferArg::from_raw_parts(uw.clone(), n / 4),
-                    BufferArg::from_raw_parts(xp, self.embd / 4),
+                    BufferArg::from_raw_parts(xp, xm * self.embd / 4),
                     BufferArg::from_raw_parts(routes.clone(), 2 * slots),
                     BufferArg::from_raw_parts(d_gu, 2),
                     BufferArg::from_raw_parts(h.clone(), slots * self.ff),
@@ -1700,7 +1706,7 @@ impl GpuNativeExperts {
                     CubeDim::new_1d(gpu.cube_dim as u32),
                     BufferArg::from_raw_parts(gw.clone(), n / 4),
                     BufferArg::from_raw_parts(uw.clone(), n / 4),
-                    BufferArg::from_raw_parts(xp, self.embd / 4),
+                    BufferArg::from_raw_parts(xp, xm * self.embd / 4),
                     BufferArg::from_raw_parts(routes.clone(), 2 * slots),
                     BufferArg::from_raw_parts(d_gu, 2),
                     BufferArg::from_raw_parts(h.clone(), slots * self.ff),
@@ -1716,7 +1722,7 @@ impl GpuNativeExperts {
                     BufferArg::from_raw_parts(u.0.clone(), n.0 / 4),
                     BufferArg::from_raw_parts(u.1.clone(), n.1 / 4),
                     BufferArg::from_raw_parts(u.2.clone(), n.2),
-                    BufferArg::from_raw_parts(xp, self.embd / 4),
+                    BufferArg::from_raw_parts(xp, xm * self.embd / 4),
                     BufferArg::from_raw_parts(routes.clone(), 2 * slots),
                     BufferArg::from_raw_parts(d_gu, 2),
                     BufferArg::from_raw_parts(h.clone(), slots * self.ff),

@@ -33,6 +33,15 @@ impl DMat {
             DMat::Q8(m) => m.launch(gpu, x, 1),
         }
     }
+    /// The decode matvec over `m` token rows (`[m, rows]`): every plane runs one token's rows, no tile padding. For a verify chunk of a few tokens
+    /// (records into a CUDA graph; the tiled GEMM does not).
+    pub(crate) fn launch_m(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        match self {
+            DMat::Q5(a) => a.launch(gpu, x, m),
+            DMat::Q6(a) => a.launch(gpu, x, m),
+            DMat::Q8(a) => a.launch_mt(gpu, x, m),
+        }
+    }
     /// Tiled GEMM over `m` token rows (prefill): `[m, rows]`.
     pub(crate) fn gemm(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
         match self {
@@ -377,6 +386,57 @@ impl DevModel {
         Ok(gpu.qp_combine_rows(&x1, &down, &weights, &shout, &logits, m, c.n_embd, c.n_used, c.n_expert))
     }
 
+    /// The verify-pass layer: [`prefill_layer`](Self::prefill_layer)'s arithmetic for a few tokens with every step on the device (no routes read back;
+    /// the routed experts run the row-indexed decode kernels), so a stage's whole pass can be recorded as one CUDA graph. Records the delta-net inputs.
+    pub fn verify_layer(&self, gpu: &Gpu, i: usize, x: &Handle, m: usize) -> Handle {
+        let c = &self.cfg;
+        let l = &self.layers[i];
+        let stop = std::env::var("LB_VG_STOP").unwrap_or_default();
+        let h = gpu.qp_rms_rows(x, &l.attn_norm, m, c.n_embd, c.eps);
+        if stop == "rms" { return x.clone(); }
+        let y = if let Some(d) = &l.lin {
+            let qkv = d.qkv.launch_m(gpu, &h, m);
+            if stop == "qkv gemm" { return x.clone(); }
+            let z = d.z.launch_m(gpu, &h, m);
+            if stop == "z gemm" { return x.clone(); }
+            let ba = gpu.qp_f32_rows(&d.ba, &h, m, 2 * c.n_v_heads, c.n_embd);
+            if stop == "ba" { return x.clone(); }
+            if let Some(k) = &self.spec[i] {
+                gpu.qw_copy(&qkv, &k.qkv, m * c.conv_channels());
+                gpu.qw_copy(&z, &k.z, m * c.d_inner);
+                gpu.qw_copy(&ba, &k.ba, m * 2 * c.n_v_heads);
+                if stop == "copy keep" { return x.clone(); }
+            }
+            let core = gpu.qp_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, &self.pp2, m, (c.conv_channels(), c.n_k_heads, c.n_v_heads, c.head_k), c.eps);
+            if stop == "dn core" { return x.clone(); }
+            d.out.launch_m(gpu, &core, m)
+        } else {
+            let a = l.attn.as_ref().unwrap();
+            let qf = a.q.launch_m(gpu, &h, m);
+            let k = a.k.launch_m(gpu, &h, m);
+            let v = a.v.launch_m(gpu, &h, m);
+            if stop == "attn proj" { return x.clone(); }
+            let o = gpu.qp_attention(&qf, &k, &v, &a.qn, &a.kn, &a.kc, &a.vc, &self.pp1, m, (c.n_head, c.n_head_kv, c.head_dim, c.n_rot / 2, self.cap), c.eps, self.theta_scale);
+            if stop == "attn core" { return x.clone(); }
+            a.o.launch_m(gpu, &o, m)
+        };
+        if stop == "mixer out" { return x.clone(); }
+        let x1 = gpu.qw_add(x, &y, m * c.n_embd);
+        let h2 = gpu.qp_rms_rows(&x1, &l.post_norm, m, c.n_embd, c.eps);
+        let logits = gpu.qp_f32_rows(&l.router_sg, &h2, m, c.n_expert + 1, c.n_embd);
+        let (routes, weights) = gpu.qp_route_rows(&logits, m, c.n_expert, c.n_used);
+        if stop == "route" { return x.clone(); }
+        let h2p = gpu.qw_permute_x(&h2, m * c.n_embd);
+        if stop == "permute" { return x.clone(); }
+        let down = l.experts.launch_permuted_m(gpu, h2p, &routes, m * c.n_used, m);
+        if stop == "experts" { return x.clone(); }
+        let gg = l.sh_gate.launch_m(gpu, &h2, m);
+        let uu = l.sh_up.launch_m(gpu, &h2, m);
+        let sh = gpu.qw_silu_mul(&gg, &uu, m * c.ff_shexp);
+        let shout = l.sh_down.launch_m(gpu, &sh, m);
+        gpu.qp_combine_rows(&x1, &down, &weights, &shout, &logits, m, c.n_embd, c.n_used, c.n_expert)
+    }
+
     /// Copy the recurrent state and the first `len` KV positions of every layer to the host (a rewind point for prefix reuse).
     pub fn snapshot(&self, gpu: &Gpu, len: usize) -> Result<Vec<LayerSnap>> {
         let c = &self.cfg;
@@ -430,6 +490,17 @@ impl DevModel {
             if let (Some(d), Some(k)) = (&l.lin, k) {
                 gpu.qw_copy(&d.conv_state, &k.ck_conv, 2 * (c.d_conv - 1) * c.conv_channels());
                 gpu.qw_copy(&d.s, &k.ck_s, c.n_v_heads * c.head_v() * c.head_k);
+            }
+        }
+    }
+
+    /// Put every delta-net layer's recurrent state back to the checkpoint (a whole chunk undone).
+    pub fn spec_restore(&self, gpu: &Gpu) {
+        let c = &self.cfg;
+        for (l, k) in self.layers.iter().zip(&self.spec) {
+            if let (Some(d), Some(k)) = (&l.lin, k) {
+                gpu.qw_copy(&k.ck_conv, &d.conv_state, 2 * (c.d_conv - 1) * c.conv_channels());
+                gpu.qw_copy(&k.ck_s, &d.s, c.n_v_heads * c.head_v() * c.head_k);
             }
         }
     }
