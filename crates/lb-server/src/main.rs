@@ -509,12 +509,14 @@ fn thinking_on(req: &ChatReq) -> bool {
 struct ThinkSplit {
     in_reasoning: bool,
     started: bool,
+    /// Whitespace right after `</think>` is dropped, even when it arrives in a later chunk.
+    lead_trim: bool,
     buf: String,
 }
 
 impl ThinkSplit {
     fn new(in_reasoning: bool) -> Self {
-        Self { in_reasoning, started: in_reasoning, buf: String::new() }
+        Self { in_reasoning, started: in_reasoning, lead_trim: false, buf: String::new() }
     }
     /// Feed text; returns `(reasoning, content)` ready to send. `last` flushes what is held back.
     fn push(&mut self, t: &str, last: bool) -> (String, String) {
@@ -528,6 +530,7 @@ impl ThinkSplit {
                     self.buf = rest;
                     self.in_reasoning = false;
                     self.started = true;
+                    self.lead_trim = true;
                     continue;
                 }
                 let hold = if last { 0 } else { tag_prefix_len(&self.buf, "</think>") };
@@ -553,6 +556,13 @@ impl ThinkSplit {
                 self.started = true;
                 continue;
             } else {
+                if self.lead_trim {
+                    let rest = self.buf.trim_start().to_string();
+                    self.buf = rest;
+                    if !self.buf.is_empty() {
+                        self.lead_trim = false;
+                    }
+                }
                 c.push_str(&self.buf);
                 self.buf.clear();
             }
@@ -1251,6 +1261,12 @@ mod think_tests {
     fn open_block_splits_at_close_tag_even_across_chunks() {
         let (r, c) = run(true, &["Here's a th", "inking <", "/thi", "nk>\n\n", "391"]);
         assert_eq!((r.as_str(), c.as_str()), ("Here's a thinking ", "391"));
+    }
+
+    #[test]
+    fn whitespace_after_close_tag_is_dropped_across_chunks() {
+        let (r, c) = run(true, &["think", "</think>", "\n", "\n", "```rust\nfn x() {}\n```"]);
+        assert_eq!((r.as_str(), c.as_str()), ("think", "```rust\nfn x() {}\n```"));
     }
 
     #[test]

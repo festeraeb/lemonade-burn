@@ -57,7 +57,12 @@ def run(args):
     return [json.loads(l) for l in r.stdout.strip().splitlines() if l.startswith("{")], r.stderr[-300:]
 try:
     res, err = run(["decode", "256"]); emit(event="decode", runs=res, err=err, vram_mib=[smi()[c][0] for c in S["cards"]])
-    for i, n in enumerate(sizes):
+    if os.environ.get("THINK"):
+        r = subprocess.run(["python3", BENCH.replace("limits_bench.py", "think_check.py"), str(port), "test"], capture_output=True, text=True, timeout=3000)
+        for l in r.stdout.strip().splitlines():
+            emit(event="think", **json.loads(l))
+        if r.stderr: emit(event="think_err", err=r.stderr[-300:])
+    for i, n in enumerate([x for x in sizes if x > 0]):
         try:
             res, err = run(["prompt", str(n), str(i + 1)]); emit(event="prompt", want=n, runs=res, err=err, vram_mib=[smi()[c][0] for c in S["cards"]], peak_mib=[peak[c][0] for c in S["cards"]])
         except Exception as e:
