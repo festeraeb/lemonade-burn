@@ -427,3 +427,33 @@ Whole-model gates on the final build (570 positions, the five texts, both cards,
 | llama.cpp batch vs its own single-token path, same run | 97.37 % (555/570) / 0.00636 |
 
 Identical to before the speed work to the digit on the llama.cpp comparisons. Tiel-Coder-35B through the same server: 75.3-76.3 tok/s (median 75.8, was 63.7). The manifest entry `hard-qwen36-own-2card-c4` now names build `20261116-qwen35-6b421ab` (backup `var/fleet-manifest.json.bak-20261116-qwen-d`).
+
+## 16. Step E: batched prefill (2026-11-16)
+
+**Built** (`lb-q4-gpu/src/qgemm.rs`, `qprefill.rs`, `kquant.rs`; `lb-qwen35/src/device.rs`, `pipeline.rs`; `lb-server/src/qwen.rs`):
+* Tiled GEMMs on the file-density matrices (`kq_gemm_kernel`: a cube owns 64 tokens x 64 weight rows, 256 units a 4x4 sub-tile, one 32-column slab staged in shared memory a step, dequantised to f32 in the staging step: Q5_K, Q6_K, Q8_0), dense and grouped (routed
+  experts: slots sorted by expert on the host, tiles of at most 64 slots of one expert, gate+up+SiLU as one launch, down for Q5_K / Q6_K / Q8_0). A 4-wide variant (the structure of the Q4_0 `gemm_v4`) is built and verified but was slower on the real shapes (3.35 vs 2.95 s of expert time): opt-in `LB_QGEMM_V4=1`.
+* Batched kernels: RMS norm rows, f32 GEMM for the router and beta/alpha, router top-8 per token, causal conv + conv-state handover, L2 norms, **the delta rule with a plane per state row** (the row lives in registers for the whole chunk: 2.2 s -> 0.5 s of a 3000-token prompt), gated norm, attention prep (norm + partial rotary + KV append per token) and causal attention (a cube per head and query, scores in shared memory so at most 4096 positions), MoE combine.
+* **A two-stage software pipeline**: one thread a card; chunk c+1 on stage 0 while chunk c is on stage 1, hidden rows handed over through the host. The chunk size defaults to a quarter of the stage count's share (64..1024 tokens). This is what takes 3000 tokens from 407 to 620 tok/s.
+* Server: prompts of 8 or more new tokens (`LB_QW_PREFILL_MIN`) up to position 4096 go through the prefill; decode CUDA graphs are captured at load (before any prefill: a capture started after the stage threads have written the shared buffers is invalidated by CUDA, found the hard way); after a prefill every persistent buffer is touched once from the model thread to settle the cross-stream ordering.
+* **Prefix reuse for chat**: `Decoder::checkpoint`/`rewind` implemented as a host snapshot of every layer's recurrent state and the KV prefix (about 190 MB at 3000 tokens, 60-180 ms), restored on rewind (70-100 ms); the server's existing prompt cache then keeps checkpoints at the end of a prompt and 8 tokens before it (`LB_PROMPT_CACHE_TAIL` defaults to 8 for this family: the template re-renders the previous assistant turn without its think block, so the reusable prefix ends a few tokens before the previous prompt's end).
+
+**Correctness** (last position, prefill vs the same tokens as single steps on the device, then 24 greedy tokens continued from each state) [measured, `qwen35-dev-check pcheck`]:
+
+| prompt | last-position logits | greedy continuation |
+|---|---|---|
+| 70 tokens | top-1 same, max abs diff 1.9e-5, KL 3.4e-13 | identical (24) |
+| 600 tokens | top-1 same, max abs diff 9.2e-2, KL 2.7e-9 | identical (24) |
+| 3000 tokens | top-1 same, max abs diff 0.69, KL 1.3e-6 | identical (24) |
+
+Not bit-identical: the GEMM-based router, the tiled sums and the batched recurrence sum in a different order; the difference grows with the length (the recurrent state integrates 3000 tokens) but stays far under the margin that decides the next token (KL 1.3e-6). The logits at the last position of a **long** prompt therefore differ from the token-by-token path by up to 0.7 in the worst vocabulary entry; the top-1 and the continuation do not.
+
+**Speed** [measured, c4 AF + D8, 3000-token prompt = the five test texts repeated, warm]:
+
+| chunk | prefill tok/s |
+|---|---|
+| serial stages, 512 | 280 |
+| serial stages, 1024 | 348; with tuned GEMM and delta rule, chunk 2048: 407 |
+| **pipelined stages, adaptive / 1024** | **620 / 629** (gate 500) |
+
+Time split of a 3000-token prefill before pipelining (serial, 1024-chunks, seconds): routed experts 3.0-3.5, dense GEMMs 2.2, attention core 1.0, delta rule 0.5, router + norms 0.5, shared expert 0.35. Small prompts do not get faster: a chunk of 32-37 tokens still costs about 0.5 s (a 37-token prefill is 13 ms a token, the decode rate), because 37 tokens x 8 routed experts touch about 190 of 256 experts per layer and the grouped GEMM reads each at about 70 GB/s.

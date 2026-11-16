@@ -298,11 +298,16 @@ fn warm_up<D: Decoder>(model: &D) {
 fn worker<D: Decoder>(model: D, codec: Arc<TextCodec>, rx: std_mpsc::Receiver<Job>) {
     let mut session: Option<Session<D>> = None;
     warm_up(&model);
+    READY.store(true, Ordering::Release);
     while let Ok(job) = rx.recv() {
         // the session is taken out for the job: a panic mid-pass leaves none behind
         let prev = if prompt_cache_on() { session.take() } else { None };
         session = None;
+        let t_job = Instant::now();
         let res = guarded(&model, || run_job(&model, &codec, &job, prev));
+        if std::env::var("LB_TRACE_REQ").is_ok() {
+            eprintln!("lb-server: job of {} prompt tokens took {:.0} ms in the model thread", job.prompt.len(), t_job.elapsed().as_secs_f64() * 1e3);
+        }
         let res = res.map(|s| session = s);
         if let Err(e) = res {
             let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
@@ -523,7 +528,12 @@ async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatReq>) -> Resp
         return err(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
     let no_think = req.chat_template_kwargs.as_ref().and_then(|k| k.get("enable_thinking")).and_then(Value::as_bool) == Some(false);
-    let prompt = match st.codec.encode_chat_suffix(&msgs, if no_think { "<think></think>" } else { "" }) {
+    let t_enc = std::time::Instant::now();
+    let enc_res = st.codec.encode_chat_suffix(&msgs, if no_think { "<think></think>" } else { "" });
+    if std::env::var("LB_TRACE_REQ").is_ok() {
+        eprintln!("lb-server: tokenisation of the chat prompt took {:.0} ms", t_enc.elapsed().as_secs_f64() * 1e3);
+    }
+    let prompt = match enc_res {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
@@ -633,15 +643,26 @@ fn stream_events(
     })
 }
 
-async fn models(State(st): State<Arc<AppState>>) -> Json<Value> {
+async fn models(State(st): State<Arc<AppState>>) -> Response {
+    if !READY.load(Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": {"message": "model is warming up", "type": "loading"}}))).into_response();
+    }
     Json(json!({"object": "list", "data": [{
         "id": st.model_id, "object": "model", "created": st.started, "owned_by": RUNTIME_NAME,
         "context_length": st.ctx
-    }]}))
+    }]})).into_response()
 }
 
-async fn health(State(st): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({"status": "ok", "runtime": RUNTIME_NAME, "version": env!("CARGO_PKG_VERSION"), "model": st.model_id, "model_loaded": st.model_id}))
+/// False from process start until the model thread has finished its warm-up: the HTTP server is up long before (it starts while the model
+/// thread is still running the warm-up sequence), and a request that arrives meanwhile queues behind the warm-up, so `/health` says `loading`
+/// (503) until the model can answer at full speed.
+static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn health(State(st): State<Arc<AppState>>) -> Response {
+    if !READY.load(Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"status": "loading", "runtime": RUNTIME_NAME, "model": st.model_id, "detail": "warming up"}))).into_response();
+    }
+    Json(json!({"status": "ok", "runtime": RUNTIME_NAME, "version": env!("CARGO_PKG_VERSION"), "model": st.model_id, "model_loaded": st.model_id})).into_response()
 }
 
 /// Where the expert calls went since start: how many the GPU residents caught, how many
