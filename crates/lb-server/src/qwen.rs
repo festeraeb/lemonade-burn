@@ -26,6 +26,17 @@ pub struct QCache {
     len: usize,
 }
 
+/// A rewind point: the sequence state at `len` tokens, on the host.
+pub struct QSnap {
+    len: usize,
+    state: Vec<Vec<lb_qwen35::device::LayerSnap>>,
+}
+
+/// Prompts of at least this many new tokens go through the batched prefill (`LB_QW_PREFILL_MIN`, default 8; 0 = never).
+fn prefill_min() -> usize {
+    std::env::var("LB_QW_PREFILL_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+}
+
 pub fn is_qwen(p: &Path) -> bool {
     lb_gguf::Gguf::open(p).ok().and_then(|g| g.meta_str("general.architecture").map(|a| a == "qwen35moe")) == Some(true)
 }
@@ -53,7 +64,21 @@ pub fn load(path: &Path, ctx: usize) -> Result<(QwenDev, Arc<TextCodec>, usize)>
 
 impl Decoder for QwenDev {
     type Cache = QCache;
-    type Checkpoint = ();
+    type Checkpoint = QSnap;
+    fn checkpoint(&self, cache: &mut QCache) -> Option<QSnap> {
+        match self.pipe.snapshot(cache.len) {
+            Ok(state) => Some(QSnap { len: cache.len, state }),
+            Err(e) => {
+                eprintln!("lb-server: qwen checkpoint failed ({e}); this turn will not be reusable");
+                None
+            }
+        }
+    }
+    fn rewind(&self, cache: &mut QCache, cp: &QSnap) -> bool {
+        self.pipe.restore(&cp.state);
+        cache.len = cp.len;
+        true
+    }
     fn new_cache(&self) -> QCache {
         QCache { len: 0 }
     }
@@ -67,6 +92,12 @@ impl Decoder for QwenDev {
             self.pipe.reset();
         }
         assert!(cache.len + tokens.len() <= self.cap, "sequence exceeds the KV capacity {}", self.cap);
+        let pm = prefill_min();
+        if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= 4096 {
+            let l = self.pipe.prefill(tokens, cache.len, 0).expect("device prefill");
+            cache.len += tokens.len();
+            return l;
+        }
         let mut last = None;
         for (i, &t) in tokens.iter().enumerate() {
             last = self.pipe.step(t, cache.len, i + 1 == tokens.len()).expect("device step");
@@ -79,6 +110,12 @@ impl Decoder for QwenDev {
             self.pipe.reset();
         }
         assert!(cache.len + tokens.len() <= self.cap, "sequence exceeds the KV capacity {}", self.cap);
+        let pm = prefill_min();
+        if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= 4096 {
+            let l = self.pipe.prefill(tokens, cache.len, 0).expect("device prefill");
+            cache.len += tokens.len();
+            return Some(l.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32);
+        }
         let (last, head) = tokens.split_last().expect("tokens");
         for &t in head {
             self.pipe.step(t, cache.len, false).expect("device step");

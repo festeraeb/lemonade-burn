@@ -223,6 +223,133 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         s.dev.bench_parts(&s.gpu, il - s.first, reps)
     }
 
+    /// Final norm + head on one hidden row (outside the stage graphs): the logits.
+    fn head_logits(&self, xrow: &[f32]) -> Result<Vec<f32>> {
+        let c = &self.model.cfg;
+        let s = self.stages.last().unwrap();
+        let h = s.head.as_ref().ok_or_else(|| anyhow!("no head"))?;
+        let x = s.gpu.upload_f32(xrow);
+        let nrm = s.gpu.qw_rms(&x, &h.norm, 1, c.n_embd, c.eps).0;
+        let logits = match &h.out {
+            HeadMat::Q6(m) => m.launch(&s.gpu, &nrm, 1),
+            HeadMat::Q8(m) => m.launch(&s.gpu, &nrm, 1),
+        };
+        Ok(s.gpu.read_all(vec![(logits, c.vocab)]).map_err(|e| anyhow!(e))?.remove(0))
+    }
+
+    pub fn ptime_report(&self) -> Vec<(&'static str, f64)> {
+        crate::device::ptime_report()
+    }
+
+    /// Batched prompt processing: `tokens` at positions `pos0 ..` in chunks (tiled GEMMs, batched kernels), the stages as a software pipeline: one thread a
+    /// stage, chunk `c + 1` on stage 0 while chunk `c` is on stage 1, a chunk's hidden rows handed over through the host. Returns the logits of the last
+    /// token. State and KV cache afterwards are those of token-by-token steps. Needs `pos0 + tokens.len() <= 4096` (the attention kernel keeps its scores in
+    /// shared memory). `chunk` 0 picks a size giving each stage about four chunks (64..1024 tokens).
+    pub fn prefill(&self, tokens: &[u32], pos0: usize, chunk: usize) -> Result<Vec<f32>> {
+        use std::sync::mpsc;
+        let c = &self.model.cfg;
+        if pos0 + tokens.len() > 4096 {
+            return Err(anyhow!("prefill supports positions below 4096"));
+        }
+        let nst = self.stages.len();
+        let chunk = if chunk > 0 { chunk } else { (tokens.len().div_ceil(2 * nst).div_ceil(64) * 64).clamp(64, 1024) };
+        let mut spans = Vec::new();
+        let mut p = 0usize;
+        while p < tokens.len() {
+            let m = chunk.min(tokens.len() - p);
+            spans.push((p, m));
+            p += m;
+        }
+        struct Raw<T>(*const T);
+        unsafe impl<T> Send for Raw<T> {}
+        // channels: stage i sends its output rows to stage i + 1
+        let mut txs = Vec::new();
+        let mut rxs = Vec::new();
+        for _ in 0..nst {
+            let (t, r) = mpsc::channel::<Result<(usize, Vec<f32>)>>();
+            txs.push(t);
+            rxs.push(Some(r));
+        }
+        let (last_tx, last_rx) = mpsc::channel::<Result<Vec<f32>>>();
+        std::thread::scope(|sc| {
+            for si in 0..nst {
+                let s = Raw(&self.stages[si] as *const Stage);
+                let model = Raw(self.model as *const Model<'a>);
+                let rx = rxs[si].take().unwrap();
+                let next = if si + 1 < nst { Some(txs[si + 1].clone()) } else { None };
+                let last_tx = last_tx.clone();
+                let spans = spans.clone();
+                let flush = self.flush;
+                let ncfg = (c.n_embd, spans.len());
+                let tok_ptr = Raw(tokens.as_ptr());
+                let tok_len = tokens.len();
+                sc.spawn(move || {
+                    let (s, model, tok_ptr) = (s, model, tok_ptr);
+                    // SAFETY: the stage, the model and the tokens outlive the scope; each stage is touched by its own thread only
+                    let (s, model, tokens) = unsafe { (&*s.0, &*model.0, std::slice::from_raw_parts(tok_ptr.0, tok_len)) };
+                    let n_embd = ncfg.0;
+                    for (ci, &(p, m)) in spans.iter().enumerate() {
+                        let run = || -> Result<Vec<f32>> {
+                            let xh = if si == 0 {
+                                let mut xh = vec![0f32; m * n_embd];
+                                for (i, &t) in tokens[p..p + m].iter().enumerate() {
+                                    model.tok_embd.dequant_row(t as usize, &mut xh[i * n_embd..(i + 1) * n_embd]);
+                                }
+                                xh
+                            } else {
+                                match rx.recv() {
+                                    Ok(Ok((_, v))) => v,
+                                    Ok(Err(e)) => return Err(e),
+                                    Err(e) => return Err(anyhow!("stage hand-over: {e}")),
+                                }
+                            };
+                            let mut cur = s.gpu.upload_f32(&xh);
+                            s.dev.set_chunk(&s.gpu, pos0 + p, m);
+                            for l in 0..s.dev.layers.len() {
+                                cur = s.dev.prefill_layer(&s.gpu, l, &cur, m)?;
+                                if flush > 0 {
+                                    s.gpu.flush_queue();
+                                }
+                            }
+                            s.gpu.read_all(vec![(cur, m * n_embd)]).map_err(|e| anyhow!(e)).map(|mut v| v.remove(0))
+                        };
+                        match run() {
+                            Ok(v) => {
+                                if let Some(nx) = &next {
+                                    let _ = nx.send(Ok((ci, v)));
+                                } else if ci + 1 == spans.len() {
+                                    let _ = last_tx.send(Ok(v[(m - 1) * n_embd..m * n_embd].to_vec()));
+                                }
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if let Some(nx) = &next {
+                                    let _ = nx.send(Err(anyhow!(msg.clone())));
+                                }
+                                let _ = last_tx.send(Err(anyhow!(msg)));
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+            drop(last_tx);
+        });
+        let row = last_rx.recv().map_err(|e| anyhow!("prefill produced no result: {e}"))??;
+        self.head_logits(&row)
+    }
+
+    /// Host copy of the whole sequence state at `len` tokens.
+    pub fn snapshot(&self, len: usize) -> Result<Vec<Vec<crate::device::LayerSnap>>> {
+        self.stages.iter().map(|s| s.dev.snapshot(&s.gpu, len)).collect()
+    }
+
+    pub fn restore(&self, snap: &[Vec<crate::device::LayerSnap>]) {
+        for (s, sn) in self.stages.iter().zip(snap) {
+            s.dev.restore(&s.gpu, sn);
+        }
+    }
+
     pub fn first_layer_of_stage(&self, i: usize) -> usize {
         self.stages[i].first
     }

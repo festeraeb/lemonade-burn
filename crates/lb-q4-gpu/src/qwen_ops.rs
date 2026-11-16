@@ -11,9 +11,21 @@ use cubecl::prelude::*;
 type Handle = cubecl::server::Handle;
 
 #[cube]
+pub(crate) fn silu_pub(x: f32) -> f32 {
+    x / (1.0f32 + Exp::exp(-x))
+}
+
+#[cube]
+pub(crate) fn sigmoid_pub(x: f32) -> f32 {
+    1.0f32 / (1.0f32 + Exp::exp(-x))
+}
+
+#[cube]
 fn silu_f(x: f32) -> f32 {
     x / (1.0f32 + Exp::exp(-x))
 }
+
+pub(crate) fn _marker() {}
 
 /// Index of value `i` in the 16-value-permuted order of `perm16_kernel` (`y[16a + 4j + i'] = x[16a + 4i' + j]`).
 #[cube]

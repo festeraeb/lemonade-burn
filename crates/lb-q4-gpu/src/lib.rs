@@ -19,6 +19,8 @@
 pub mod decode;
 pub mod gemm;
 pub mod kquant;
+pub mod qgemm;
+pub mod qprefill;
 pub mod qwen_ops;
 pub mod prefill;
 pub mod store;

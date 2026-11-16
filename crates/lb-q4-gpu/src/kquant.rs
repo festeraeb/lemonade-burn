@@ -236,6 +236,16 @@ fn sbyte(s0: u32, s1: u32, s2: u32, i: u32) -> u32 {
 }
 
 #[cube]
+pub(crate) fn k4_scale_pub(s0: u32, s1: u32, s2: u32, g: u32) -> u32 {
+    k4_scale(s0, s1, s2, g)
+}
+
+#[cube]
+pub(crate) fn k4_min_pub(s0: u32, s1: u32, s2: u32, g: u32) -> u32 {
+    k4_min(s0, s1, s2, g)
+}
+
+#[cube]
 fn k4_scale(s0: u32, s1: u32, s2: u32, g: u32) -> u32 {
     let mut r = sbyte(s0, s1, s2, g) & 63u32;
     if g >= 4u32 {
@@ -1935,6 +1945,123 @@ impl GpuQ8Native {
                 k,
                 sg_off,
             );
+        }
+        out
+    }
+}
+
+// ---- prefill GEMMs (see `qgemm.rs`): many token rows against the same file-density weights
+
+use crate::qgemm::{kq_gemm_kernel, kq_gemm_v4_kernel, QT_Q5K, QT_Q6K, QT_Q8};
+
+fn gemm_launch(gpu: &Gpu, qt: u32, a: [(&Handle, usize); 3], b: Option<[(&Handle, usize); 3]>, x: &Handle, routes: &Handle, n_routes: usize, perm: &Handle, n_perm: usize, tiles: &Handle, n_tiles: usize, dims: &[u32; 3], out: &Handle, n_out: usize, n_x: usize, (grouped, src_tok): (bool, bool), grid_y: usize) {
+    let dummy = gpu.const_u32(&[0u32]);
+    let gate_up = b.is_some();
+    let b = b.unwrap_or([(&dummy, 1), (&dummy, 1), (&dummy, 1)]);
+    let dh = gpu.const_u32(dims);
+    let rows = dims[0] as usize;
+    if std::env::var("LB_QGEMM_V4").is_err() {
+        unsafe {
+            kq_gemm_kernel::launch(
+                &gpu.client,
+                CubeCount::Static(rows.div_ceil(64) as u32, grid_y as u32, 1),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(a[0].0.clone(), a[0].1),
+                BufferArg::from_raw_parts(a[1].0.clone(), a[1].1),
+                BufferArg::from_raw_parts(a[2].0.clone(), a[2].1),
+                BufferArg::from_raw_parts(b[0].0.clone(), b[0].1),
+                BufferArg::from_raw_parts(b[1].0.clone(), b[1].1),
+                BufferArg::from_raw_parts(b[2].0.clone(), b[2].1),
+                BufferArg::from_raw_parts(x.clone(), n_x),
+                BufferArg::from_raw_parts(routes.clone(), n_routes),
+                BufferArg::from_raw_parts(perm.clone(), n_perm),
+                BufferArg::from_raw_parts(tiles.clone(), n_tiles),
+                BufferArg::from_raw_parts(dh, 3),
+                BufferArg::from_raw_parts(out.clone(), n_out),
+                qt,
+                grouped,
+                gate_up,
+                src_tok,
+            );
+        }
+        return;
+    }
+    unsafe {
+        kq_gemm_v4_kernel::launch(
+            &gpu.client,
+            CubeCount::Static(rows.div_ceil(64) as u32, grid_y as u32, 1),
+            CubeDim::new_1d(128),
+            BufferArg::from_raw_parts(a[0].0.clone(), a[0].1),
+            BufferArg::from_raw_parts(a[1].0.clone(), a[1].1),
+            BufferArg::from_raw_parts(a[2].0.clone(), a[2].1),
+            BufferArg::from_raw_parts(b[0].0.clone(), b[0].1),
+            BufferArg::from_raw_parts(b[1].0.clone(), b[1].1),
+            BufferArg::from_raw_parts(b[2].0.clone(), b[2].1),
+            BufferArg::from_raw_parts(x.clone(), n_x / 4),
+            BufferArg::from_raw_parts(routes.clone(), n_routes),
+            BufferArg::from_raw_parts(perm.clone(), n_perm),
+            BufferArg::from_raw_parts(tiles.clone(), n_tiles),
+            BufferArg::from_raw_parts(dh, 3),
+            BufferArg::from_raw_parts(out.clone(), n_out),
+            qt,
+            grouped,
+            gate_up,
+            src_tok,
+        );
+    }
+}
+
+impl GpuQ5KNative {
+    /// `out[t, r] = W[r] . x[t]` for `m` token rows (`x` f32 `[m, cols]` on the device). Returns `[m, rows]`.
+    pub fn gemm(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        let out = gpu.scratch(m * self.rows * 4);
+        let d = gpu.const_u32(&[0u32]);
+        gemm_launch(gpu, QT_Q5K, [(&self.w, self.n_words), (&d, 1), (&d, 1)], None, x, &d, 1, &d, 1, &d, 1, &[self.rows as u32, self.cols as u32, m as u32], &out, m * self.rows, m * self.cols, (false, false), m.div_ceil(64));
+        out
+    }
+}
+
+impl GpuQ6KNative {
+    pub fn gemm(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        let out = gpu.scratch(m * self.rows * 4);
+        let d = gpu.const_u32(&[0u32]);
+        gemm_launch(gpu, QT_Q6K, [(&self.qq, self.n.0), (&self.sc, self.n.1), (&self.dd, self.n.2)], None, x, &d, 1, &d, 1, &d, 1, &[self.rows as u32, self.cols as u32, m as u32], &out, m * self.rows, m * self.cols, (false, false), m.div_ceil(64));
+        out
+    }
+}
+
+impl GpuQ8Native {
+    pub fn gemm(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        let out = gpu.scratch(m * self.rows * 4);
+        let d = gpu.const_u32(&[0u32]);
+        gemm_launch(gpu, QT_Q8, [(&self.qs, self.n.0), (&self.dd, self.n.1), (&d, 1)], None, x, &d, 1, &d, 1, &d, 1, &[self.rows as u32, self.cols as u32, m as u32], &out, m * self.rows, m * self.cols, (false, false), m.div_ceil(64));
+        out
+    }
+}
+
+impl GpuNativeExperts {
+    /// A chunk of `m` tokens (`x` f32 `[m, embd]`) through the experts named by `routes` (`(expert, token)` per slot, host side): slots are grouped by
+    /// expert into tiles of at most 64 and run as tiled GEMMs. Returns `[slots, embd]` per-slot outputs (router weights not applied), slot order as `routes`.
+    pub fn gemm(&self, gpu: &Gpu, x: &Handle, m: usize, routes: &[(u32, u32)]) -> Handle {
+        let slots = routes.len();
+        let flat: Vec<u32> = routes.iter().flat_map(|&(e, t)| [e, t]).collect();
+        let (perm, tiles) = crate::gemm::group_slots(&flat, self.n_expert);
+        let (n_perm, n_tiles) = (perm.len(), tiles.len());
+        let ntile = n_tiles / 3;
+        let rh = gpu.upload_u32(flat.clone());
+        let ph = gpu.upload_u32(perm);
+        let th = gpu.upload_u32(tiles);
+        let h = gpu.scratch(slots * self.ff * 4);
+        let out = gpu.scratch(slots * self.embd * 4);
+        match &self.gu {
+            NativeGateUp::Q5 { gw, uw, n } => gemm_launch(gpu, QT_Q5K, [(gw, *n), (gw, 1), (gw, 1)], Some([(uw, *n), (uw, 1), (uw, 1)]), x, &rh, flat.len(), &ph, n_perm, &th, n_tiles, &[self.ff as u32, self.embd as u32, m as u32], &h, slots * self.ff, m * self.embd, (true, true), ntile),
+            NativeGateUp::Q6 { g, u, n } => gemm_launch(gpu, QT_Q6K, [(&g.0, n.0), (&g.1, n.1), (&g.2, n.2)], Some([(&u.0, n.0), (&u.1, n.1), (&u.2, n.2)]), x, &rh, flat.len(), &ph, n_perm, &th, n_tiles, &[self.ff as u32, self.embd as u32, m as u32], &h, slots * self.ff, m * self.embd, (true, true), ntile),
+        }
+        let dims = [self.embd as u32, self.ff as u32, m as u32];
+        match &self.down {
+            NativeDown::Q5 { w, n } => gemm_launch(gpu, QT_Q5K, [(w, *n), (w, 1), (w, 1)], None, &h, &rh, flat.len(), &ph, n_perm, &th, n_tiles, &dims, &out, slots * self.embd, slots * self.ff, (true, false), ntile),
+            NativeDown::Q6 { qq, sc, dd, n } => gemm_launch(gpu, QT_Q6K, [(qq, n.0), (sc, n.1), (dd, n.2)], None, &h, &rh, flat.len(), &ph, n_perm, &th, n_tiles, &dims, &out, slots * self.embd, slots * self.ff, (true, false), ntile),
+            NativeDown::Q8 { qs, dd, n } => gemm_launch(gpu, QT_Q8, [(qs, n.0), (dd, n.1), (dd, 1)], None, &h, &rh, flat.len(), &ph, n_perm, &th, n_tiles, &dims, &out, slots * self.embd, slots * self.ff, (true, false), ntile),
         }
         out
     }

@@ -12,7 +12,7 @@ type Handle = lb_q4_gpu::cubecl_server::Handle;
 pub enum DMat {
     Q5(GpuQ5KNative),
     Q6(GpuQ6KNative),
-    Q8(GpuQ8Mat),
+    Q8(GpuQ8Mat, GpuQ8Native),
 }
 
 impl DMat {
@@ -20,7 +20,7 @@ impl DMat {
         let r = match q.ty {
             GgmlType::Q5K => GpuQ5KNative::upload(gpu, *q).map(DMat::Q5),
             GgmlType::Q6K => GpuQ6KNative::upload(gpu, *q).map(DMat::Q6),
-            GgmlType::Q8_0 => GpuQ8Mat::upload(gpu, *q).map(DMat::Q8),
+            GgmlType::Q8_0 => GpuQ8Mat::upload(gpu, *q).and_then(|a| GpuQ8Native::upload(gpu, *q).map(|b| DMat::Q8(a, b))),
             t => return Err(anyhow!("no device kernel for {}", t.name())),
         };
         r.map_err(|e| anyhow!(e))
@@ -29,7 +29,15 @@ impl DMat {
         match self {
             DMat::Q5(m) => m.launch(gpu, x, 1),
             DMat::Q6(m) => m.launch(gpu, x, 1),
-            DMat::Q8(m) => m.launch(gpu, x, 1),
+            DMat::Q8(m, _) => m.launch(gpu, x, 1),
+        }
+    }
+    /// Tiled GEMM over `m` token rows (prefill): `[m, rows]`.
+    fn gemm(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        match self {
+            DMat::Q5(a) => a.gemm(gpu, x, m),
+            DMat::Q6(a) => a.gemm(gpu, x, m),
+            DMat::Q8(_, b) => b.gemm(gpu, x, m),
         }
     }
     /// With the activation available both ways (the producer wrote the permuted copy), no permute launch is needed.
@@ -37,7 +45,7 @@ impl DMat {
         match self {
             DMat::Q5(m) => m.launch_permuted(gpu, xp, 1),
             DMat::Q6(m) => m.launch_permuted(gpu, xp, 1),
-            DMat::Q8(m) => m.launch(gpu, x, 1),
+            DMat::Q8(m, _) => m.launch(gpu, x, 1),
         }
     }
 }
@@ -86,7 +94,44 @@ fn skip(name: &str) -> bool {
     S.get_or_init(|| std::env::var("LB_QW_SKIP").unwrap_or_default()).split(',').any(|x| x == name)
 }
 
+fn shf_on() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("LB_QW_SHF").is_ok())
+}
+
+/// `LB_QW_PTIME=1`: wait for the device after every phase of a prefill layer and add the time to a per-phase table (`ptime_report`).
+pub fn ptime_on() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("LB_QW_PTIME").is_ok())
+}
+
+static PTIME: std::sync::Mutex<Vec<(&'static str, f64)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn ptime_add(name: &'static str, s: f64) {
+    let mut t = PTIME.lock().unwrap();
+    if let Some(e) = t.iter_mut().find(|e| e.0 == name) {
+        e.1 += s;
+    } else {
+        t.push((name, s));
+    }
+}
+
+pub fn ptime_report() -> Vec<(&'static str, f64)> {
+    std::mem::take(&mut *PTIME.lock().unwrap())
+}
+
+/// One layer's host copy of its recurrent state / KV prefix (see [`DevModel::snapshot`]).
+#[derive(Default, Clone)]
+pub struct LayerSnap {
+    conv: Vec<f32>,
+    s: Vec<f32>,
+    kc: Vec<f32>,
+    vc: Vec<f32>,
+}
+
 pub struct DevModel {
+    pp2: Handle,
+    pp1: Handle,
     zeros: Handle,
     pub cfg: Config,
     pub cap: usize,
@@ -105,7 +150,7 @@ impl DevModel {
         }
         let theta_scale = c.rope_base.powf(-2.0 / c.n_rot as f32);
         let zeros = gpu.upload_f32(&vec![0.0f32; 16384]);
-        Ok(DevModel { zeros, cfg: c, cap, layers, theta_scale, pos_h: gpu.upload_u32(vec![0]) })
+        Ok(DevModel { pp2: gpu.upload_u32(vec![0, 0]), pp1: gpu.upload_u32(vec![0]), zeros, cfg: c, cap, layers, theta_scale, pos_h: gpu.upload_u32(vec![0]) })
     }
 
     fn upload_layer(gpu: &Gpu, c: &Config, l: &Layer<'_>, cap: usize) -> Result<DevLayer> {
@@ -151,7 +196,7 @@ impl DevModel {
             sh_gate: DMat::new(gpu, &l.sh_gate.0)?,
             sh_up: DMat::new(gpu, &l.sh_up.0)?,
             sh_down: DMat::new(gpu, &l.sh_down.0)?,
-            sh_fused: if gpu.use_plane && gpu.plane_size.1 == 32 && [l.sh_gate.0.ty, l.sh_up.0.ty, l.sh_down.0.ty].iter().all(|t| *t == GgmlType::Q8_0) && std::env::var("LB_QW_SHF").is_ok() {
+            sh_fused: if [l.sh_gate.0.ty, l.sh_up.0.ty, l.sh_down.0.ty].iter().all(|t| *t == GgmlType::Q8_0) {
                 Some((GpuQ8Native::upload(gpu, l.sh_gate.0).map_err(|e| anyhow!(e))?, GpuQ8Native::upload(gpu, l.sh_up.0).map_err(|e| anyhow!(e))?, GpuQ8Native::upload(gpu, l.sh_down.0).map_err(|e| anyhow!(e))?))
             } else {
                 None
@@ -220,6 +265,114 @@ impl DevModel {
         v
     }
 
+    /// Set the chunk the prefill kernels see: positions `p0 .. p0 + m`.
+    pub fn set_chunk(&self, gpu: &Gpu, p0: usize, m: usize) {
+        gpu.qw_write_u32(&self.pp2, &[p0 as u32, m as u32]);
+        gpu.qw_write_u32(&self.pp1, &[p0 as u32]);
+    }
+
+    /// One layer for a chunk of `m` tokens (`x` `[m, n_embd]`): tiled GEMMs, batched glue kernels, routed experts grouped by expert on the host (one
+    /// read of the routes a layer). Leaves the recurrent state and KV cache as `m` single-token steps would. Returns the layer output `[m, n_embd]`.
+    pub fn prefill_layer(&self, gpu: &Gpu, i: usize, x: &Handle, m: usize) -> Result<Handle> {
+        let c = &self.cfg;
+        let l = &self.layers[i];
+        let t0 = std::cell::Cell::new(std::time::Instant::now());
+        let ph = |name: &'static str, hd: &Handle| {
+            if ptime_on() {
+                let _ = gpu.read_all(vec![(hd.clone(), 1)]);
+                ptime_add(name, t0.get().elapsed().as_secs_f64());
+                t0.set(std::time::Instant::now());
+            }
+        };
+        let h = gpu.qp_rms_rows(x, &l.attn_norm, m, c.n_embd, c.eps);
+        ph("norm", &h);
+        let y = if let Some(d) = &l.lin {
+            let qkv = d.qkv.gemm(gpu, &h, m);
+            let z = d.z.gemm(gpu, &h, m);
+            let ba = gpu.qp_f32_rows(&d.ba, &h, m, 2 * c.n_v_heads, c.n_embd);
+            ph("dn proj gemm", &ba);
+            let core = gpu.qp_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, &self.pp2, m, (c.conv_channels(), c.n_k_heads, c.n_v_heads, c.head_k), c.eps);
+            ph("dn core", &core);
+            let y = d.out.gemm(gpu, &core, m);
+            ph("dn out gemm", &y);
+            y
+        } else {
+            let a = l.attn.as_ref().unwrap();
+            let qf = a.q.gemm(gpu, &h, m);
+            let k = a.k.gemm(gpu, &h, m);
+            let v = a.v.gemm(gpu, &h, m);
+            ph("attn proj gemm", &v);
+            let o = gpu.qp_attention(&qf, &k, &v, &a.qn, &a.kn, &a.kc, &a.vc, &self.pp1, m, (c.n_head, c.n_head_kv, c.head_dim, c.n_rot / 2, self.cap), c.eps, self.theta_scale);
+            ph("attn core", &o);
+            let y = a.o.gemm(gpu, &o, m);
+            ph("attn out gemm", &y);
+            y
+        };
+        let x1 = gpu.qw_add(x, &y, m * c.n_embd);
+        let h2 = gpu.qp_rms_rows(&x1, &l.post_norm, m, c.n_embd, c.eps);
+        let logits = gpu.qp_f32_rows(&l.router_sg, &h2, m, c.n_expert + 1, c.n_embd);
+        let (routes, weights) = gpu.qp_route_rows(&logits, m, c.n_expert, c.n_used);
+        ph("norm+router", &weights);
+        let rbits = gpu.read_all(vec![(routes, 2 * m * c.n_used)]).map_err(|e| anyhow!(e))?.remove(0);
+        t0.set(std::time::Instant::now());
+        let rv: Vec<(u32, u32)> = rbits.chunks_exact(2).map(|p| (p[0].to_bits(), p[1].to_bits())).collect();
+        let down = l.experts.gemm(gpu, &h2, m, &rv);
+        ph("experts gemm", &down);
+        let (g, u, dn) = l.sh_fused.as_ref().ok_or_else(|| anyhow!("prefill needs Q8_0 shared experts"))?;
+        let gg = g.gemm(gpu, &h2, m);
+        let uu = u.gemm(gpu, &h2, m);
+        let sh = gpu.qw_silu_mul(&gg, &uu, m * c.ff_shexp);
+        let shout = dn.gemm(gpu, &sh, m);
+        ph("shared gemm", &shout);
+        Ok(gpu.qp_combine_rows(&x1, &down, &weights, &shout, &logits, m, c.n_embd, c.n_used, c.n_expert))
+    }
+
+    /// Copy the recurrent state and the first `len` KV positions of every layer to the host (a rewind point for prefix reuse).
+    pub fn snapshot(&self, gpu: &Gpu, len: usize) -> Result<Vec<LayerSnap>> {
+        let c = &self.cfg;
+        let mut out = Vec::new();
+        for l in &self.layers {
+            let mut snap = LayerSnap::default();
+            if let Some(d) = &l.lin {
+                let r = gpu.read_all(vec![(d.conv_state.clone(), 2 * (c.d_conv - 1) * c.conv_channels()), (d.s.clone(), c.n_v_heads * c.head_v() * c.head_k)]).map_err(|e| anyhow!(e))?;
+                let mut it = r.into_iter();
+                snap.conv = it.next().unwrap();
+                snap.s = it.next().unwrap();
+            }
+            if let Some(a) = &l.attn {
+                let n = len * c.n_head_kv * c.head_dim;
+                if n > 0 {
+                    let r = gpu.read_all(vec![(a.kc.clone(), n), (a.vc.clone(), n)]).map_err(|e| anyhow!(e))?;
+                    let mut it = r.into_iter();
+                    snap.kc = it.next().unwrap();
+                    snap.vc = it.next().unwrap();
+                }
+            }
+            out.push(snap);
+        }
+        Ok(out)
+    }
+
+    /// Put a [`snapshot`](Self::snapshot) back (the KV positions beyond it are zeroed: attention never reads them).
+    pub fn restore(&self, gpu: &Gpu, snaps: &[LayerSnap]) {
+        let c = &self.cfg;
+        let full = self.cap * c.n_head_kv * c.head_dim;
+        for (l, snap) in self.layers.iter().zip(snaps) {
+            if let Some(d) = &l.lin {
+                gpu.write_f32(&d.conv_state, &snap.conv);
+                gpu.write_f32(&d.s, &snap.s);
+            }
+            if let Some(a) = &l.attn {
+                let mut k = snap.kc.clone();
+                k.resize(full, 0.0);
+                gpu.write_f32(&a.kc, &k);
+                let mut v = snap.vc.clone();
+                v.resize(full, 0.0);
+                gpu.write_f32(&a.vc, &v);
+            }
+        }
+    }
+
     /// Zero every layer's recurrent state and KV cache (a new sequence).
     pub fn reset(&self, gpu: &Gpu) {
         let c = &self.cfg;
@@ -266,7 +419,7 @@ impl DevModel {
         let (routes, weights) = gpu.qw_route(&logits, c.n_expert, c.n_used);
         let h2p2 = h2p.clone();
         let down = if skip("experts") { self.zeros.clone() } else { l.experts.launch_permuted(gpu, h2p, &routes, c.n_used) };
-        let out = if let (Some((g, u, dn)), false) = (&l.sh_fused, skip("shared")) {
+        let out = if let (Some((g, u, dn)), false, true) = (&l.sh_fused, skip("shared"), shf_on()) {
             let hs = GpuQ8Native::gate_up_silu(gpu, g, u, &h2p2);
             dn.combine_shared(gpu, &x1, &down, &weights, &logits, c.n_expert + 1, c.n_expert, &hs, c.n_used)
         } else {

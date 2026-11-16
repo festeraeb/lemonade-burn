@@ -115,6 +115,68 @@ fn main() -> Result<()> {
                 eprintln!("round {round}: prompt {} tokens in {pre:.2}s ({:.1} tok/s); decode {} tokens in {dt:.2}s = {:.1} tok/s", p.len(), p.len() as f64 / pre, n - 1, (n - 1) as f64 / dt);
             }
         }
+        "pcheck" => {
+            // pcheck <model> <ids> <n> [chunk]: a prompt of n tokens (the ids lines concatenated, repeated) by prefill and by single steps; last-position
+            // logits compared, then 24 greedy tokens continued from each state
+            let n: usize = a[4].parse()?;
+            let chunk: usize = a.get(5).and_then(|v| v.parse().ok()).unwrap_or(512);
+            let mut toks: Vec<u32> = Vec::new();
+            while toks.len() < n {
+                for p in &prompts {
+                    toks.extend_from_slice(p);
+                }
+            }
+            toks.truncate(n);
+            pipe.reset();
+            let mut l1 = None;
+            let t0 = std::time::Instant::now();
+            for (i, &t) in toks.iter().enumerate() {
+                l1 = pipe.step(t, i, i + 1 == toks.len())?;
+            }
+            let t_single = t0.elapsed().as_secs_f64();
+            let l1 = l1.unwrap();
+            let mut g1 = Vec::new();
+            let mut l = l1.clone();
+            for s in 0..24 {
+                let t = argmax(&l) as u32;
+                g1.push(t);
+                l = pipe.step(t, toks.len() + s, true)?.unwrap();
+            }
+            pipe.reset();
+            let t0 = std::time::Instant::now();
+            let l2 = pipe.prefill(&toks, 0, chunk)?;
+            let t_pre = t0.elapsed().as_secs_f64();
+            let mut g2 = Vec::new();
+            let mut l = l2.clone();
+            for s in 0..24 {
+                let t = argmax(&l) as u32;
+                g2.push(t);
+                l = pipe.step(t, toks.len() + s, true)?.unwrap();
+            }
+            eprintln!("n={n} chunk={chunk}: single steps {t_single:.2}s ({:.1} tok/s), prefill {t_pre:.2}s ({:.1} tok/s)", n as f64 / t_single, n as f64 / t_pre);
+            eprintln!("last-position logits: top-1 {} vs {} ({}), max |diff| {:.3e}, KL {:.3e}; greedy continuation {}", argmax(&l1), argmax(&l2), if argmax(&l1) == argmax(&l2) { "same" } else { "DIFFERENT" }, maxd(&l1, &l2), kl(&l1, &l2), if g1 == g2 { "identical (24 tokens)".to_string() } else { format!("differs: {:?} vs {:?}", &g1[..8], &g2[..8]) });
+        }
+        "pbench" => {
+            let n: usize = a[4].parse()?;
+            let chunk: usize = a.get(5).and_then(|v| v.parse().ok()).unwrap_or(512);
+            let mut toks: Vec<u32> = Vec::new();
+            while toks.len() < n {
+                for p in &prompts {
+                    toks.extend_from_slice(p);
+                }
+            }
+            toks.truncate(n);
+            for round in 0..2 {
+                pipe.reset();
+                let t0 = std::time::Instant::now();
+                let _ = pipe.prefill(&toks, 0, chunk)?;
+                let dt = t0.elapsed().as_secs_f64();
+                eprintln!("round {round}: prefill {n} tokens (chunk {chunk}) in {dt:.2}s = {:.1} tok/s", n as f64 / dt);
+                for (name, s) in pipe.ptime_report() {
+                    eprintln!("   {name:<16} {s:7.3} s");
+                }
+            }
+        }
         "parts" => {
             // time the parts of one delta-net layer (0) and one attention layer (3) on stage 0
             for il in [0usize, 3] {
