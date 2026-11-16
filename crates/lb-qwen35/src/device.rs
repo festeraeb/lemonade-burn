@@ -5,14 +5,16 @@
 use crate::{Config, Layer, Model};
 use anyhow::{anyhow, Result};
 use lb_gguf::{GgmlType, QuantMat};
-use lb_q4_gpu::{Gpu, GpuNativeExperts, GpuQ5KNative, GpuQ6KNative, GpuQ8Mat, GpuQ8Native};
+use lb_q4_gpu::{Gpu, GpuNativeExperts, GpuQ5KNative, GpuQ6KNative, GpuQ8Native};
+use std::sync::Arc;
 
 type Handle = lb_q4_gpu::cubecl_server::Handle;
 
 pub enum DMat {
     Q5(GpuQ5KNative),
     Q6(GpuQ6KNative),
-    Q8(GpuQ8Mat, GpuQ8Native),
+    /// One device copy of the Q8_0 matrix serves decode (matvec) and prefill (GEMM); `sh_fused` shares it too.
+    Q8(Arc<GpuQ8Native>),
 }
 
 impl DMat {
@@ -20,7 +22,7 @@ impl DMat {
         let r = match q.ty {
             GgmlType::Q5K => GpuQ5KNative::upload(gpu, *q).map(DMat::Q5),
             GgmlType::Q6K => GpuQ6KNative::upload(gpu, *q).map(DMat::Q6),
-            GgmlType::Q8_0 => GpuQ8Mat::upload(gpu, *q).and_then(|a| GpuQ8Native::upload(gpu, *q).map(|b| DMat::Q8(a, b))),
+            GgmlType::Q8_0 => GpuQ8Native::upload(gpu, *q).map(|b| DMat::Q8(Arc::new(b))),
             t => return Err(anyhow!("no device kernel for {}", t.name())),
         };
         r.map_err(|e| anyhow!(e))
@@ -29,7 +31,7 @@ impl DMat {
         match self {
             DMat::Q5(m) => m.launch(gpu, x, 1),
             DMat::Q6(m) => m.launch(gpu, x, 1),
-            DMat::Q8(m, _) => m.launch(gpu, x, 1),
+            DMat::Q8(m) => m.launch(gpu, x, 1),
         }
     }
     /// Tiled GEMM over `m` token rows (prefill): `[m, rows]`.
@@ -37,7 +39,7 @@ impl DMat {
         match self {
             DMat::Q5(a) => a.gemm(gpu, x, m),
             DMat::Q6(a) => a.gemm(gpu, x, m),
-            DMat::Q8(_, b) => b.gemm(gpu, x, m),
+            DMat::Q8(b) => b.gemm(gpu, x, m),
         }
     }
     /// With the activation available both ways (the producer wrote the permuted copy), no permute launch is needed.
@@ -45,7 +47,7 @@ impl DMat {
         match self {
             DMat::Q5(m) => m.launch_permuted(gpu, xp, 1),
             DMat::Q6(m) => m.launch_permuted(gpu, xp, 1),
-            DMat::Q8(m, _) => m.launch(gpu, x, 1),
+            DMat::Q8(m) => m.launch_permuted(gpu, xp, 1),
         }
     }
 }
@@ -85,7 +87,7 @@ pub struct DevLayer {
     sh_up: DMat,
     sh_down: DMat,
     /// All three shared matrices are Q8_0 (Qwen3.6, Tiel-Coder): gate+up+SiLU and down-into-combine as two launches.
-    sh_fused: Option<(GpuQ8Native, GpuQ8Native, GpuQ8Native)>,
+    sh_fused: Option<(Arc<GpuQ8Native>, Arc<GpuQ8Native>, Arc<GpuQ8Native>)>,
 }
 
 /// `LB_QW_SKIP=experts,shared,core,dense,route` skips those parts of every layer (timing ablation only: the results are wrong).
@@ -186,6 +188,9 @@ impl DevModel {
             ),
             _ => unreachable!(),
         };
+        let sh_gate = DMat::new(gpu, &l.sh_gate.0)?;
+        let sh_up = DMat::new(gpu, &l.sh_up.0)?;
+        let sh_down = DMat::new(gpu, &l.sh_down.0)?;
         Ok(DevLayer {
             attn_norm: f(&l.attn_norm),
             post_norm: f(&l.post_norm),
@@ -193,14 +198,13 @@ impl DevModel {
             attn,
             router_sg: f(&[l.router.as_slice(), l.sh_gate_inp.as_slice()].concat()),
             experts: GpuNativeExperts::upload(gpu, c.n_expert, l.gate_exps, l.up_exps, l.down_exps).map_err(|e| anyhow!(e))?,
-            sh_gate: DMat::new(gpu, &l.sh_gate.0)?,
-            sh_up: DMat::new(gpu, &l.sh_up.0)?,
-            sh_down: DMat::new(gpu, &l.sh_down.0)?,
-            sh_fused: if [l.sh_gate.0.ty, l.sh_up.0.ty, l.sh_down.0.ty].iter().all(|t| *t == GgmlType::Q8_0) {
-                Some((GpuQ8Native::upload(gpu, l.sh_gate.0).map_err(|e| anyhow!(e))?, GpuQ8Native::upload(gpu, l.sh_up.0).map_err(|e| anyhow!(e))?, GpuQ8Native::upload(gpu, l.sh_down.0).map_err(|e| anyhow!(e))?))
-            } else {
-                None
+            sh_fused: match (&sh_gate, &sh_up, &sh_down) {
+                (DMat::Q8(g), DMat::Q8(u), DMat::Q8(d)) => Some((g.clone(), u.clone(), d.clone())),
+                _ => None,
             },
+            sh_gate,
+            sh_up,
+            sh_down,
         })
     }
 
