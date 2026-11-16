@@ -13,7 +13,7 @@ arm() {
    strata) env CUDA_DEVICE_ORDER=PCI_BUS_ID STRATA_ENGINE_READY_S=1800 ~/Strata/.venv/bin/python /codebase/repos/Nauti-Strata/serve/server.py --engine strata --config ~/PolyStrata/strata-qwen36-c4-af-d8.json --host 127.0.0.1 --port 8117 > $R/abba-strata.log 2>&1 & SP=$!; PORT=8117; MODEL=qwen3.6-35b-a3b;;
   esac
   t0=$(date +%s)
-  if waitup $PORT $SP; then echo "$name up in $(( $(date +%s)-t0 )) s"; echo "$name $(python3 $R/abba_client.py $PORT $MODEL | head -1)"; else echo "$name FAILED to start"; fi
+  if waitup $PORT $SP; then echo "$name up in $(( $(date +%s)-t0 )) s"; echo "$name $(python3 $R/${CLIENT:-abba_client.py} $PORT $MODEL | head -1)"; else echo "$name FAILED to start"; fi
   killtree $SP; for w in $(seq 1 30); do kill -0 $SP 2>/dev/null || break; ping -c 2 127.0.0.1 >/dev/null; done; ping -c 4 127.0.0.1 >/dev/null
   echo "cards after: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | sed -n '4,5p' | tr '\n' ' ')"
 }

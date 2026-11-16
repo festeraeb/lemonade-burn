@@ -335,6 +335,12 @@ impl<'m, 'a> Pipeline<'m, 'a> {
             }
             drop(last_tx);
         });
+        // The stage threads wrote the states and KV caches on their own streams: touch every persistent buffer once from this thread so the
+        // cross-stream ordering is settled here, outside any CUDA-graph capture window (a capture that meets a pending foreign write is invalidated).
+        for s in &self.stages {
+            let hs: Vec<(Handle, usize)> = s.dev.persistent().into_iter().map(|h| (h, 1usize)).collect();
+            s.gpu.read_all(hs).map_err(|e| anyhow!(e))?;
+        }
         let row = last_rx.recv().map_err(|e| anyhow!("prefill produced no result: {e}"))??;
         self.head_logits(&row)
     }

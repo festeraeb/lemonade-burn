@@ -373,6 +373,22 @@ impl DevModel {
         }
     }
 
+    /// Every persistent device buffer of the block (states, KV caches).
+    pub fn persistent(&self) -> Vec<Handle> {
+        let mut v = Vec::new();
+        for l in &self.layers {
+            if let Some(d) = &l.lin {
+                v.push(d.conv_state.clone());
+                v.push(d.s.clone());
+            }
+            if let Some(a) = &l.attn {
+                v.push(a.kc.clone());
+                v.push(a.vc.clone());
+            }
+        }
+        v
+    }
+
     /// Zero every layer's recurrent state and KV cache (a new sequence).
     pub fn reset(&self, gpu: &Gpu) {
         let c = &self.cfg;
