@@ -41,6 +41,11 @@ fn prefill_min() -> usize {
     std::env::var("LB_QW_PREFILL_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
 }
 
+/// Rows per prefill chunk (`LB_QW_PREFILL_CHUNK`; 0 = automatic 64..1024). A smaller chunk lowers the device temporaries, which matters when the weights nearly fill the cards.
+fn prefill_chunk() -> usize {
+    std::env::var("LB_QW_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 pub fn is_qwen(p: &Path) -> bool {
     lb_gguf::Gguf::open(p).ok().and_then(|g| g.meta_str("general.architecture").map(|a| a == "qwen35moe")) == Some(true)
 }
@@ -109,7 +114,7 @@ impl Decoder for QwenDev {
         let pm = prefill_min();
         if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= 4096 {
             let t0 = std::time::Instant::now();
-            let l = self.pipe.prefill(tokens, cache.len, 0).expect("device prefill");
+            let l = self.pipe.prefill(tokens, cache.len, prefill_chunk()).expect("device prefill");
             if trace() {
                 eprintln!("qwen: prefill of {} tokens at {} took {:.0} ms", tokens.len(), cache.len, t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -131,7 +136,7 @@ impl Decoder for QwenDev {
         let pm = prefill_min();
         if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= 4096 {
             let t0 = std::time::Instant::now();
-            let l = self.pipe.prefill(tokens, cache.len, 0).expect("device prefill");
+            let l = self.pipe.prefill(tokens, cache.len, prefill_chunk()).expect("device prefill");
             if trace() {
                 eprintln!("qwen: prefill of {} tokens at {} took {:.0} ms", tokens.len(), cache.len, t0.elapsed().as_secs_f64() * 1e3);
             }

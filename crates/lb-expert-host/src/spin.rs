@@ -40,6 +40,14 @@ pub struct SpinPool {
 impl SpinPool {
     /// `threads` counts the caller, so `threads - 1` workers are started.
     pub fn new(threads: usize, spin_for: Duration) -> Self {
+        // Never more threads than CPUs this process may run on (`available_parallelism` reads the scheduler affinity and
+        // cgroup quota on Linux): spinning workers beyond that fight each other for cores and the pool collapses
+        // (measured on c4, 64 threads pinned to one NUMA node: 3 tok/s against 27).
+        let allowed = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(threads).max(1);
+        if threads > allowed {
+            eprintln!("lb-expert-host: spin pool clamped from {threads} to {allowed} threads (process CPU affinity)");
+        }
+        let threads = threads.min(allowed);
         let n_workers = threads.saturating_sub(1);
         let shared = Arc::new(Shared {
             gen: AtomicUsize::new(0),
