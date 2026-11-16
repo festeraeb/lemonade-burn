@@ -387,3 +387,43 @@ No change to the decoder or the layer code. [measured]
   worse than llama.cpp's own self-agreement on both measures. Tiel agrees less with llama.cpp than Qwen3.6 does (95.1 % vs 98.4 %), and llama.cpp agrees less with itself on it by about the same amount (94.6 % vs 97.4 %): the fine-tune has more near-tie positions, the cause is the reference's own rounding, as for Qwen.
 * Speed: in-process 65.6 tok/s, through `lb-server` 63.5-64.2 (median 63.7) on AF + D8 with the same five prompts (cheaper than Qwen3.6 because its attention and shared experts are Q8_0, which has the fast kernel). llama.cpp and Nauti-Strata were not run on Tiel.
 * No manifest entry was added for Tiel (the on-demand report's `tiel-c4` standing seat is the one-card spill setup; a two-card own-engine Tiel entry is the same shape as `hard-qwen36-own-2card-c4` with the Tiel file and model id, to add if wanted).
+
+## 15. Step D: decode speed (2026-11-16): 53.7 -> 69.5 tok/s through `lb-server`, past Nauti-Strata
+
+**Why Nauti-Strata was faster: what the source and the measurements say.** Read: `src/kernels/cuda/native_mmvq.cu`, `include/strata/kernels/dp4a.hpp`, `docs/OLDER_GPUS.md`, `docs/MMVQ_IL_TABLE.md`.
+* The P100 is compute capability 6.0 and has **no `dp4a`** (that arrived with 6.1). Strata's K-quant decode kernels are llama.cpp's `vec_dot_*_q8_1`: the activation is rounded to int8 blocks (q8_1: int8 values, per-32 scale and sum), the weights stay packed and are unpacked
+  four values at a time with word masks (`& 0x0f0f0f0f`), and the integer dot is `strata_dp4a`, a software dp4a made of **four PTX `vmad.s32` byte-select instructions** (bit-exact with a real dp4a, "2.2x faster than byte extraction" in their check). The "interleaved" decode matvec (`native_mmvq_il`, `MMVQ_IL_TABLE.md`) reads
+  an interleaved copy of the q8_1 activations and takes **1, 2 or 4 matrix rows per warp**, so one activation read serves several rows. That path is off for sm_75 and older per that document; the plain mmvq runs on the P100.
+* Strata's engine log has no timing lines in the build on disk (`STRATA_DECODE_TIMING` produced nothing in `hard-qwen36-c4-engine.log`), and Nsight Systems on c4 refuses CUDA 12.8 ("not installed with CUDA Toolkit 12.8"), so I could not time Strata's layers; what I compared is what its source does against what mine did, and I tested each difference on our kernels.
+* **Tested here [measured, P100]:** (1) the arithmetic is not the limit. Word-wide SWAR quant assembly plus an exact int-to-float by `(byte | 0x4B000000) - 2^23` (two integer ops and an add instead of a quarter-rate convert) left the Q5_K matvec at 148 us (before 148 us) and Q6_K at 154 us (before 163): no gain. The earlier X7 work agrees: on this card f32, f16 and the dp4a polyfill
+  run the Q4_0 matvec at 310 / 320 / 314 GB/s. An activation-rounding int8 path (what Strata and llama.cpp do) would not have helped for that reason, and I did not build it: **every path in this engine still uses f32 activations, no rounding switch was added or needed.** (2) What mattered was **activation reloads and parallelism**: one plane per row re-read 256 bytes of activations
+  for every 80 bytes of Q5_K weights. Four rows a plane that load the activations once: Q5_K 148 -> 81 us (286 GB/s of resident bytes, from 156), Q6_K 154 -> 118 us, Q5_K 1.8x faster than the widened layout with 46 % of its memory (R=8 gains nothing more; in the real model it was slower). (3) in the real graph the routed-expert kernels were short of parallel work: 1024 planes
+  for the 8 x 512-row gate/up pass. Two gate+up rows a plane and one down row a lane group (more planes in flight): in-process 61.0 -> 67.8 tok/s with no other change. (4) kernel count and chain length: the delta-net core as one launch instead of five (conv + L2 + scalars + delta rule + gated norm; conv state double-buffered by position parity so the cubes that share a q/k head
+  never read a column another has shifted), wide attention decode (a plane a position with coalesced K reads, `p = e/sum` stored once), argmax on the device for greedy requests (4 bytes back instead of 1 MB of logits), norms that write the activation both natural and in the permuted order the native kernels read (no permute launches), router top-8 by rank counting in one cube.
+  In-situ ablation (skipping a part in the CUDA graph, timing only) put the routed experts at 5.2 ms of a 16.4 ms token, the dense projections 4-5 ms, the delta-net core 1.5-1.8 ms, the shared expert 1.2-1.5 ms, the head 1.8 ms at that point. A fused shared-expert (gate+up+SiLU, down folded into the combine) built and verified but was slower (61.1 vs 62.6): kept opt-in (`LB_QW_SHF=1`), off.
+
+**Correctness** (the path stays exact: f32 activations; only summation order changes):
+* Layers against the CPU decoder, all 40 of Qwen3.6 (blocks 0-11, 12-25, 26-39) and Tiel-Coder layers 0-11 and 28-39, isolated and in 12-layer chains: relative L2 <= 1.4e-6 (attention layer 31 of Qwen 3.7e-6; Tiel attention layer 31 8.6e-6), chains <= 1.5e-6 (Qwen) / 1.0e-5 (Tiel, after layer 39); max abs <= 5.3e-5. Same level as before the speed work.
+* Whole model, 570 teacher-forced positions, two cards, graphs on: see the table below.
+
+**A-B-B-A on c4 AF + D8** (same client, five prompts, 256 tokens, T=0, no-think, streamed; order ours, llama.cpp, Nauti-Strata, Nauti-Strata, llama.cpp, ours; build `20261116-qwen35-6b421ab`) [measured]:
+
+| engine | run 1 | run 2 |
+|---|---|---|
+| lemonade-burn through `lb-server` | **69.7** | **69.3** |
+| llama.cpp (fleet build) | 53.9 | 54.0 |
+| Nauti-Strata | 63.1 | 63.1 |
+
+The speed gate (>= 63 through the server) is met: **69.5 tok/s, 10 % above Nauti-Strata and 29 % above llama.cpp** on these cards and prompts (in-process 67.8). The first request of a server still takes 5-6 s (step F).
+Defaults in code: `LB_QW_R` 4 (dense rows a plane), `LB_QW_GU_R` 2, `LB_QW_DN_R` 1; `LB_QW_ROWS1=1` turns every row-batched kernel off, `LB_QW_NOGU`, `LB_QW_NODN` the expert ones, `LB_QW_ATTN_OLD` the attention one, `LB_QW_SKIP=experts,shared,core,qkv,z,out,aq,dense` is a timing ablation (wrong results).
+
+Whole-model gates on the final build (570 positions, the five texts, both cards, graphs on, argmax path not used by the check) [measured, `d_tf_stepD.jsonl`]:
+
+| gate | result |
+|---|---|
+| device vs CPU decoder, top-1 | **570 / 570 = 100 %** (gate 99.9 %) |
+| device vs CPU decoder, max logit difference | 2.8e-4 (mean 1.9e-5), mean KL 2.7e-12, worst 1.2e-10 |
+| device vs llama.cpp (batch path), top-1 / mean KL | 98.42 % (561/570) / 0.00485 |
+| llama.cpp batch vs its own single-token path, same run | 97.37 % (555/570) / 0.00636 |
+
+Identical to before the speed work to the digit on the llama.cpp comparisons. Tiel-Coder-35B through the same server: 75.3-76.3 tok/s (median 75.8, was 63.7). The manifest entry `hard-qwen36-own-2card-c4` now names build `20261116-qwen35-6b421ab` (backup `var/fleet-manifest.json.bak-20261116-qwen-d`).
