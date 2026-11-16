@@ -392,8 +392,9 @@ fn qp_attn_prep_rows_kernel(
     }
 }
 
-/// Causal attention for a chunk: a cube (256 units, 8 planes) a (query head, token); keys `0 ..= p0 + t`; scores live in shared memory (so at most
-/// 4096 keys); then `* sigmoid(gate)`. `out` `[m, nh * hd]`. `hd` = 256.
+/// Causal attention for a chunk: a cube (256 units, 8 planes) a (query head, token); keys `0 ..= p0 + t`, in tiles of 4096 keys whose scores live in shared
+/// memory, joined by an online softmax (running max and sum, the accumulators rescaled when the max grows), so any context length works with the same shared
+/// memory; then `* sigmoid(gate)`. `out` `[m, nh * hd]`. `hd` = 256.
 #[cube(launch)]
 fn qp_attn_rows_kernel(
     q: &[f32], kc: &[f32], vc: &[f32], gate: &[f32], out: &mut [f32], pp: &[u32],
@@ -416,76 +417,94 @@ fn qp_attn_rows_kernel(
     for mm in 0..8usize {
         qr[mm] = q[qb + lane + 32usize * mm];
     }
-    let mut t = w;
-    while t < n {
-        let kb = (t * nkv + kvh) * hd;
-        let mut part = 0.0f32;
-        #[unroll]
-        for mm in 0..8usize {
-            part += qr[mm] * kc[kb + lane + 32usize * mm];
-        }
-        let sv = plane_sum(part) * scale;
-        if lane == 0usize {
-            sc[t] = sv;
-        }
-        t += nw;
-    }
-    sync_cube();
-    let mut mx = q[0usize] * 0.0f32 - 3.0e38f32;
-    let mut t = u;
-    while t < n {
-        if sc[t] > mx {
-            mx = sc[t];
-        }
-        t += 256usize;
-    }
-    sm[u] = mx;
-    sync_cube();
-    let mut st = 128usize;
-    while st > 0usize {
-        if u < st {
-            let o2 = sm[u + st];
-            if o2 > sm[u] {
-                sm[u] = o2;
-            }
-        }
-        sync_cube();
-        st = st / 2usize;
-    }
-    let m = sm[0usize];
-    sync_cube();
-    let mut sum = 0.0f32;
-    let mut t = u;
-    while t < n {
-        let e = Exp::exp(sc[t] - m);
-        sc[t] = e;
-        sum += e;
-        t += 256usize;
-    }
-    let total = lane_sum(&mut sm, sum, false);
-    let mut t = u;
-    while t < n {
-        sc[t] = sc[t] / total;
-        t += 256usize;
-    }
-    sync_cube();
+    let mut m_run = q[0usize] * 0.0f32 - 3.0e38f32;
+    let mut l_run = 0.0f32;
     let mut o0 = 0.0f32;
     let mut o1 = 0.0f32;
     let mut o2 = 0.0f32;
     let mut o3 = 0.0f32;
-    let mut t = 0usize;
-    while t + 3usize < n {
-        o0 += sc[t] * vc[(t * nkv + kvh) * hd + u];
-        o1 += sc[t + 1usize] * vc[((t + 1usize) * nkv + kvh) * hd + u];
-        o2 += sc[t + 2usize] * vc[((t + 2usize) * nkv + kvh) * hd + u];
-        o3 += sc[t + 3usize] * vc[((t + 3usize) * nkv + kvh) * hd + u];
-        t += 4usize;
+    let mut t0 = 0usize;
+    while t0 < n {
+        let mut tn = n - t0;
+        if tn > 4096usize {
+            tn = 4096usize;
+        }
+        let mut t = w;
+        while t < tn {
+            let kb = ((t0 + t) * nkv + kvh) * hd;
+            let mut part = 0.0f32;
+            #[unroll]
+            for mm in 0..8usize {
+                part += qr[mm] * kc[kb + lane + 32usize * mm];
+            }
+            let sv = plane_sum(part) * scale;
+            if lane == 0usize {
+                sc[t] = sv;
+            }
+            t += nw;
+        }
+        sync_cube();
+        let mut mx = q[0usize] * 0.0f32 - 3.0e38f32;
+        let mut t = u;
+        while t < tn {
+            if sc[t] > mx {
+                mx = sc[t];
+            }
+            t += 256usize;
+        }
+        sm[u] = mx;
+        sync_cube();
+        let mut st = 128usize;
+        while st > 0usize {
+            if u < st {
+                let o2m = sm[u + st];
+                if o2m > sm[u] {
+                    sm[u] = o2m;
+                }
+            }
+            sync_cube();
+            st = st / 2usize;
+        }
+        let tmax = sm[0usize];
+        sync_cube();
+        let mut m_new = m_run;
+        if tmax > m_new {
+            m_new = tmax;
+        }
+        let f = Exp::exp(m_run - m_new);
+        l_run = l_run * f;
+        o0 = o0 * f;
+        o1 = o1 * f;
+        o2 = o2 * f;
+        o3 = o3 * f;
+        let mut sum = 0.0f32;
+        let mut t = u;
+        while t < tn {
+            let e = Exp::exp(sc[t] - m_new);
+            sc[t] = e;
+            sum += e;
+            t += 256usize;
+        }
+        let total = lane_sum(&mut sm, sum, false);
+        l_run = l_run + total;
+        m_run = m_new;
+        sync_cube();
+        let mut t = 0usize;
+        while t + 3usize < tn {
+            o0 += sc[t] * vc[((t0 + t) * nkv + kvh) * hd + u];
+            o1 += sc[t + 1usize] * vc[((t0 + t + 1usize) * nkv + kvh) * hd + u];
+            o2 += sc[t + 2usize] * vc[((t0 + t + 2usize) * nkv + kvh) * hd + u];
+            o3 += sc[t + 3usize] * vc[((t0 + t + 3usize) * nkv + kvh) * hd + u];
+            t += 4usize;
+        }
+        while t < tn {
+            o0 += sc[t] * vc[((t0 + t) * nkv + kvh) * hd + u];
+            t += 1usize;
+        }
+        sync_cube();
+        t0 += 4096usize;
     }
-    while t < n {
-        o0 += sc[t] * vc[(t * nkv + kvh) * hd + u];
-        t += 1usize;
-    }
-    out[tok * nh * hd + h * hd + u] = (o0 + o1 + o2 + o3) * sigmoid_pub(gate[tok * nh * hd + h * hd + u]);
+    out[tok * nh * hd + h * hd + u] = (o0 + o1 + o2 + o3) / l_run * sigmoid_pub(gate[tok * nh * hd + h * hd + u]);
 }
 
 /// `out[t, i] = x[t, i] + sum_k w[t, k] down[t * kk + k, i] + sigmoid(sg[t * stride + sg_off]) * shared[t, i]`.

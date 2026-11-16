@@ -112,7 +112,7 @@ impl Decoder for QwenDev {
         }
         assert!(cache.len + tokens.len() <= self.cap, "sequence exceeds the KV capacity {}", self.cap);
         let pm = prefill_min();
-        if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= 4096 {
+        if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= self.cap {
             let t0 = std::time::Instant::now();
             let l = self.pipe.prefill(tokens, cache.len, prefill_chunk()).expect("device prefill");
             if trace() {
@@ -134,7 +134,7 @@ impl Decoder for QwenDev {
         }
         assert!(cache.len + tokens.len() <= self.cap, "sequence exceeds the KV capacity {}", self.cap);
         let pm = prefill_min();
-        if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= 4096 {
+        if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= self.cap {
             let t0 = std::time::Instant::now();
             let l = self.pipe.prefill(tokens, cache.len, prefill_chunk()).expect("device prefill");
             if trace() {

@@ -253,13 +253,13 @@ impl<'m, 'a> Pipeline<'m, 'a> {
 
     /// Batched prompt processing: `tokens` at positions `pos0 ..` in chunks (tiled GEMMs, batched kernels), the stages as a software pipeline: one thread a
     /// stage, chunk `c + 1` on stage 0 while chunk `c` is on stage 1, a chunk's hidden rows handed over through the host. Returns the logits of the last
-    /// token. State and KV cache afterwards are those of token-by-token steps. Needs `pos0 + tokens.len() <= 4096` (the attention kernel keeps its scores in
-    /// shared memory). `chunk` 0 picks a size giving each stage about four chunks (64..1024 tokens).
+    /// token. State and KV cache afterwards are those of token-by-token steps. Any length up to the KV capacity (the attention kernel tiles its scores). `chunk` 0 picks a size giving each stage about four chunks (64..1024 tokens).
     pub fn prefill(&self, tokens: &[u32], pos0: usize, chunk: usize) -> Result<Vec<f32>> {
         use std::sync::mpsc;
         let c = &self.model.cfg;
-        if pos0 + tokens.len() > 4096 {
-            return Err(anyhow!("prefill supports positions below 4096"));
+        let cap = self.stages[0].dev.cap;
+        if pos0 + tokens.len() > cap {
+            return Err(anyhow!("prefill past the KV capacity {cap}"));
         }
         let nst = self.stages.len();
         let chunk = if chunk > 0 { chunk } else { (tokens.len().div_ceil(2 * nst).div_ceil(64) * 64).clamp(64, 1024) };
