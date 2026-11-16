@@ -147,6 +147,25 @@ pub enum LayerState {
 pub struct State {
     pub pos: usize,
     pub layers: Vec<LayerState>,
+    /// The trunk output of the last token before the final norm (what the MTP head takes as its hidden input).
+    pub last_hidden: Vec<f32>,
+}
+
+/// The nextn (multi-token-prediction) block: `eh_proj` over `[enorm(embd(tok)); hnorm(hidden)]` (order per [`Mtp::embed_first`]), one full trunk
+/// layer (`blk.<n_layer>`), `shared_head_norm`, then the trunk's own output head.
+pub struct Mtp<'a> {
+    pub(crate) layer: Layer<'a>,
+    pub(crate) eh_proj: QuantMat<'a>,
+    pub(crate) enorm: Vec<f32>,
+    pub(crate) hnorm: Vec<f32>,
+    pub(crate) shead_norm: Vec<f32>,
+}
+
+/// KV cache of the MTP block's attention layer.
+#[derive(Clone, Default)]
+pub struct MtpState {
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
 }
 
 fn qmat<'a>(g: &'a Gguf, name: &str) -> Result<QuantMat<'a>> {
@@ -161,13 +180,10 @@ fn f32v(g: &Gguf, name: &str) -> Result<Vec<f32>> {
     Ok(g.tensor_f32(t))
 }
 
-impl<'a> Model<'a> {
-    pub fn load(g: &'a Gguf) -> Result<Self> {
-        let cfg = Config::from_gguf(g)?;
-        let mut layers = Vec::new();
-        for il in 0..cfg.n_layer {
+
+fn load_layer<'a>(g: &'a Gguf, cfg: &Config, il: usize, recurrent: bool) -> Result<Layer<'a>> {
             let n = |s: &str| format!("blk.{il}.{s}");
-            let (attn, lin) = if cfg.is_recurrent(il) {
+            let (attn, lin) = if recurrent {
                 (None, Some(LinW {
                     qkv: Mat(qmat(g, &n("attn_qkv.weight"))?),
                     z: Mat(qmat(g, &n("attn_gate.weight"))?),
@@ -189,7 +205,7 @@ impl<'a> Model<'a> {
                     k_norm: f32v(g, &n("attn_k_norm.weight"))?,
                 }), None)
             };
-            layers.push(Layer {
+            Ok(Layer {
                 attn_norm: f32v(g, &n("attn_norm.weight"))?,
                 post_norm: f32v(g, &n("post_attention_norm.weight"))?,
                 attn,
@@ -202,9 +218,58 @@ impl<'a> Model<'a> {
                 sh_up: Mat(qmat(g, &n("ffn_up_shexp.weight"))?),
                 sh_down: Mat(qmat(g, &n("ffn_down_shexp.weight"))?),
                 sh_gate_inp: f32v(g, &n("ffn_gate_inp_shexp.weight"))?,
-            });
+            })
+}
+
+impl<'a> Model<'a> {
+    pub fn load(g: &'a Gguf) -> Result<Self> {
+        let cfg = Config::from_gguf(g)?;
+        let mut layers = Vec::new();
+        for il in 0..cfg.n_layer {
+            layers.push(load_layer(g, &cfg, il, cfg.is_recurrent(il))?);
         }
         Ok(Model { tok_embd: qmat(g, "token_embd.weight")?, out_norm: f32v(g, "output_norm.weight")?, output: qmat(g, "output.weight")?, layers, cfg })
+    }
+
+    /// The nextn block of a file that carries one (`qwen35moe.nextn_predict_layers` > 0): `blk.<n_layer>` is a full-attention layer.
+    pub fn load_mtp(&self, g: &'a Gguf) -> Result<Mtp<'a>> {
+        let il = self.cfg.n_layer;
+        let n = |x: &str| format!("blk.{il}.{x}");
+        Ok(Mtp {
+            layer: load_layer(g, &self.cfg, il, false)?,
+            eh_proj: qmat(g, &n("nextn.eh_proj.weight"))?,
+            enorm: f32v(g, &n("nextn.enorm.weight"))?,
+            hnorm: f32v(g, &n("nextn.hnorm.weight"))?,
+            shead_norm: f32v(g, &n("nextn.shared_head_norm.weight"))?,
+        })
+    }
+
+    /// One MTP step: the draft logits for the token after `tok`, given the trunk hidden `h` of the token before it, with the
+    /// block's attention at position `pos`. Returns `(logits, hidden)`; `hidden` feeds the next draft step.
+    pub fn mtp_step(&self, m: &Mtp<'_>, st: &mut MtpState, h: &[f32], tok: u32, pos: usize, embed_first: bool) -> (Vec<f32>, Vec<f32>) {
+        let c = &self.cfg;
+        let mut e = vec![0f32; c.n_embd];
+        self.tok_embd.dequant_row(tok as usize, &mut e);
+        let en = rms_norm(&e, &m.enorm, c.eps);
+        let hn = rms_norm(h, &m.hnorm, c.eps);
+        let cat: Vec<f32> = if embed_first { en.iter().chain(hn.iter()).cloned().collect() } else { hn.iter().chain(en.iter()).cloned().collect() };
+        let mut x = vec![0f32; c.n_embd];
+        matvec(&m.eh_proj, &cat, &mut x);
+        let l = &m.layer;
+        let hh = rms_norm(&x, &l.attn_norm, c.eps);
+        let a = self.attention(l.attn.as_ref().unwrap(), &hh, pos, &mut st.k, &mut st.v);
+        for (xi, ai) in x.iter_mut().zip(&a) {
+            *xi += ai;
+        }
+        let h2 = rms_norm(&x, &l.post_norm, c.eps);
+        let f = self.moe_l(l, &h2);
+        for (xi, fi) in x.iter_mut().zip(&f) {
+            *xi += fi;
+        }
+        let hn = rms_norm(&x, &m.shead_norm, c.eps);
+        let mut logits = vec![0f32; c.vocab];
+        matvec(&self.output, &hn, &mut logits);
+        (logits, x)
     }
 
     /// `qwen35moe.context_length` of the file (the model's trained limit).
@@ -223,7 +288,7 @@ impl<'a> Model<'a> {
                 }
             })
             .collect();
-        State { pos: 0, layers }
+        State { pos: 0, layers, last_hidden: Vec::new() }
     }
 
     /// Run one token through the trunk; returns the logits when `want_logits`.
@@ -259,6 +324,7 @@ impl<'a> Model<'a> {
             tr("post_moe", il, &x);
         }
         st.pos += 1;
+        st.last_hidden = x.clone();
         if !want_logits {
             return None;
         }
@@ -303,7 +369,7 @@ impl<'a> Model<'a> {
         }
         kc.extend_from_slice(&k);
         vc.extend_from_slice(&v);
-        let n = pos + 1;
+        let n = kc.len() / (nkv * hd);
         let scale = 1.0 / (hd as f32).sqrt();
         let group = nh / nkv;
         let mut o = vec![0f32; nh * hd];
@@ -410,8 +476,11 @@ impl<'a> Model<'a> {
 
     /// Router (softmax over all experts, top-k, weights renormalised), routed experts, gated shared expert.
     pub fn route(&self, l: usize, h: &[f32]) -> (Vec<usize>, Vec<f32>) {
+        self.route_l(&self.layers[l], h)
+    }
+
+    fn route_l(&self, lw: &Layer<'_>, h: &[f32]) -> (Vec<usize>, Vec<f32>) {
         let c = &self.cfg;
-        let lw = &self.layers[l];
         let logits: Vec<f32> = (0..c.n_expert).map(|e| dot(&lw.router[e * c.n_embd..(e + 1) * c.n_embd], h)).collect();
         let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut p: Vec<f32> = logits.iter().map(|l| (l - m).exp()).collect();
@@ -426,9 +495,12 @@ impl<'a> Model<'a> {
     }
 
     fn moe(&self, l: usize, h: &[f32]) -> Vec<f32> {
+        self.moe_l(&self.layers[l], h)
+    }
+
+    fn moe_l(&self, lw: &Layer<'_>, h: &[f32]) -> Vec<f32> {
         let c = &self.cfg;
-        let lw = &self.layers[l];
-        let (ids, ws) = self.route(l, h);
+        let (ids, ws) = self.route_l(lw, h);
         let mut out = vec![0f32; c.n_embd];
         for (&e, &wt) in ids.iter().zip(&ws) {
             let rb_gu = lw.gate_exps.ty.row_bytes(c.n_embd).unwrap();
