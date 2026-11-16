@@ -31,7 +31,7 @@ if mode == "decode":
     for i in range(3):
         r = req(code, N); r["hash"] = hashlib.md5(r["text"][:120].encode()).hexdigest()[:8]; r.pop("text"); r.pop("reasoning"); print(json.dumps(r), flush=True)
 elif mode == "prompt":
-    k = max(1, round(N / 16.8))
+    k = max(1, round(N / 27.4))
     text = " ".join(sents[i % 4].format(a=48000 + SEED + i * 7, b=20 + (i * 13 + SEED) % 90, c=i + 1 + SEED % 7, d=3 + (i * 5) % 11, e=2 + (i * 3) % 9) for i in range(k))
     r = req("Read this survey log, then answer in one sentence: which instruments are mentioned?\n\n" + text, 48)
     r["want"] = N; r["head"] = r.pop("text")[:100].replace("\n", " "); r["hash"] = hashlib.md5(r["head"].encode()).hexdigest()[:8]; r.pop("reasoning")

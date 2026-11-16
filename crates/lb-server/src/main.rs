@@ -477,6 +477,94 @@ struct ChatReq {
     /// `<think>` itself). Absent or true: the prompt is unchanged.
     #[serde(default)]
     chat_template_kwargs: Option<Value>,
+    /// Also accepted at the top level (llama.cpp / vLLM style): `enable_thinking`, `reasoning_budget` (0 = off, anything else = on; the
+    /// number is not enforced as a cap), `reasoning_effort` ("none"/"off" = off, any other value = on).
+    #[serde(default)]
+    enable_thinking: Option<bool>,
+    #[serde(default)]
+    reasoning_budget: Option<i64>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+}
+
+/// Whether a Qwen3.x chat request wants the model to think: `chat_template_kwargs.enable_thinking`, then the top-level `enable_thinking`,
+/// `reasoning_budget` (kwargs first), `reasoning_effort`; absent all, the server default, which is OFF (`LB_THINKING=on` flips it).
+fn thinking_on(req: &ChatReq) -> bool {
+    let k = req.chat_template_kwargs.as_ref();
+    if let Some(b) = k.and_then(|k| k.get("enable_thinking")).and_then(Value::as_bool).or(req.enable_thinking) {
+        return b;
+    }
+    if let Some(n) = k.and_then(|k| k.get("reasoning_budget")).and_then(Value::as_i64).or(req.reasoning_budget) {
+        return n != 0;
+    }
+    if let Some(e) = k.and_then(|k| k.get("reasoning_effort")).and_then(Value::as_str).map(str::to_string).or_else(|| req.reasoning_effort.clone()) {
+        return !matches!(e.to_ascii_lowercase().as_str(), "none" | "off");
+    }
+    std::env::var("LB_THINKING").map(|v| matches!(v.to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes")).unwrap_or(false)
+}
+
+/// Splits a Qwen3.x reply into `reasoning_content` and `content`. With the reasoning block open in the prompt (`<think>\n`) the reply starts in
+/// reasoning and the first `</think>` ends it; with it closed the reply is content (a reply that opens its own `<think>` first is still split).
+/// Tags may arrive split across stream chunks, so a possible tag prefix is held back until it resolves.
+struct ThinkSplit {
+    in_reasoning: bool,
+    started: bool,
+    buf: String,
+}
+
+impl ThinkSplit {
+    fn new(in_reasoning: bool) -> Self {
+        Self { in_reasoning, started: in_reasoning, buf: String::new() }
+    }
+    /// Feed text; returns `(reasoning, content)` ready to send. `last` flushes what is held back.
+    fn push(&mut self, t: &str, last: bool) -> (String, String) {
+        self.buf.push_str(t);
+        let (mut r, mut c) = (String::new(), String::new());
+        loop {
+            if self.in_reasoning {
+                if let Some(i) = self.buf.find("</think>") {
+                    r.push_str(&self.buf[..i]);
+                    let rest = self.buf[i + 8..].trim_start().to_string();
+                    self.buf = rest;
+                    self.in_reasoning = false;
+                    self.started = true;
+                    continue;
+                }
+                let hold = if last { 0 } else { tag_prefix_len(&self.buf, "</think>") };
+                let cut = self.buf.len() - hold;
+                r.push_str(&self.buf[..cut]);
+                self.buf.drain(..cut);
+            } else if !self.started {
+                // content mode, nothing sent yet: a leading `<think>` opens a reasoning block
+                let trimmed = self.buf.trim_start();
+                if trimmed.starts_with("<think>") {
+                    let rest = trimmed[7..].trim_start_matches('\n').to_string();
+                    self.buf = rest;
+                    self.in_reasoning = true;
+                    self.started = true;
+                    continue;
+                }
+                if !last && !trimmed.is_empty() && "<think>".starts_with(trimmed) {
+                    break;
+                }
+                if !last && trimmed.is_empty() {
+                    break;
+                }
+                self.started = true;
+                continue;
+            } else {
+                c.push_str(&self.buf);
+                self.buf.clear();
+            }
+            break;
+        }
+        (r, c)
+    }
+}
+
+/// Length of the longest suffix of `s` that is a proper prefix of `tag`.
+fn tag_prefix_len(s: &str, tag: &str) -> usize {
+    (1..tag.len()).rev().find(|&n| s.len() >= n && s.is_char_boundary(s.len() - n) && tag.starts_with(&s[s.len() - n..])).unwrap_or(0)
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -527,7 +615,14 @@ async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatReq>) -> Resp
     if msgs.is_empty() {
         return err(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
-    let no_think = req.chat_template_kwargs.as_ref().and_then(|k| k.get("enable_thinking")).and_then(Value::as_bool) == Some(false);
+    let qwen35 = st.codec.style == ChatStyle::Qwen35;
+    // Qwen3.x: thinking is off unless the request (or LB_THINKING=on) turns it on, the prompt then ends `<think>\n\n</think>\n\n`; other families keep
+    // the old rule (only an explicit enable_thinking=false closes the block).
+    let think = if qwen35 { Some(thinking_on(&req)) } else { None };
+    let no_think = match think {
+        Some(t) => !t,
+        None => req.chat_template_kwargs.as_ref().and_then(|k| k.get("enable_thinking")).and_then(Value::as_bool) == Some(false),
+    };
     let t_enc = std::time::Instant::now();
     let enc_res = st.codec.encode_chat_suffix(&msgs, if no_think { "<think></think>" } else { "" });
     if std::env::var("LB_TRACE_REQ").is_ok() {
@@ -537,7 +632,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(req): Json<ChatReq>) -> Resp
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
-    respond(st, req, prompt, true).await
+    respond(st, req, prompt, true, think).await
 }
 
 async fn completions(State(st): State<Arc<AppState>>, Json(req): Json<ChatReq>) -> Response {
@@ -550,10 +645,10 @@ async fn completions(State(st): State<Arc<AppState>>, Json(req): Json<ChatReq>) 
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
-    respond(st, req, prompt, false).await
+    respond(st, req, prompt, false, None).await
 }
 
-async fn respond(st: Arc<AppState>, req: ChatReq, prompt: Vec<u32>, chat: bool) -> Response {
+async fn respond(st: Arc<AppState>, req: ChatReq, prompt: Vec<u32>, chat: bool, think: Option<bool>) -> Response {
     let (mut rx, _n) = match st.submit(&req, prompt) {
         Ok(v) => v,
         Err(r) => return r,
@@ -565,12 +660,30 @@ async fn respond(st: Arc<AppState>, req: ChatReq, prompt: Vec<u32>, chat: bool) 
     let model = req.model.clone().filter(|m| !m.is_empty()).unwrap_or_else(|| st.model_id.clone());
     if !req.stream {
         let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut split = think.map(ThinkSplit::new);
         loop {
             match rx.recv().await {
-                Some(Gen::Text(t)) => text.push_str(&t),
+                Some(Gen::Text(t)) => match split.as_mut() {
+                    Some(sp) => {
+                        let (r, c) = sp.push(&t, false);
+                        reasoning.push_str(&r);
+                        text.push_str(&c);
+                    }
+                    None => text.push_str(&t),
+                },
                 Some(Gen::Done { finish_reason, prompt_tokens, cached_tokens, completion_tokens, prefill_s, decode_s }) => {
+                    if let Some(sp) = split.as_mut() {
+                        let (r, c) = sp.push("", true);
+                        reasoning.push_str(&r);
+                        text.push_str(&c);
+                    }
                     let choice = if chat {
-                        json!({"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish_reason})
+                        let mut msg = json!({"role": "assistant", "content": text});
+                        if !reasoning.is_empty() {
+                            msg["reasoning_content"] = json!(reasoning);
+                        }
+                        json!({"index": 0, "message": msg, "finish_reason": finish_reason})
                     } else {
                         json!({"index": 0, "text": text, "finish_reason": finish_reason})
                     };
@@ -595,7 +708,7 @@ async fn respond(st: Arc<AppState>, req: ChatReq, prompt: Vec<u32>, chat: bool) 
     } else {
         None
     };
-    let s = stream_events(rx, first, id, created, model, chat);
+    let s = stream_events(rx, first, id, created, model, chat, think.map(ThinkSplit::new));
     Sse::new(s).keep_alive(KeepAlive::default()).into_response()
 }
 
@@ -606,6 +719,7 @@ fn stream_events(
     created: u64,
     model: String,
     chat: bool,
+    split: Option<ThinkSplit>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let chunk = move |delta: Value, finish: Value| -> Value {
         if chat {
@@ -616,15 +730,35 @@ fn stream_events(
     };
     let queue: VecDeque<Event> = first.map(|f| Event::default().data(f.to_string())).into_iter().collect();
     // state: receiver (None once finished), queued events, chunk builder
-    stream::unfold((Some(rx), queue, chunk), |(mut rx, mut queue, chunk)| async move {
+    stream::unfold((Some(rx), queue, chunk, split), |(mut rx, mut queue, chunk, mut split)| async move {
         loop {
             if let Some(ev) = queue.pop_front() {
-                return Some((Ok(ev), (rx, queue, chunk)));
+                return Some((Ok(ev), (rx, queue, chunk, split)));
             }
             let r = rx.as_mut()?;
             match r.recv().await {
-                Some(Gen::Text(t)) => queue.push_back(Event::default().data(chunk(json!({"content": t}), Value::Null).to_string())),
+                Some(Gen::Text(t)) => match split.as_mut() {
+                    Some(sp) => {
+                        let (r, c) = sp.push(&t, false);
+                        if !r.is_empty() {
+                            queue.push_back(Event::default().data(chunk(json!({"reasoning_content": r}), Value::Null).to_string()));
+                        }
+                        if !c.is_empty() {
+                            queue.push_back(Event::default().data(chunk(json!({"content": c}), Value::Null).to_string()));
+                        }
+                    }
+                    None => queue.push_back(Event::default().data(chunk(json!({"content": t}), Value::Null).to_string())),
+                },
                 Some(Gen::Done { finish_reason, prompt_tokens, cached_tokens, completion_tokens, .. }) => {
+                    if let Some(sp) = split.as_mut() {
+                        let (r, c) = sp.push("", true);
+                        if !r.is_empty() {
+                            queue.push_back(Event::default().data(chunk(json!({"reasoning_content": r}), Value::Null).to_string()));
+                        }
+                        if !c.is_empty() {
+                            queue.push_back(Event::default().data(chunk(json!({"content": c}), Value::Null).to_string()));
+                        }
+                    }
                     let mut last = chunk(json!({}), json!(finish_reason));
                     last["usage"] = json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens,
                                            "prompt_tokens_details": {"cached_tokens": cached_tokens}});
@@ -1094,5 +1228,58 @@ mod tests {
         let r = guarded(&m, || panic!("boom")); // generation panic is caught, state still dropped
         assert!(r.is_err());
         assert_eq!(m.discards.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod think_tests {
+    use super::*;
+
+    fn run(start_in_reasoning: bool, chunks: &[&str]) -> (String, String) {
+        let mut sp = ThinkSplit::new(start_in_reasoning);
+        let (mut r, mut c) = (String::new(), String::new());
+        for ch in chunks {
+            let (a, b) = sp.push(ch, false);
+            r += &a;
+            c += &b;
+        }
+        let (a, b) = sp.push("", true);
+        (r + &a, c + &b)
+    }
+
+    #[test]
+    fn open_block_splits_at_close_tag_even_across_chunks() {
+        let (r, c) = run(true, &["Here's a th", "inking <", "/thi", "nk>\n\n", "391"]);
+        assert_eq!((r.as_str(), c.as_str()), ("Here's a thinking ", "391"));
+    }
+
+    #[test]
+    fn closed_block_is_all_content() {
+        let (r, c) = run(false, &["fn main() {", " let a = x < y; }"]);
+        assert_eq!((r.as_str(), c.as_str()), ("", "fn main() { let a = x < y; }"));
+    }
+
+    #[test]
+    fn closed_block_reply_that_opens_its_own_think_is_split() {
+        let (r, c) = run(false, &["<th", "ink>\nhmm</think>\n\nanswer"]);
+        assert_eq!((r.as_str(), c.as_str()), ("hmm", "answer"));
+    }
+
+    #[test]
+    fn unfinished_reasoning_is_flushed_as_reasoning() {
+        let (r, c) = run(true, &["still thinking <"]);
+        assert_eq!((r.as_str(), c.as_str()), ("still thinking <", ""));
+    }
+
+    #[test]
+    fn thinking_switches() {
+        let req = |j: Value| -> ChatReq { serde_json::from_value(j).unwrap() };
+        assert!(!thinking_on(&req(json!({"messages": []}))));
+        assert!(thinking_on(&req(json!({"chat_template_kwargs": {"enable_thinking": true}}))));
+        assert!(!thinking_on(&req(json!({"chat_template_kwargs": {"enable_thinking": false}, "reasoning_budget": -1}))));
+        assert!(!thinking_on(&req(json!({"reasoning_budget": 0}))));
+        assert!(thinking_on(&req(json!({"reasoning_budget": -1}))));
+        assert!(thinking_on(&req(json!({"reasoning_effort": "high"}))));
+        assert!(!thinking_on(&req(json!({"reasoning_effort": "none"}))));
     }
 }
