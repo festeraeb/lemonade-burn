@@ -10,6 +10,8 @@
 pub mod chat;
 pub mod spec;
 #[cfg(feature = "gpu")]
+pub mod spec_dev;
+#[cfg(feature = "gpu")]
 pub mod device;
 #[cfg(feature = "gpu")]
 pub mod pipeline;

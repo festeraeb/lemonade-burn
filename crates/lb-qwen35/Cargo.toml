@@ -25,3 +25,8 @@ ahash = "0.8"
 name = "qwen35-dev-check"
 path = "src/bin/qwen35-dev-check.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "qwen35-dev-mtp"
+path = "src/bin/qwen35-dev-mtp.rs"
+required-features = ["cuda"]
