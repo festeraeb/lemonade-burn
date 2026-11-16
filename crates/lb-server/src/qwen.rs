@@ -32,13 +32,13 @@ pub struct QSnap {
     state: Vec<Vec<lb_qwen35::device::LayerSnap>>,
 }
 
-/// Prompts of at least this many new tokens go through the batched prefill (`LB_QW_PREFILL_MIN`, default 8; 0 = never).
+/// Prompts of at least this many new tokens go through the batched prefill (`LB_QW_PREFILL_MIN`, default 32; 0 = never).
 fn trace() -> bool {
     std::env::var("LB_QW_TRACE").is_ok()
 }
 
 fn prefill_min() -> usize {
-    std::env::var("LB_QW_PREFILL_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+    std::env::var("LB_QW_PREFILL_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
 }
 
 pub fn is_qwen(p: &Path) -> bool {
