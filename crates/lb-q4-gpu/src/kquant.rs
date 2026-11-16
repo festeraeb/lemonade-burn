@@ -266,11 +266,22 @@ fn perm16_kernel(x: &[f32], y: &mut [f32]) {
     }
 }
 
+/// Byte `k` of each of the four words of `w` as an exact float: `(byte | 0x4B000000)` is `2^23 + byte`, minus `2^23` (`off` = the
+/// constant to subtract, `8388608.0` plus any offset of the quant, e.g. 32 for Q6_K, exactly representable). Two integer ops and one add
+/// where an int-to-float convert costs a quarter-rate slot (Pascal).
+#[cube]
+fn u2f_bytes(w: V4U, k: u32, off: f32) -> V4F {
+    let b = ((w >> V4U::new(8u32 * k)) & V4U::new(255u32)) | V4U::new(1258291200u32);
+    V4F::reinterpret(b) - V4F::new(off)
+}
+
+/// Lane partial of one Q5_K row at file density. The nibble/high-bit assembly is done on whole words (4 values an instruction), then
+/// each value costs one extract, one add and one FMA; same products as the scalar decode, summed in a different order.
 #[cube]
 fn q5n_partial(w: &[V4U], x: &[V4F], blk0: usize, xrow4: usize, bpr: usize, lane: usize, width: usize) -> f32 {
-let mut acc = 0.0f32;
-let mut it = lane;
-let items = bpr * 4usize;
+    let items = bpr * 4usize;
+    let mut acc = 0.0f32;
+    let mut it = lane;
     while it < items {
         let b = it / 4usize;
         let j = it % 4usize;
@@ -293,21 +304,20 @@ let items = bpr * 4usize;
         let mut p2 = V4F::new(0.0f32);
         let mut x1 = V4F::new(0.0f32);
         let mut x2 = V4F::new(0.0f32);
+        let m4 = V4U::new(252645135u32);
+        let m16 = V4U::new(269488144u32);
         #[unroll]
         for a in 0..2usize {
             let hv = w[base + 1usize + a];
             let qv = w[base + 3usize + 2usize * j + a];
+            let w1 = (qv & m4) | (((hv >> V4U::new(g1)) << V4U::new(4u32)) & m16);
+            let w2 = ((qv >> V4U::new(4u32)) & m4) | (((hv >> V4U::new(g2)) << V4U::new(4u32)) & m16);
             #[unroll]
             for k in 0..4u32 {
-                let byte = (qv >> V4U::new(8u32 * k)) & V4U::new(255u32);
-                let h1 = (hv >> V4U::new(8u32 * k + g1)) & V4U::new(1u32);
-                let h2 = (hv >> V4U::new(8u32 * k + g2)) & V4U::new(1u32);
-                let q1 = (byte & V4U::new(15u32)) + h1 * V4U::new(16u32);
-                let q2 = (byte >> V4U::new(4u32)) + h2 * V4U::new(16u32);
                 let xv1 = x[xb + 4usize * a + k as usize];
                 let xv2 = x[xb + 8usize + 4usize * a + k as usize];
-                p1 += V4F::cast_from(q1) * xv1;
-                p2 += V4F::cast_from(q2) * xv2;
+                p1 += u2f_bytes(w1, k, 8388608.0f32) * xv1;
+                p2 += u2f_bytes(w2, k, 8388608.0f32) * xv2;
                 x1 += xv1;
                 x2 += xv2;
             }
@@ -320,6 +330,130 @@ let items = bpr * 4usize;
         it += width;
     }
     acc
+}
+
+
+// ---- row-batched K-quant matvec: a plane takes `r` consecutive rows and loads every activation vector once for all of them
+// (the one-row kernels re-read 256 bytes of activations for every 80 bytes of Q5_K weights: the loads, not the arithmetic, set the time).
+
+/// `acc[i] += ` this lane's partial of row `i` (`i < r`; rows `blk0 + i * bpr` blocks apart), Q5_K file density; rows `i >= split` read
+/// their blocks from `w2` (the up matrix next to the gate matrix: the same activation vectors serve both).
+#[cube]
+fn q5n_rows2(w: &[V4U], w2: &[V4U], x: &[V4F], blk0: usize, xrow4: usize, bpr: usize, lane: usize, width: usize, acc: &mut Array<f32>, #[comptime] r: usize, #[comptime] split: usize) {
+    let items = bpr * 4usize;
+    let mut it = lane;
+    while it < items {
+        let b = it / 4usize;
+        let j = it % 4usize;
+        let g1 = (2usize * j) as u32;
+        let g2 = g1 + 1u32;
+        let xb = xrow4 + b * 64usize + 16usize * j;
+        // all loads first: 16 activation vectors once, then each row's header, qh and qs
+        let mut xa = Array::<V4F>::new(16usize);
+        let mut x1 = V4F::new(0.0f32);
+        let mut x2 = V4F::new(0.0f32);
+        #[unroll]
+        for a in 0..2usize {
+            #[unroll]
+            for kk in 0..4usize {
+                let v1 = x[xb + 4usize * a + kk];
+                let v2 = x[xb + 8usize + 4usize * a + kk];
+                xa[(a * 4usize + kk) * 2usize] = v1;
+                xa[(a * 4usize + kk) * 2usize + 1usize] = v2;
+                x1 += v1;
+                x2 += v2;
+            }
+        }
+        let sx1 = x1.extract(0usize) + x1.extract(1usize) + x1.extract(2usize) + x1.extract(3usize);
+        let sx2 = x2.extract(0usize) + x2.extract(1usize) + x2.extract(2usize) + x2.extract(3usize);
+        let m4 = V4U::new(252645135u32);
+        let m16 = V4U::new(269488144u32);
+        #[unroll]
+        for i in 0..r {
+            let ri = comptime!(if i >= split { i - split } else { i });
+            let base = (blk0 + ri * bpr + b) * 11usize;
+            let mut hdr = w[base];
+            let mut h0 = w[base + 1usize];
+            let mut h1v = w[base + 2usize];
+            let mut q0 = w[base + 3usize + 2usize * j];
+            let mut q1 = w[base + 4usize + 2usize * j];
+            if comptime!(i >= split) {
+                hdr = w2[base];
+                h0 = w2[base + 1usize];
+                h1v = w2[base + 2usize];
+                q0 = w2[base + 3usize + 2usize * j];
+                q1 = w2[base + 4usize + 2usize * j];
+            }
+            let w0 = hdr.extract(0usize);
+            let d = f16_to_f32(w0 & 65535u32);
+            let dmin = f16_to_f32((w0 >> 16u32) & 65535u32);
+            let s0 = hdr.extract(1usize);
+            let s1 = hdr.extract(2usize);
+            let s2 = hdr.extract(3usize);
+            let sc1 = d * (k4_scale(s0, s1, s2, g1) as f32);
+            let sc2 = d * (k4_scale(s0, s1, s2, g2) as f32);
+            let mn1 = dmin * (k4_min(s0, s1, s2, g1) as f32);
+            let mn2 = dmin * (k4_min(s0, s1, s2, g2) as f32);
+            let mut p1 = V4F::new(0.0f32);
+            let mut p2 = V4F::new(0.0f32);
+            #[unroll]
+            for a in 0..2usize {
+                let mut hv = h0;
+                let mut qv = q0;
+                if a == 1usize {
+                    hv = h1v;
+                    qv = q1;
+                }
+                let wd1 = (qv & m4) | (((hv >> V4U::new(g1)) << V4U::new(4u32)) & m16);
+                let wd2 = ((qv >> V4U::new(4u32)) & m4) | (((hv >> V4U::new(g2)) << V4U::new(4u32)) & m16);
+                #[unroll]
+                for kk in 0..4u32 {
+                    p1 += u2f_bytes(wd1, kk, 8388608.0f32) * xa[(a * 4usize + kk as usize) * 2usize];
+                    p2 += u2f_bytes(wd2, kk, 8388608.0f32) * xa[(a * 4usize + kk as usize) * 2usize + 1usize];
+                }
+            }
+            let sp1 = p1.extract(0usize) + p1.extract(1usize) + p1.extract(2usize) + p1.extract(3usize);
+            let sp2 = p2.extract(0usize) + p2.extract(1usize) + p2.extract(2usize) + p2.extract(3usize);
+            acc[i] += sc1 * sp1 - mn1 * sx1 + sc2 * sp2 - mn2 * sx2;
+        }
+        it += width;
+    }
+}
+
+/// Q5_K native matvec, 4 rows a plane, activations shared across the rows; needs plane ops and `rows % 4 == 0`.
+#[cube(launch)]
+fn q5_k_native_rows4_kernel(w: &[V4U], x: &[V4F], dims: &[u32], out: &mut [f32]) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let step = CUBE_COUNT as usize * ppc;
+    let groups = out.len() / 4usize;
+    let mut g = CUBE_POS as usize * ppc + plane_id;
+    while g < groups {
+        let o0 = g * 4usize;
+        let t = o0 / rows;
+        let r0 = o0 % rows;
+        let mut acc = Array::<f32>::new(4usize);
+        #[unroll]
+        for i in 0..4usize {
+            acc[i] = 0.0f32;
+        }
+        q5n_rows(w, x, r0 * bpr, t * cols / 4usize, bpr, lane, 32usize, &mut acc, 4usize);
+        let s0 = plane_sum(acc[0usize]);
+        let s1 = plane_sum(acc[1usize]);
+        let s2 = plane_sum(acc[2usize]);
+        let s3 = plane_sum(acc[3usize]);
+        if lane == 0usize {
+            out[o0] = s0;
+            out[o0 + 1usize] = s1;
+            out[o0 + 2usize] = s2;
+            out[o0 + 3usize] = s3;
+        }
+        g += step;
+    }
 }
 
 /// Native-layout Q5_K matvec: the GGUF bytes as they are (176-byte blocks = 11 `Vector<u32,4>`, 0.6875 bytes a value), no repack.
@@ -398,6 +532,20 @@ impl GpuQ5KNative {
     pub fn launch_permuted(&self, gpu: &Gpu, xp: &Handle, m: usize) -> Handle {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
+        if gpu.use_plane && gpu.plane_size.1 == 32 && self.rows % 4 == 0 && std::env::var("LB_QW_ROWS1").is_err() {
+            unsafe {
+                q5_k_native_rows4_kernel::launch(
+                    &gpu.client,
+                    cube_count(n_out / 4, gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(self.w.clone(), self.n_words / 4),
+                    BufferArg::from_raw_parts(xp.clone(), m * self.cols / 4),
+                    BufferArg::from_raw_parts(self.dims.clone(), 2),
+                    BufferArg::from_raw_parts(out.clone(), n_out),
+                );
+            }
+            return out;
+        }
         unsafe {
             q5_k_native_matvec_kernel::launch(
                 &gpu.client,
@@ -597,17 +745,17 @@ impl GpuKExpertLayer {
 // f16 `d` packed two to a word (34 B a block). Both read activations permuted by `perm16_kernel`.
 // ---------------------------------------------------------------------------------------------------------------------------
 
+/// Lane partial of one Q6_K row at file density (half blocks `lane, lane + width, ...`), word-wide nibble/2-bit assembly as in Q5_K.
 #[cube]
 fn q6n_partial(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], blk0: usize, xrow4: usize, bpr: usize, lane: usize, width: usize) -> f32 {
-let mut acc = 0.0f32;
-let mut it = lane;
-let items = bpr * 2usize;
+    let items = bpr * 2usize;
+    let mut acc = 0.0f32;
+    let mut it = lane;
     while it < items {
         let gb = blk0 + it / 2usize;
         let h = it % 2usize;
         let d = f16_to_f32((dd[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
         let sv = sc[gb];
-        // scale bytes 8h + c live in word 2h + c/4 of the scale vector
         let mut w0 = sv.extract(0usize);
         let mut w1 = sv.extract(1usize);
         if h == 1usize {
@@ -616,35 +764,39 @@ let items = bpr * 2usize;
         }
         let xb = xrow4 + (it / 2usize) * 64usize + 32usize * h;
         let qb = gb * 12usize;
+        let m4 = V4U::new(252645135u32);
+        let m3 = V4U::new(50529027u32);
         let mut part = 0.0f32;
         #[unroll]
         for a in 0..2usize {
             let qla = qq[qb + 4usize * h + a];
             let qlb = qq[qb + 4usize * h + a + 2usize];
             let qhv = qq[qb + 8usize + 2usize * h + a];
+            let l0 = qla & m4;
+            let l1 = qlb & m4;
+            let l2 = (qla >> V4U::new(4u32)) & m4;
+            let l3 = (qlb >> V4U::new(4u32)) & m4;
+            let v0 = l0 | ((qhv & m3) << V4U::new(4u32));
+            let v1 = l1 | (((qhv >> V4U::new(2u32)) & m3) << V4U::new(4u32));
+            let v2 = l2 | (((qhv >> V4U::new(4u32)) & m3) << V4U::new(4u32));
+            let v3 = l3 | (((qhv >> V4U::new(6u32)) & m3) << V4U::new(4u32));
             let mut p0 = V4F::new(0.0f32);
             let mut p1 = V4F::new(0.0f32);
             let mut p2 = V4F::new(0.0f32);
             let mut p3 = V4F::new(0.0f32);
             #[unroll]
             for k in 0..4u32 {
-                let sh = 8u32 * k;
-                let v0 = ((qla >> V4U::new(sh)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh)) & V4U::new(3u32)) << V4U::new(4u32));
-                let v1 = ((qlb >> V4U::new(sh)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 2u32)) & V4U::new(3u32)) << V4U::new(4u32));
-                let v2 = ((qla >> V4U::new(sh + 4u32)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 4u32)) & V4U::new(3u32)) << V4U::new(4u32));
-                let v3 = ((qlb >> V4U::new(sh + 4u32)) & V4U::new(15u32)) | (((qhv >> V4U::new(sh + 6u32)) & V4U::new(3u32)) << V4U::new(4u32));
                 let xo = xb + 4usize * a + k as usize;
-                p0 += (V4F::cast_from(v0) - V4F::new(32.0f32)) * x[xo];
-                p1 += (V4F::cast_from(v1) - V4F::new(32.0f32)) * x[xo + 8usize];
-                p2 += (V4F::cast_from(v2) - V4F::new(32.0f32)) * x[xo + 16usize];
-                p3 += (V4F::cast_from(v3) - V4F::new(32.0f32)) * x[xo + 24usize];
+                // 8388608 + 32: the Q6_K offset folded into the exact subtract
+                p0 += u2f_bytes(v0, k, 8388640.0f32) * x[xo];
+                p1 += u2f_bytes(v1, k, 8388640.0f32) * x[xo + 8usize];
+                p2 += u2f_bytes(v2, k, 8388640.0f32) * x[xo + 16usize];
+                p3 += u2f_bytes(v3, k, 8388640.0f32) * x[xo + 24usize];
             }
-            // scale index within the half: a + 2m, m = 0..3  -> byte (a + 2m) of w0 (a+2m < 4) or w1
             let s0 = ((w0 >> ((8usize * a) as u32)) & 255u32) as f32;
             let s1 = ((w0 >> ((8usize * (a + 2usize)) as u32)) & 255u32) as f32;
             let s2 = ((w1 >> ((8usize * a) as u32)) & 255u32) as f32;
             let s3 = ((w1 >> ((8usize * (a + 2usize)) as u32)) & 255u32) as f32;
-            // i8 -> signed
             let f0 = s0 - 256.0f32 * (((s0 as u32) >> 7u32) as f32);
             let f1 = s1 - 256.0f32 * (((s1 as u32) >> 7u32) as f32);
             let f2 = s2 - 256.0f32 * (((s2 as u32) >> 7u32) as f32);
@@ -659,6 +811,125 @@ let items = bpr * 2usize;
         it += width;
     }
     acc
+}
+
+
+/// One weight array: [`q5n_rows2`] with no second matrix.
+#[cube]
+fn q5n_rows(w: &[V4U], x: &[V4F], blk0: usize, xrow4: usize, bpr: usize, lane: usize, width: usize, acc: &mut Array<f32>, #[comptime] r: usize) {
+    q5n_rows2(w, w, x, blk0, xrow4, bpr, lane, width, acc, r, 1000usize);
+}
+
+/// Q6_K analogue of [`q5n_rows`]: `acc[i] +=` the lane's partial of row `i`; the 32 activation vectors of a half block are loaded once.
+#[cube]
+fn q6n_rows(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], blk0: usize, xrow4: usize, bpr: usize, lane: usize, width: usize, acc: &mut Array<f32>, #[comptime] r: usize) {
+    let items = bpr * 2usize;
+    let mut it = lane;
+    while it < items {
+        let bb = it / 2usize;
+        let h = it % 2usize;
+        let xb = xrow4 + bb * 64usize + 32usize * h;
+        let mut xa = Array::<V4F>::new(32usize);
+        #[unroll]
+        for a in 0..2usize {
+            #[unroll]
+            for kk in 0..4usize {
+                #[unroll]
+                for mm in 0..4usize {
+                    xa[((a * 4usize + kk) * 4usize) + mm] = x[xb + 4usize * a + kk + 8usize * mm];
+                }
+            }
+        }
+        let m4 = V4U::new(252645135u32);
+        let m3 = V4U::new(50529027u32);
+        #[unroll]
+        for i in 0..r {
+            let gb = blk0 + i * bpr + bb;
+            let d = f16_to_f32((dd[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+            let sv = sc[gb];
+            let mut w0 = sv.extract(0usize);
+            let mut w1 = sv.extract(1usize);
+            if h == 1usize {
+                w0 = sv.extract(2usize);
+                w1 = sv.extract(3usize);
+            }
+            let qb = gb * 12usize;
+            let mut part = 0.0f32;
+            #[unroll]
+            for a in 0..2usize {
+                let qla = qq[qb + 4usize * h + a];
+                let qlb = qq[qb + 4usize * h + a + 2usize];
+                let qhv = qq[qb + 8usize + 2usize * h + a];
+                let v0 = (qla & m4) | ((qhv & m3) << V4U::new(4u32));
+                let v1 = (qlb & m4) | (((qhv >> V4U::new(2u32)) & m3) << V4U::new(4u32));
+                let v2 = ((qla >> V4U::new(4u32)) & m4) | (((qhv >> V4U::new(4u32)) & m3) << V4U::new(4u32));
+                let v3 = ((qlb >> V4U::new(4u32)) & m4) | (((qhv >> V4U::new(6u32)) & m3) << V4U::new(4u32));
+                let mut p0 = V4F::new(0.0f32);
+                let mut p1 = V4F::new(0.0f32);
+                let mut p2 = V4F::new(0.0f32);
+                let mut p3 = V4F::new(0.0f32);
+                #[unroll]
+                for kk in 0..4u32 {
+                    let xi = ((a * 4usize + kk as usize) * 4usize);
+                    p0 += u2f_bytes(v0, kk, 8388640.0f32) * xa[xi];
+                    p1 += u2f_bytes(v1, kk, 8388640.0f32) * xa[xi + 1usize];
+                    p2 += u2f_bytes(v2, kk, 8388640.0f32) * xa[xi + 2usize];
+                    p3 += u2f_bytes(v3, kk, 8388640.0f32) * xa[xi + 3usize];
+                }
+                let s0 = ((w0 >> ((8usize * a) as u32)) & 255u32) as f32;
+                let s1 = ((w0 >> ((8usize * (a + 2usize)) as u32)) & 255u32) as f32;
+                let s2 = ((w1 >> ((8usize * a) as u32)) & 255u32) as f32;
+                let s3 = ((w1 >> ((8usize * (a + 2usize)) as u32)) & 255u32) as f32;
+                let f0 = s0 - 256.0f32 * (((s0 as u32) >> 7u32) as f32);
+                let f1 = s1 - 256.0f32 * (((s1 as u32) >> 7u32) as f32);
+                let f2 = s2 - 256.0f32 * (((s2 as u32) >> 7u32) as f32);
+                let f3 = s3 - 256.0f32 * (((s3 as u32) >> 7u32) as f32);
+                let e0 = p0.extract(0usize) + p0.extract(1usize) + p0.extract(2usize) + p0.extract(3usize);
+                let e1 = p1.extract(0usize) + p1.extract(1usize) + p1.extract(2usize) + p1.extract(3usize);
+                let e2 = p2.extract(0usize) + p2.extract(1usize) + p2.extract(2usize) + p2.extract(3usize);
+                let e3 = p3.extract(0usize) + p3.extract(1usize) + p3.extract(2usize) + p3.extract(3usize);
+                part += f0 * e0 + f1 * e1 + f2 * e2 + f3 * e3;
+            }
+            acc[i] += d * part;
+        }
+        it += width;
+    }
+}
+
+/// Q6_K native matvec, 4 rows a plane, activations shared across the rows; needs plane ops and `rows % 4 == 0`.
+#[cube(launch)]
+fn q6_k_native_rows4_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32]) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let step = CUBE_COUNT as usize * ppc;
+    let groups = out.len() / 4usize;
+    let mut g = CUBE_POS as usize * ppc + plane_id;
+    while g < groups {
+        let o0 = g * 4usize;
+        let t = o0 / rows;
+        let r0 = o0 % rows;
+        let mut acc = Array::<f32>::new(4usize);
+        #[unroll]
+        for i in 0..4usize {
+            acc[i] = 0.0f32;
+        }
+        q6n_rows(qq, sc, dd, x, r0 * bpr, t * cols / 4usize, bpr, lane, 32usize, &mut acc, 4usize);
+        let s0 = plane_sum(acc[0usize]);
+        let s1 = plane_sum(acc[1usize]);
+        let s2 = plane_sum(acc[2usize]);
+        let s3 = plane_sum(acc[3usize]);
+        if lane == 0usize {
+            out[o0] = s0;
+            out[o0 + 1usize] = s1;
+            out[o0 + 2usize] = s2;
+            out[o0 + 3usize] = s3;
+        }
+        g += step;
+    }
 }
 
 /// Q6_K lane = one 128-value half block. `dims` = [rows, cols].
@@ -792,6 +1063,22 @@ impl GpuQ6KNative {
     pub fn launch_permuted(&self, gpu: &Gpu, xp: &Handle, m: usize) -> Handle {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
+        if gpu.use_plane && gpu.plane_size.1 == 32 && self.rows % 4 == 0 && std::env::var("LB_QW_ROWS1").is_err() {
+            unsafe {
+                q6_k_native_rows4_kernel::launch(
+                    &gpu.client,
+                    cube_count(n_out / 4, gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(self.qq.clone(), self.n.0 / 4),
+                    BufferArg::from_raw_parts(self.sc.clone(), self.n.1 / 4),
+                    BufferArg::from_raw_parts(self.dd.clone(), self.n.2),
+                    BufferArg::from_raw_parts(xp.clone(), m * self.cols / 4),
+                    BufferArg::from_raw_parts(self.dims.clone(), 2),
+                    BufferArg::from_raw_parts(out.clone(), n_out),
+                );
+            }
+            return out;
+        }
         unsafe {
             q6_k_native_matvec_kernel::launch(
                 &gpu.client,
@@ -1166,6 +1453,133 @@ fn split_q6(gpu: &Gpu, bytes: &[u8], nb: usize) -> (Handle, Handle, Handle, (usi
     (gpu.upload_u32(qq), gpu.upload_u32(sc), gpu.upload_u32(dd), n)
 }
 
+
+/// Routed gate+up+SiLU, Q5_K, 4 output rows a plane (gate and up of each: 8 row partials sharing the activation loads); writes `h` permuted.
+#[cube(launch)]
+fn q5n_routed_gate_up_rows4_kernel(gw: &[V4U], uw: &[V4U], x: &[V4F], routes: &[u32], dims: &[u32], h: &mut [f32]) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let step = CUBE_COUNT as usize * ppc;
+    let groups = h.len() / 4usize;
+    let mut g = CUBE_POS as usize * ppc + plane_id;
+    while g < groups {
+        let o0 = g * 4usize;
+        let slot = o0 / rows;
+        let r0 = o0 % rows;
+        let e = routes[2usize * slot] as usize;
+        let tok = routes[2usize * slot + 1usize] as usize;
+        let mut acc = Array::<f32>::new(8usize);
+        #[unroll]
+        for i in 0..8usize {
+            acc[i] = 0.0f32;
+        }
+        // rows 0..4 of acc: gate rows r0..r0+4, rows 4..8: the same rows of up
+        q5n_rows2(gw, uw, x, (e * rows + r0) * bpr, tok * cols / 4usize, bpr, lane, 32usize, &mut acc, 8usize, 4usize);
+        #[unroll]
+        for i in 0..4usize {
+            let gsum = plane_sum(acc[i]);
+            let usum = plane_sum(acc[i + 4usize]);
+            if lane == 0usize {
+                let r = r0 + i;
+                let a16 = r / 16usize;
+                let rem = r % 16usize;
+                h[slot * rows + a16 * 16usize + (rem % 4usize) * 4usize + rem / 4usize] = gsum / (1.0f32 + Exp::exp(-gsum)) * usum;
+            }
+        }
+        g += step;
+    }
+}
+
+/// Routed down, Q5_K or Q6_K experts, `r` rows a lane group with the activation loaded once per group: a plane is `32 / ipr` groups of
+/// `ipr` lanes (the items of one row), each group `r` consecutive rows; a group's lanes are summed with xor shuffles.
+#[cube(launch)]
+fn q5n_routed_down_rb_kernel(w: &[V4U], h: &[V4F], routes: &[u32], dims: &[u32], out: &mut [f32], #[comptime] ipr: usize, #[comptime] r: usize) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let step = CUBE_COUNT as usize * ppc;
+    let gpp = 32usize / ipr;
+    let per_plane = gpp * r;
+    let groups = out.len() / per_plane;
+    let lg = lane / ipr;
+    let li = lane % ipr;
+    let mut g = CUBE_POS as usize * ppc + plane_id;
+    while g < groups {
+        let ob = g * per_plane + lg * r;
+        let slot = ob / rows;
+        let r0 = ob % rows;
+        let e = routes[2usize * slot] as usize;
+        let mut acc = Array::<f32>::new(r);
+        #[unroll]
+        for i in 0..r {
+            acc[i] = 0.0f32;
+        }
+        q5n_rows(w, h, (e * rows + r0) * bpr, slot * cols / 4usize, bpr, li, ipr, &mut acc, r);
+        #[unroll]
+        for i in 0..r {
+            let mut v = acc[i];
+            let mut s = lane * 0usize + ipr / 2usize;
+            while s > 0usize {
+                v += plane_shuffle_xor(v, s as u32);
+                s = s / 2usize;
+            }
+            if li == 0usize {
+                out[ob + i] = v;
+            }
+        }
+        g += step;
+    }
+}
+
+#[cube(launch)]
+fn q6n_routed_down_rb_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], h: &[V4F], routes: &[u32], dims: &[u32], out: &mut [f32], #[comptime] ipr: usize, #[comptime] r: usize) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let step = CUBE_COUNT as usize * ppc;
+    let gpp = 32usize / ipr;
+    let per_plane = gpp * r;
+    let groups = out.len() / per_plane;
+    let lg = lane / ipr;
+    let li = lane % ipr;
+    let mut g = CUBE_POS as usize * ppc + plane_id;
+    while g < groups {
+        let ob = g * per_plane + lg * r;
+        let slot = ob / rows;
+        let r0 = ob % rows;
+        let e = routes[2usize * slot] as usize;
+        let mut acc = Array::<f32>::new(r);
+        #[unroll]
+        for i in 0..r {
+            acc[i] = 0.0f32;
+        }
+        q6n_rows(qq, sc, dd, h, (e * rows + r0) * bpr, slot * cols / 4usize, bpr, li, ipr, &mut acc, r);
+        #[unroll]
+        for i in 0..r {
+            let mut v = acc[i];
+            let mut s = lane * 0usize + ipr / 2usize;
+            while s > 0usize {
+                v += plane_shuffle_xor(v, s as u32);
+                s = s / 2usize;
+            }
+            if li == 0usize {
+                out[ob + i] = v;
+            }
+        }
+        g += step;
+    }
+}
+
 /// Expert gate and up matrices (always the same type in the files seen): Q5_K, or Q6_K in a few layers.
 pub enum NativeGateUp {
     Q5 { gw: Handle, uw: Handle, n: usize },
@@ -1253,8 +1667,21 @@ impl GpuNativeExperts {
         let out = gpu.scratch(slots * self.embd * 4);
         let d_gu = gpu.const_u32(&[self.ff as u32, self.embd as u32]);
         let d_dn = gpu.const_u32(&[self.embd as u32, self.ff as u32]);
+        // row-batched kernels need plane ops, a 32-lane plane, and (for the down pass) lane groups that divide the plane
+        let rb = gpu.use_plane && gpu.plane_size.1 == 32 && std::env::var("LB_QW_ROWS1").is_err();
         unsafe {
             match &self.gu {
+                NativeGateUp::Q5 { gw, uw, n } if rb && self.ff % 4 == 0 && std::env::var("LB_QW_NOGU").is_err() => q5n_routed_gate_up_rows4_kernel::launch(
+                    &gpu.client,
+                    cube_count(slots * self.ff / 4, gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(gw.clone(), n / 4),
+                    BufferArg::from_raw_parts(uw.clone(), n / 4),
+                    BufferArg::from_raw_parts(xp, self.embd / 4),
+                    BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                    BufferArg::from_raw_parts(d_gu, 2),
+                    BufferArg::from_raw_parts(h.clone(), slots * self.ff),
+                ),
                 NativeGateUp::Q5 { gw, uw, n } => q5n_routed_gate_up_silu_kernel::launch(
                     &gpu.client,
                     cube_count(slots * self.ff, gpu.per_cube()),
@@ -1308,6 +1735,22 @@ impl GpuNativeExperts {
                         rpp,
                     )
                 }
+                NativeDown::Q5 { w, n } if rb && std::env::var("LB_QW_NODN").is_err() && 32 % (self.ff / 256 * 4) == 0 && self.embd % (32 / (self.ff / 256 * 4) * 4) == 0 => {
+                    let ipr = self.ff / 256 * 4;
+                    let per_plane = 32 / ipr * 4;
+                    q5n_routed_down_rb_kernel::launch(
+                        &gpu.client,
+                        cube_count(slots * self.embd / per_plane, gpu.per_cube()),
+                        CubeDim::new_1d(gpu.cube_dim as u32),
+                        BufferArg::from_raw_parts(w.clone(), n / 4),
+                        BufferArg::from_raw_parts(hp, slots * self.ff / 4),
+                        BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                        BufferArg::from_raw_parts(d_dn, 2),
+                        BufferArg::from_raw_parts(out.clone(), slots * self.embd),
+                        ipr,
+                        4usize,
+                    )
+                }
                 NativeDown::Q5 { w, n } if mr(self.ff / 256 * 4) => {
                     let ipr = self.ff / 256 * 4;
                     let rpp = 32 / ipr;
@@ -1335,6 +1778,24 @@ impl GpuNativeExperts {
                     BufferArg::from_raw_parts(out.clone(), slots * self.embd),
                     gpu.use_plane,
                 ),
+                NativeDown::Q6 { qq, sc, dd, n } if rb && std::env::var("LB_QW_NODN").is_err() && 32 % (self.ff / 256 * 2) == 0 && self.embd % (32 / (self.ff / 256 * 2) * 4) == 0 => {
+                    let ipr = self.ff / 256 * 2;
+                    let per_plane = 32 / ipr * 4;
+                    q6n_routed_down_rb_kernel::launch(
+                        &gpu.client,
+                        cube_count(slots * self.embd / per_plane, gpu.per_cube()),
+                        CubeDim::new_1d(gpu.cube_dim as u32),
+                        BufferArg::from_raw_parts(qq.clone(), n.0 / 4),
+                        BufferArg::from_raw_parts(sc.clone(), n.1 / 4),
+                        BufferArg::from_raw_parts(dd.clone(), n.2),
+                        BufferArg::from_raw_parts(hp, slots * self.ff / 4),
+                        BufferArg::from_raw_parts(routes.clone(), 2 * slots),
+                        BufferArg::from_raw_parts(d_dn, 2),
+                        BufferArg::from_raw_parts(out.clone(), slots * self.embd),
+                        ipr,
+                        4usize,
+                    )
+                }
                 NativeDown::Q6 { qq, sc, dd, n } if mr(self.ff / 256 * 2) => {
                     let ipr = self.ff / 256 * 2;
                     let rpp = 32 / ipr;

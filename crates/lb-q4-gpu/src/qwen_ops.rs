@@ -225,6 +225,121 @@ fn qw_dn_recur_kernel(s: &mut [f32], conv: &[f32], beta: &[f32], g: &[f32], out:
     }
 }
 
+/// The whole delta-net core of one token in one launch (CUDA, plane ops): a cube (4 planes) per v head `hh` does the causal conv + SiLU
+/// of its q/k head's channels (`hh % nk`) and its own v channels, the L2 norms, beta and g, the delta rule (a plane a state row, lanes along the
+/// row), and the gated RMS norm; it writes the result natural and in the 16-value-permuted order. The conv state is double buffered
+/// (`st2` = two copies, the token's position parity picks the one to read; the cubes sharing a q/k head write identical values), so
+/// no cube reads a column another has already shifted. `nk` = 16 q/k heads, `hk` = `hv` = 128, conv width 4.
+#[cube(launch)]
+fn qw_dn_fused_kernel(
+    qkv: &[f32], z: &[f32], ba: &[f32], cw: &[f32], dt: &[f32], a: &[f32], nw: &[f32],
+    st2: &mut [f32], s: &mut [f32], out: &mut [f32], outp: &mut [f32], pp: &[u32], eps: &[f32],
+    #[comptime] nk: usize, #[comptime] nv: usize, #[comptime] hk: usize, #[comptime] ch: usize,
+) {
+    let hh = CUBE_POS as usize;
+    let t = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let w = (UNIT_POS / PLANE_DIM) as usize;
+    let nwp = (CUBE_DIM_X / PLANE_DIM) as usize;
+    let kh = hh % nk;
+    let par = (pp[0] % 2u32) as usize;
+    let rd = par * 3usize * ch;
+    let wr = (1usize - par) * 3usize * ch;
+    let mut qs = Shared::<[f32]>::new_slice(128usize);
+    let mut ks = Shared::<[f32]>::new_slice(128usize);
+    let mut vs = Shared::<[f32]>::new_slice(128usize);
+    let mut os = Shared::<[f32]>::new_slice(128usize);
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    // conv + SiLU of the three channels this thread owns (q, k of head kh; v of head hh), and the state shift
+    let cq = kh * hk + t;
+    let ck = nk * hk + kh * hk + t;
+    let cv = 2usize * nk * hk + hh * hk + t;
+    let mut sum = cw[cq * 4usize + 3usize] * qkv[cq];
+    sum += st2[rd + cq] * cw[cq * 4usize];
+    sum += st2[rd + ch + cq] * cw[cq * 4usize + 1usize];
+    sum += st2[rd + 2usize * ch + cq] * cw[cq * 4usize + 2usize];
+    qs[t] = silu_f(sum);
+    st2[wr + cq] = st2[rd + ch + cq];
+    st2[wr + ch + cq] = st2[rd + 2usize * ch + cq];
+    st2[wr + 2usize * ch + cq] = qkv[cq];
+    let mut sumk = cw[ck * 4usize + 3usize] * qkv[ck];
+    sumk += st2[rd + ck] * cw[ck * 4usize];
+    sumk += st2[rd + ch + ck] * cw[ck * 4usize + 1usize];
+    sumk += st2[rd + 2usize * ch + ck] * cw[ck * 4usize + 2usize];
+    ks[t] = silu_f(sumk);
+    st2[wr + ck] = st2[rd + ch + ck];
+    st2[wr + ch + ck] = st2[rd + 2usize * ch + ck];
+    st2[wr + 2usize * ch + ck] = qkv[ck];
+    let mut sumv = cw[cv * 4usize + 3usize] * qkv[cv];
+    sumv += st2[rd + cv] * cw[cv * 4usize];
+    sumv += st2[rd + ch + cv] * cw[cv * 4usize + 1usize];
+    sumv += st2[rd + 2usize * ch + cv] * cw[cv * 4usize + 2usize];
+    vs[t] = silu_f(sumv);
+    st2[wr + cv] = st2[rd + ch + cv];
+    st2[wr + ch + cv] = st2[rd + 2usize * ch + cv];
+    st2[wr + 2usize * ch + cv] = qkv[cv];
+    sync_cube();
+    // L2 norms of q and k
+    let qv = qs[t];
+    let kv = ks[t];
+    let sq = lane_sum(&mut sm, qv * qv, false);
+    let sk = lane_sum(&mut sm, kv * kv, false);
+    let rq = 1.0f32 / Sqrt::sqrt(sq + eps[0]);
+    let rk = 1.0f32 / Sqrt::sqrt(sk + eps[0]);
+    qs[t] = qv * rq;
+    ks[t] = kv * rk;
+    sync_cube();
+    let beta = sigmoid_f(ba[hh]);
+    let xg = ba[nv + hh] + dt[hh];
+    let mut sp = xg;
+    if xg <= 20.0f32 {
+        sp = Log1p::log1p(Exp::exp(xg));
+    }
+    let decay = Exp::exp(sp * a[hh]);
+    let mut kr = Array::<f32>::new(4usize);
+    let mut qr = Array::<f32>::new(4usize);
+    #[unroll]
+    for m in 0..4usize {
+        kr[m] = ks[lane + 32usize * m];
+        qr[m] = qs[lane + 32usize * m];
+    }
+    let qscale = 1.0f32 / Sqrt::sqrt(hk as f32);
+    let mut i = w;
+    while i < hk {
+        let base = hh * hk * hk + i * hk;
+        let mut vr = Array::<f32>::new(4usize);
+        let mut ps = 0.0f32;
+        #[unroll]
+        for m in 0..4usize {
+            let v = s[base + lane + 32usize * m] * decay;
+            vr[m] = v;
+            ps += v * kr[m];
+        }
+        let skv = plane_sum(ps);
+        let d = (vs[i] - skv) * beta;
+        let mut po = 0.0f32;
+        #[unroll]
+        for m in 0..4usize {
+            let v = vr[m] + kr[m] * d;
+            s[base + lane + 32usize * m] = v;
+            po += v * qr[m];
+        }
+        let o = plane_sum(po);
+        if lane == 0usize {
+            os[i] = o * qscale;
+        }
+        i += nwp;
+    }
+    sync_cube();
+    // gated RMS norm of the head's output
+    let ov = os[t];
+    let so = lane_sum(&mut sm, ov * ov, false);
+    let r = 1.0f32 / Sqrt::sqrt(so / (hk as f32) + eps[0]);
+    let val = ov * r * nw[t] * silu_f(z[hh * hk + t]);
+    out[hh * hk + t] = val;
+    outp[hh * hk + perm16_idx(t)] = val;
+}
+
 /// `out = rms(o) * w * silu(z)` per head of `hv`; one cube per head.
 #[cube(launch)]
 fn qw_dn_gnorm_kernel(o: &[f32], z: &[f32], w: &[f32], out: &mut [f32], outp: &mut [f32], eps: &[f32], #[comptime] hv: usize) {
@@ -369,6 +484,103 @@ fn qw_attn_decode_kernel(
         out[h * hd + d] = o * sigmoid_f(gate[h * hd + d]);
         d += CUBE_DIM_X as usize;
     }
+}
+
+/// Plane-wide attention for one token (CUDA): the scores are computed a position per plane with the lanes along the head dimension
+/// (coalesced reads of K, one `plane_sum` a position), `p = e / sum` is stored once, and the output loop is a plain FMA over positions.
+/// One cube of 256 units (8 planes of 32) per query head; `hd` = 256. Then `* sigmoid(gate)`.
+#[cube(launch)]
+fn qw_attn_decode_wide_kernel(
+    q: &[f32], kc: &[f32], vc: &[f32], gate: &[f32], out: &mut [f32], scores: &mut [f32], pp: &[u32],
+    #[comptime] nh: usize, #[comptime] nkv: usize, #[comptime] hd: usize, #[comptime] cap: usize,
+) {
+    let h = CUBE_POS as usize;
+    let u = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let w = (UNIT_POS / PLANE_DIM) as usize;
+    let nw = (CUBE_DIM_X / PLANE_DIM) as usize;
+    let n = pp[0] as usize + 1usize;
+    let kvh = h / (nh / nkv);
+    let scale = 1.0f32 / Sqrt::sqrt(hd as f32);
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut qr = Array::<f32>::new(8usize);
+    #[unroll]
+    for m in 0..8usize {
+        qr[m] = q[h * hd + lane + 32usize * m];
+    }
+    let mut t = w;
+    while t < n {
+        let kb = (t * nkv + kvh) * hd;
+        let mut part = 0.0f32;
+        #[unroll]
+        for m in 0..8usize {
+            part += qr[m] * kc[kb + lane + 32usize * m];
+        }
+        let s = plane_sum(part) * scale;
+        if lane == 0usize {
+            scores[h * cap + t] = s;
+        }
+        t += nw;
+    }
+    sync_cube();
+    // max over positions
+    let mut mx = q[0usize] * 0.0f32 - 3.0e38f32;
+    let mut t = u;
+    while t < n {
+        let sv = scores[h * cap + t];
+        if sv > mx {
+            mx = sv;
+        }
+        t += CUBE_DIM_X as usize;
+    }
+    sm[u] = mx;
+    sync_cube();
+    let mut st = CUBE_DIM_X / 2u32;
+    while st > 0u32 {
+        if UNIT_POS < st {
+            let o2 = sm[u + st as usize];
+            if o2 > sm[u] {
+                sm[u] = o2;
+            }
+        }
+        sync_cube();
+        st = st / 2u32;
+    }
+    let m = sm[0usize];
+    sync_cube();
+    let mut sum = 0.0f32;
+    let mut t = u;
+    while t < n {
+        let e = Exp::exp(scores[h * cap + t] - m);
+        scores[h * cap + t] = e;
+        sum += e;
+        t += CUBE_DIM_X as usize;
+    }
+    let total = lane_sum(&mut sm, sum, false);
+    let mut t = u;
+    while t < n {
+        scores[h * cap + t] = scores[h * cap + t] / total;
+        t += CUBE_DIM_X as usize;
+    }
+    sync_cube();
+    // output: unit d owns dimension d (hd == cube size); positions in groups of four for independent loads
+    let mut o0 = 0.0f32;
+    let mut o1 = 0.0f32;
+    let mut o2 = 0.0f32;
+    let mut o3 = 0.0f32;
+    let mut t = 0usize;
+    while t + 3usize < n {
+        o0 += scores[h * cap + t] * vc[(t * nkv + kvh) * hd + u];
+        o1 += scores[h * cap + t + 1usize] * vc[((t + 1usize) * nkv + kvh) * hd + u];
+        o2 += scores[h * cap + t + 2usize] * vc[((t + 2usize) * nkv + kvh) * hd + u];
+        o3 += scores[h * cap + t + 3usize] * vc[((t + 3usize) * nkv + kvh) * hd + u];
+        t += 4usize;
+    }
+    while t < n {
+        o0 += scores[h * cap + t] * vc[(t * nkv + kvh) * hd + u];
+        t += 1usize;
+    }
+    out[h * hd + u] = (o0 + o1 + o2 + o3) * sigmoid_f(gate[h * hd + u]);
 }
 
 /// Softmax over `ne` (<= 512) router logits, top `k` by probability (ties: lowest index), weights renormalised; writes `[expert, 0]`
@@ -520,25 +732,24 @@ impl Gpu {
         out
     }
 
-    /// Delta-net core for one token. `qkv` `[ch]`, `z` `[d_inner]`, `ba` `[2 nv]` (beta logits then alpha logits); `conv_state` `[(kd-1) * ch]` and `s`
-    /// `[nv * hv * hk]` are persistent (create with `upload_f32`), updated in place. Returns the gated-normed `[d_inner]` (natural, permuted).
+    /// Delta-net core for one token, one launch. `qkv` `[ch]`, `z` `[d_inner]`, `ba` `[2 nv]` (beta logits then alpha logits); `conv_state` is
+    /// `2 * (kd-1) * ch` (double buffered, see the kernel) and `s` `[nv * hv * hk]`, both persistent (`upload_f32`), updated in place;
+    /// `pos_h` holds the token position (its parity picks the conv-state buffer). Returns the gated-normed `[d_inner]` (natural, permuted).
     #[allow(clippy::too_many_arguments)]
-    pub fn qw_delta_net(&self, qkv: &Handle, z: &Handle, ba: &Handle, conv_w: &Handle, dt: &Handle, a: &Handle, norm_w: &Handle, conv_state: &Handle, s: &Handle, (ch, kd, nk, nv, hk, hv): (usize, usize, usize, usize, usize, usize), eps: f32) -> (Handle, Handle) {
-        let conv = self.scratch(ch * 4);
-        let beta = self.scratch(nv * 4);
-        let g = self.scratch(nv * 4);
-        let o = self.scratch(nv * hv * 4);
-        let e = self.const_f32(&[eps]);
-        unsafe {
-            qw_dn_conv_kernel::launch(&self.client, self.qw_cubes(ch), CubeDim::new_1d(self.cube_dim as u32), BufferArg::from_raw_parts(qkv.clone(), ch), BufferArg::from_raw_parts(conv_w.clone(), ch * kd), BufferArg::from_raw_parts(conv_state.clone(), (kd - 1) * ch), BufferArg::from_raw_parts(conv.clone(), ch), ch, kd);
-            qw_l2_kernel::launch(&self.client, CubeCount::Static((2 * nk) as u32, 1, 1), CubeDim::new_1d(128), BufferArg::from_raw_parts(conv.clone(), ch), BufferArg::from_raw_parts(e.clone(), 1), hk);
-            qw_dn_scalars_kernel::launch(&self.client, self.qw_cubes(nv), CubeDim::new_1d(self.cube_dim as u32), BufferArg::from_raw_parts(ba.clone(), 2 * nv), BufferArg::from_raw_parts(dt.clone(), nv), BufferArg::from_raw_parts(a.clone(), nv), BufferArg::from_raw_parts(beta.clone(), nv), BufferArg::from_raw_parts(g.clone(), nv), nv);
-            qw_dn_recur_kernel::launch(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(128), BufferArg::from_raw_parts(s.clone(), nv * hv * hk), BufferArg::from_raw_parts(conv.clone(), ch), BufferArg::from_raw_parts(beta, nv), BufferArg::from_raw_parts(g, nv), BufferArg::from_raw_parts(o.clone(), nv * hv), nk, hv, hk);
-        }
+    pub fn qw_delta_net(&self, qkv: &Handle, z: &Handle, ba: &Handle, conv_w: &Handle, dt: &Handle, a: &Handle, norm_w: &Handle, conv_state: &Handle, s: &Handle, pos_h: &Handle, (ch, kd, nk, nv, hk, hv): (usize, usize, usize, usize, usize, usize), eps: f32) -> (Handle, Handle) {
+        assert!(kd == 4 && hk == 128 && hv == 128, "fused delta-net kernel is written for conv width 4 and 128-wide heads");
         let out = self.scratch(nv * hv * 4);
         let outp = self.scratch(nv * hv * 4);
+        let e = self.const_f32(&[eps]);
         unsafe {
-            qw_dn_gnorm_kernel::launch(&self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(128), BufferArg::from_raw_parts(o, nv * hv), BufferArg::from_raw_parts(z.clone(), nv * hv), BufferArg::from_raw_parts(norm_w.clone(), hv), BufferArg::from_raw_parts(out.clone(), nv * hv), BufferArg::from_raw_parts(outp.clone(), nv * hv), BufferArg::from_raw_parts(e, 1), hv);
+            qw_dn_fused_kernel::launch(
+                &self.client, CubeCount::Static(nv as u32, 1, 1), CubeDim::new_1d(128),
+                BufferArg::from_raw_parts(qkv.clone(), ch), BufferArg::from_raw_parts(z.clone(), nv * hv), BufferArg::from_raw_parts(ba.clone(), 2 * nv),
+                BufferArg::from_raw_parts(conv_w.clone(), ch * kd), BufferArg::from_raw_parts(dt.clone(), nv), BufferArg::from_raw_parts(a.clone(), nv),
+                BufferArg::from_raw_parts(norm_w.clone(), hv), BufferArg::from_raw_parts(conv_state.clone(), 2 * (kd - 1) * ch), BufferArg::from_raw_parts(s.clone(), nv * hv * hk),
+                BufferArg::from_raw_parts(out.clone(), nv * hv), BufferArg::from_raw_parts(outp.clone(), nv * hv), BufferArg::from_raw_parts(pos_h.clone(), 1), BufferArg::from_raw_parts(e, 1),
+                nk, nv, hk, ch,
+            );
         }
         (out, outp)
     }
@@ -562,6 +773,15 @@ impl Gpu {
                 BufferArg::from_raw_parts(kc.clone(), cap * nkv * hd), BufferArg::from_raw_parts(vc.clone(), cap * nkv * hd),
                 BufferArg::from_raw_parts(pos_h.clone(), 1), BufferArg::from_raw_parts(pf, 2), nh, nkv, hd, half,
             );
+            if self.use_plane && self.plane_size.1 == 32 && hd == 256 && std::env::var("LB_QW_ATTN_OLD").is_err() {
+                qw_attn_decode_wide_kernel::launch(
+                    &self.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(qo, nh * hd), BufferArg::from_raw_parts(kc.clone(), cap * nkv * hd), BufferArg::from_raw_parts(vc.clone(), cap * nkv * hd),
+                    BufferArg::from_raw_parts(gate, nh * hd), BufferArg::from_raw_parts(out.clone(), nh * hd), BufferArg::from_raw_parts(scores, nh * cap),
+                    BufferArg::from_raw_parts(pos_h.clone(), 1), nh, nkv, hd, cap,
+                );
+                return out;
+            }
             qw_attn_decode_kernel::launch(
                 &self.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(qo, nh * hd), BufferArg::from_raw_parts(kc.clone(), cap * nkv * hd), BufferArg::from_raw_parts(vc.clone(), cap * nkv * hd),

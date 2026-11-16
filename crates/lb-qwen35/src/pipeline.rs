@@ -9,13 +9,13 @@ use crate::device::DevModel;
 use crate::Model;
 use anyhow::{anyhow, Result};
 use lb_gguf::QuantMat;
-use lb_q4_gpu::{CubeGraph, Gpu, GpuQ6KMat, GpuQ8Mat};
+use lb_q4_gpu::{CubeGraph, Gpu, GpuQ6KNative, GpuQ8Mat};
 use std::cell::RefCell;
 
 type Handle = lb_q4_gpu::cubecl_server::Handle;
 
 enum HeadMat {
-    Q6(GpuQ6KMat),
+    Q6(GpuQ6KNative),
     Q8(GpuQ8Mat),
 }
 
@@ -65,7 +65,7 @@ impl<'m, 'a> Pipeline<'m, 'a> {
                 let out: QuantMat<'_> = model.output;
                 let out = match out.ty {
                     lb_gguf::GgmlType::Q8_0 => HeadMat::Q8(GpuQ8Mat::upload(&gpu, out).map_err(|e| anyhow!(e))?),
-                    _ => HeadMat::Q6(GpuQ6KMat::upload(&gpu, out).map_err(|e| anyhow!(e))?),
+                    _ => HeadMat::Q6(GpuQ6KNative::upload(&gpu, out).map_err(|e| anyhow!(e))?),
                 };
                 Some(Head { norm: gpu.upload_f32(&model.out_norm), out })
             } else {

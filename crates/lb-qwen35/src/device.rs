@@ -78,7 +78,14 @@ pub struct DevLayer {
     sh_down: DMat,
 }
 
+/// `LB_QW_SKIP=experts,shared,core,dense,route` skips those parts of every layer (timing ablation only: the results are wrong).
+fn skip(name: &str) -> bool {
+    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::env::var("LB_QW_SKIP").unwrap_or_default()).split(',').any(|x| x == name)
+}
+
 pub struct DevModel {
+    zeros: Handle,
     pub cfg: Config,
     pub cap: usize,
     pub layers: Vec<DevLayer>,
@@ -95,7 +102,8 @@ impl DevModel {
             layers.push(Self::upload_layer(gpu, &c, &m.layers[il], cap)?);
         }
         let theta_scale = c.rope_base.powf(-2.0 / c.n_rot as f32);
-        Ok(DevModel { cfg: c, cap, layers, theta_scale, pos_h: gpu.upload_u32(vec![0]) })
+        let zeros = gpu.upload_f32(&vec![0.0f32; 16384]);
+        Ok(DevModel { zeros, cfg: c, cap, layers, theta_scale, pos_h: gpu.upload_u32(vec![0]) })
     }
 
     fn upload_layer(gpu: &Gpu, c: &Config, l: &Layer<'_>, cap: usize) -> Result<DevLayer> {
@@ -111,7 +119,7 @@ impl DevModel {
                     a: f(&w.a),
                     dt: f(&w.dt_bias),
                     norm: f(&w.norm),
-                    conv_state: f(&vec![0.0; (c.d_conv - 1) * c.conv_channels()]),
+                    conv_state: f(&vec![0.0; 2 * (c.d_conv - 1) * c.conv_channels()]),
                     s: f(&vec![0.0; c.n_v_heads * c.head_v() * c.head_k]),
                 }),
                 None,
@@ -184,7 +192,7 @@ impl DevModel {
             let qkv = gpu.upload_f32(&vec![0.1f32; c.conv_channels()]);
             let z = gpu.upload_f32(&vec![0.1f32; c.d_inner]);
             let ba = gpu.upload_f32(&vec![0.1f32; 2 * c.n_v_heads]);
-            v.push(time("delta-net core", &|| gpu.qw_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, (c.conv_channels(), c.d_conv, c.n_k_heads, c.n_v_heads, c.head_k, c.head_v()), c.eps).0));
+            v.push(time("delta-net core", &|| gpu.qw_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, &self.pos_h, (c.conv_channels(), c.d_conv, c.n_k_heads, c.n_v_heads, c.head_k, c.head_v()), c.eps).0));
         } else if let Some(a) = &l.attn {
             v.push(time("q matvec", &|| a.q.launch(gpu, &x)));
             v.push(time("k matvec", &|| a.k.launch(gpu, &x)));
@@ -210,7 +218,7 @@ impl DevModel {
         let c = &self.cfg;
         for l in &self.layers {
             if let Some(d) = &l.lin {
-                gpu.write_f32(&d.conv_state, &vec![0.0; (c.d_conv - 1) * c.conv_channels()]);
+                gpu.write_f32(&d.conv_state, &vec![0.0; 2 * (c.d_conv - 1) * c.conv_channels()]);
                 gpu.write_f32(&d.s, &vec![0.0; c.n_v_heads * c.head_v() * c.head_k]);
             }
             if let Some(a) = &l.attn {
@@ -230,28 +238,34 @@ impl DevModel {
         let c = &self.cfg;
         let l = &self.layers[i];
         let (h, hp) = gpu.qw_rms(x, &l.attn_norm, 1, c.n_embd, c.eps);
-        let y = if let Some(d) = &l.lin {
-            let qkv = d.qkv.launch2(gpu, &h, &hp);
-            let z = d.z.launch2(gpu, &h, &hp);
+        let y = if skip("dense") {
+            self.zeros.clone()
+        } else if let Some(d) = &l.lin {
+            let qkv = if skip("qkv") { self.zeros.clone() } else { d.qkv.launch2(gpu, &h, &hp) };
+            let z = if skip("z") { self.zeros.clone() } else { d.z.launch2(gpu, &h, &hp) };
             let ba = gpu.qw_f32_matvec(&d.ba, &h, 2 * c.n_v_heads, c.n_embd);
-            let core = gpu.qw_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, (c.conv_channels(), c.d_conv, c.n_k_heads, c.n_v_heads, c.head_k, c.head_v()), c.eps);
-            d.out.launch2(gpu, &core.0, &core.1)
+            let core = if skip("core") { (self.zeros.clone(), self.zeros.clone()) } else { gpu.qw_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, &self.pos_h, (c.conv_channels(), c.d_conv, c.n_k_heads, c.n_v_heads, c.head_k, c.head_v()), c.eps) };
+            if skip("out") { self.zeros.clone() } else { d.out.launch2(gpu, &core.0, &core.1) }
         } else {
             let a = l.attn.as_ref().unwrap();
-            let qf = a.q.launch2(gpu, &h, &hp);
+            let qf = if skip("aq") { self.zeros.clone() } else { a.q.launch2(gpu, &h, &hp) };
             let k = a.k.launch2(gpu, &h, &hp);
             let v = a.v.launch2(gpu, &h, &hp);
             let o = gpu.qw_attention(&qf, &k, &v, &a.qn, &a.kn, &a.kc, &a.vc, &self.pos_h, (c.n_head, c.n_head_kv, c.head_dim, c.n_rot / 2, self.cap), c.eps, self.theta_scale);
-            a.o.launch(gpu, &o)
+            if skip("ao") { self.zeros.clone() } else { a.o.launch(gpu, &o) }
         };
         let (x1, h2, h2p) = gpu.qw_add_rms(x, &y, &l.post_norm, c.n_embd, c.eps);
         let logits = gpu.qw_f32_matvec(&l.router_sg, &h2, c.n_expert + 1, c.n_embd);
         let (routes, weights) = gpu.qw_route(&logits, c.n_expert, c.n_used);
-        let down = l.experts.launch_permuted(gpu, h2p, &routes, c.n_used);
-        let g = l.sh_gate.launch(gpu, &h2);
-        let u = l.sh_up.launch(gpu, &h2);
-        let sh = gpu.qw_silu_mul(&g, &u, c.ff_shexp);
-        let shout = l.sh_down.launch(gpu, &sh);
+        let down = if skip("experts") { self.zeros.clone() } else { l.experts.launch_permuted(gpu, h2p, &routes, c.n_used) };
+        let shout = if skip("shared") {
+            self.zeros.clone()
+        } else {
+            let g = l.sh_gate.launch(gpu, &h2);
+            let u = l.sh_up.launch(gpu, &h2);
+            let sh = gpu.qw_silu_mul(&g, &u, c.ff_shexp);
+            l.sh_down.launch(gpu, &sh)
+        };
         let out = gpu.qw_moe_combine(&x1, &down, &weights, &shout, &logits, c.n_expert + 1, c.n_expert, c.n_embd, c.n_used);
         (x1, out)
     }
