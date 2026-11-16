@@ -74,6 +74,20 @@ impl Decoder for QwenDev {
         }
         last.expect("logits")
     }
+    fn forward_argmax(&self, tokens: &[u32], cache: &mut QCache) -> Option<u32> {
+        if cache.len == 0 {
+            self.pipe.reset();
+        }
+        assert!(cache.len + tokens.len() <= self.cap, "sequence exceeds the KV capacity {}", self.cap);
+        let (last, head) = tokens.split_last().expect("tokens");
+        for &t in head {
+            self.pipe.step(t, cache.len, false).expect("device step");
+            cache.len += 1;
+        }
+        let tok = self.pipe.step_argmax(*last, cache.len).expect("device step");
+        cache.len += 1;
+        Some(tok)
+    }
     fn max_context(&self) -> usize {
         self.cap
     }

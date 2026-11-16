@@ -149,6 +149,11 @@ pub trait Decoder: Send + 'static {
     fn forward_vec(&self, tokens: &[u32], cache: &mut Self::Cache, all_logits: bool) -> Vec<f32> {
         self.forward(tokens, cache, all_logits).into_data().try_to_vec::<f32>().expect("logits")
     }
+    /// Greedy next token without moving the logits to the host, for decoders that can do it (the model then ran the tokens: `Some`);
+    /// `None` = not supported and nothing was run.
+    fn forward_argmax(&self, _tokens: &[u32], _cache: &mut Self::Cache) -> Option<u32> {
+        None
+    }
     fn max_context(&self) -> usize;
     fn bos(&self) -> u32;
     fn kernel_name(&self) -> &'static str;
@@ -360,11 +365,18 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job, prev: Option<Ses
         keep(&mut cache, &seq, &mut cps);
     }
     let done = seq.len();
-    let logits = model.forward_vec(&job.prompt[done..], &mut cache, false);
+    let greedy = job.params.temperature <= 0.0;
+    let first = if greedy { model.forward_argmax(&job.prompt[done..], &mut cache) } else { None };
+    let mut next = match first {
+        Some(t) => t,
+        None => {
+            let logits = model.forward_vec(&job.prompt[done..], &mut cache, false);
+            sampler.sample(&logits)
+        }
+    };
     seq.extend_from_slice(&job.prompt[done..]);
     keep(&mut cache, &seq, &mut cps);
     let prefill_s = t0.elapsed().as_secs_f64();
-    let mut next = sampler.sample(&logits);
     let mut dec = StreamDecoder::new();
     let mut text = String::new();
     let mut sent = 0usize; // bytes of `text` already sent
@@ -410,9 +422,12 @@ fn run_job<D: Decoder>(model: &D, codec: &TextCodec, job: &Job, prev: Option<Ses
         if n >= job.max_tokens {
             break;
         }
-        let l = model.forward_vec(&[next], &mut cache, false);
+        let g = if greedy { model.forward_argmax(&[next], &mut cache) } else { None };
         seq.push(next);
-        next = sampler.sample(&l);
+        next = match g {
+            Some(t) => t,
+            None => sampler.sample(&model.forward_vec(&[next], &mut cache, false)),
+        };
     }
     if text.len() > sent {
         let _ = job.tx.send(Gen::Text(text[sent..].to_string()));

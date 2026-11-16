@@ -5,7 +5,7 @@
 use crate::{Config, Layer, Model};
 use anyhow::{anyhow, Result};
 use lb_gguf::{GgmlType, QuantMat};
-use lb_q4_gpu::{Gpu, GpuNativeExperts, GpuQ5KNative, GpuQ6KNative, GpuQ8Mat};
+use lb_q4_gpu::{Gpu, GpuNativeExperts, GpuQ5KNative, GpuQ6KNative, GpuQ8Mat, GpuQ8Native};
 
 type Handle = lb_q4_gpu::cubecl_server::Handle;
 
@@ -76,6 +76,8 @@ pub struct DevLayer {
     sh_gate: DMat,
     sh_up: DMat,
     sh_down: DMat,
+    /// All three shared matrices are Q8_0 (Qwen3.6, Tiel-Coder): gate+up+SiLU and down-into-combine as two launches.
+    sh_fused: Option<(GpuQ8Native, GpuQ8Native, GpuQ8Native)>,
 }
 
 /// `LB_QW_SKIP=experts,shared,core,dense,route` skips those parts of every layer (timing ablation only: the results are wrong).
@@ -149,6 +151,11 @@ impl DevModel {
             sh_gate: DMat::new(gpu, &l.sh_gate.0)?,
             sh_up: DMat::new(gpu, &l.sh_up.0)?,
             sh_down: DMat::new(gpu, &l.sh_down.0)?,
+            sh_fused: if gpu.use_plane && gpu.plane_size.1 == 32 && [l.sh_gate.0.ty, l.sh_up.0.ty, l.sh_down.0.ty].iter().all(|t| *t == GgmlType::Q8_0) && std::env::var("LB_QW_SHF").is_ok() {
+                Some((GpuQ8Native::upload(gpu, l.sh_gate.0).map_err(|e| anyhow!(e))?, GpuQ8Native::upload(gpu, l.sh_up.0).map_err(|e| anyhow!(e))?, GpuQ8Native::upload(gpu, l.sh_down.0).map_err(|e| anyhow!(e))?))
+            } else {
+                None
+            },
         })
     }
 
@@ -257,16 +264,22 @@ impl DevModel {
         let (x1, h2, h2p) = gpu.qw_add_rms(x, &y, &l.post_norm, c.n_embd, c.eps);
         let logits = gpu.qw_f32_matvec(&l.router_sg, &h2, c.n_expert + 1, c.n_embd);
         let (routes, weights) = gpu.qw_route(&logits, c.n_expert, c.n_used);
+        let h2p2 = h2p.clone();
         let down = if skip("experts") { self.zeros.clone() } else { l.experts.launch_permuted(gpu, h2p, &routes, c.n_used) };
-        let shout = if skip("shared") {
-            self.zeros.clone()
+        let out = if let (Some((g, u, dn)), false) = (&l.sh_fused, skip("shared")) {
+            let hs = GpuQ8Native::gate_up_silu(gpu, g, u, &h2p2);
+            dn.combine_shared(gpu, &x1, &down, &weights, &logits, c.n_expert + 1, c.n_expert, &hs, c.n_used)
         } else {
-            let g = l.sh_gate.launch(gpu, &h2);
-            let u = l.sh_up.launch(gpu, &h2);
-            let sh = gpu.qw_silu_mul(&g, &u, c.ff_shexp);
-            l.sh_down.launch(gpu, &sh)
+            let shout = if skip("shared") {
+                self.zeros.clone()
+            } else {
+                let g = l.sh_gate.launch(gpu, &h2);
+                let u = l.sh_up.launch(gpu, &h2);
+                let sh = gpu.qw_silu_mul(&g, &u, c.ff_shexp);
+                l.sh_down.launch(gpu, &sh)
+            };
+            gpu.qw_moe_combine(&x1, &down, &weights, &shout, &logits, c.n_expert + 1, c.n_expert, c.n_embd, c.n_used)
         };
-        let out = gpu.qw_moe_combine(&x1, &down, &weights, &shout, &logits, c.n_expert + 1, c.n_expert, c.n_embd, c.n_used);
         (x1, out)
     }
 }

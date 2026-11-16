@@ -27,7 +27,7 @@ struct Head {
 enum GraphState {
     None,
     Prepared,
-    Ready { graph: CubeGraph, out: Handle, _held: Vec<Handle> },
+    Ready { graph: CubeGraph, out: Handle, aux: Option<Handle>, _held: Vec<Handle> },
     Failed,
 }
 
@@ -38,6 +38,18 @@ struct Stage {
     dev: DevModel,
     first: usize,
     head: Option<Head>,
+}
+
+enum Out {
+    Logits,
+    Argmax,
+    Nothing,
+}
+
+enum Got {
+    Logits(Vec<f32>),
+    Token(u32),
+    Nothing,
 }
 
 pub struct Pipeline<'m, 'a> {
@@ -88,7 +100,7 @@ impl<'m, 'a> Pipeline<'m, 'a> {
     }
 
     /// The launches of stage `si` for one token: its layers from `x_in`, then (last stage) the final norm and head.
-    fn build(&self, si: usize, flush: bool) -> Handle {
+    fn build(&self, si: usize, flush: bool) -> (Handle, Option<Handle>) {
         let c = &self.model.cfg;
         let s = &self.stages[si];
         let mut cur = s.x_in.clone();
@@ -101,17 +113,19 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         }
         if let Some(h) = &s.head {
             let nrm = s.gpu.qw_rms(&cur, &h.norm, 1, c.n_embd, c.eps).0;
-            return match &h.out {
+            let logits = match &h.out {
                 HeadMat::Q6(m) => m.launch(&s.gpu, &nrm, 1),
                 HeadMat::Q8(m) => m.launch(&s.gpu, &nrm, 1),
             };
+            let am = s.gpu.qw_argmax(&logits, c.vocab);
+            return (logits, Some(am));
         }
-        cur
+        (cur, None)
     }
 
     /// Run stage `si` on `xh` at `pos`; returns the handle holding its output (activation, or logits for the last stage).
     /// With `LB_QW_GRAPH` (default) the stage is recorded as one CUDA graph on its second token and replayed afterwards.
-    fn run_stage(&self, si: usize, xh: &[f32], pos: usize) -> Result<Handle> {
+    fn run_stage(&self, si: usize, xh: &[f32], pos: usize) -> Result<(Handle, Option<Handle>)> {
         let s = &self.stages[si];
         s.gpu.write_f32(&s.x_in, xh);
         s.dev.set_pos(&s.gpu, pos);
@@ -132,12 +146,12 @@ impl<'m, 'a> Pipeline<'m, 'a> {
                     eprintln!("lb-qwen35: start_capture refused ({e:?})");
                     *gs = GraphState::Failed;
                 } else {
-                    let out = self.build(si, false);
+                    let (out, aux) = self.build(si, false);
                     match s.gpu.client.stop_capture() {
                         Ok(graph) => {
                             let held = s.gpu.take_in_flight();
                             eprintln!("lb-qwen35: stage {si} recorded as a CUDA graph");
-                            *gs = GraphState::Ready { graph, out, _held: held };
+                            *gs = GraphState::Ready { graph, out, aux, _held: held };
                         }
                         Err(e) => {
                             eprintln!("lb-qwen35: stop_capture refused ({e:?})");
@@ -149,11 +163,11 @@ impl<'m, 'a> Pipeline<'m, 'a> {
                     }
                 }
             }
-            if let GraphState::Ready { graph, out, .. } = &*gs {
+            if let GraphState::Ready { graph, out, aux, .. } = &*gs {
                 // SAFETY: every handle the recording used is held by the stage or by `held`; replayed only on the stream it was
                 // recorded on (this thread's), and this token's inputs (x_in, position) were written on that stream above.
                 unsafe { graph.replay() }.map_err(|e| anyhow!("graph replay: {e:?}"))?;
-                return Ok(out.clone());
+                return Ok((out.clone(), aux.clone()));
             }
         }
         drop(gs);
@@ -162,22 +176,41 @@ impl<'m, 'a> Pipeline<'m, 'a> {
 
     /// One token at `pos`. Returns the logits when `want_logits`.
     pub fn step(&self, tok: u32, pos: usize, want_logits: bool) -> Result<Option<Vec<f32>>> {
+        self.step_ex(tok, pos, if want_logits { Out::Logits } else { Out::Nothing }).map(|o| match o {
+            Got::Logits(v) => Some(v),
+            _ => None,
+        })
+    }
+
+    /// One token at `pos`, returning the greedy next token (argmax on the device: 4 bytes come back instead of the logits).
+    pub fn step_argmax(&self, tok: u32, pos: usize) -> Result<u32> {
+        match self.step_ex(tok, pos, Out::Argmax)? {
+            Got::Token(t) => Ok(t),
+            _ => unreachable!(),
+        }
+    }
+
+    fn step_ex(&self, tok: u32, pos: usize, want: Out) -> Result<Got> {
         let c = &self.model.cfg;
         let mut xh = vec![0f32; c.n_embd];
         self.model.tok_embd.dequant_row(tok as usize, &mut xh);
         let nst = self.stages.len();
         for si in 0..nst {
             let t0 = std::time::Instant::now();
-            let out = self.run_stage(si, &xh, pos)?;
+            let (out, aux) = self.run_stage(si, &xh, pos)?;
             let s = &self.stages[si];
             if self.timing {
                 s.gpu.flush_queue();
                 eprintln!("stage {si} issue {:.2} ms", t0.elapsed().as_secs_f64() * 1e3);
             }
             if si + 1 == nst {
+                if let (Out::Argmax, Some(am)) = (&want, aux) {
+                    let r = s.gpu.read_all(vec![(am, 1)]).map_err(|e| anyhow!(e))?.remove(0);
+                    return Ok(Got::Token(r[0].to_bits()));
+                }
                 let n = if s.head.is_some() { c.vocab } else { c.n_embd };
                 let r = s.gpu.read_all(vec![(out, n)]).map_err(|e| anyhow!(e))?.remove(0);
-                return Ok(want_logits.then_some(r));
+                return Ok(if matches!(want, Out::Logits) { Got::Logits(r) } else { Got::Nothing });
             }
             xh = s.gpu.read_all(vec![(out, c.n_embd)]).map_err(|e| anyhow!(e))?.remove(0);
         }

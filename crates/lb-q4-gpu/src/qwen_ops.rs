@@ -23,7 +23,7 @@ fn perm16_idx(i: usize) -> usize {
 }
 
 #[cube]
-fn sigmoid_f(x: f32) -> f32 {
+pub(crate) fn sigmoid_f(x: f32) -> f32 {
     1.0f32 / (1.0f32 + Exp::exp(-x))
 }
 
@@ -583,6 +583,44 @@ fn qw_attn_decode_wide_kernel(
     out[h * hd + u] = (o0 + o1 + o2 + o3) * sigmoid_f(gate[h * hd + u]);
 }
 
+/// Index of the largest of `n` values (ties: the lowest index), one cube of 256 units; the index is written as the bits of a u32 in `out[0]`.
+#[cube(launch)]
+fn qw_argmax_kernel(x: &[f32], out: &mut [f32], #[comptime] n: usize) {
+    let t = UNIT_POS as usize;
+    let mut sv = Shared::<[f32]>::new_slice(256usize);
+    let mut si = Shared::<[u32]>::new_slice(256usize);
+    let mut bv = x[0usize] * 0.0f32 - 3.0e38f32;
+    let mut bi = 0u32;
+    let mut i = t;
+    while i < n {
+        let v = x[i];
+        if v > bv {
+            bv = v;
+            bi = i as u32;
+        }
+        i += 256usize;
+    }
+    sv[t] = bv;
+    si[t] = bi;
+    sync_cube();
+    let mut st = 128usize;
+    while st > 0usize {
+        if t < st {
+            let ov = sv[t + st];
+            let oi = si[t + st];
+            if ov > sv[t] || (ov == sv[t] && oi < si[t]) {
+                sv[t] = ov;
+                si[t] = oi;
+            }
+        }
+        sync_cube();
+        st = st / 2usize;
+    }
+    if t == 0usize {
+        out[0usize] = f32::reinterpret(si[0usize]);
+    }
+}
+
 /// Softmax over `ne` (<= 512) router logits, top `k` by probability (ties: lowest index), weights renormalised; writes `[expert, 0]`
 /// pairs. One cube of 256 units (`ne` <= 256): max and sum reductions, then every expert counts how many outrank it.
 #[cube(launch)]
@@ -813,6 +851,15 @@ impl Gpu {
         let out = self.scratch(n * 4);
         unsafe {
             qw_moe_combine_kernel::launch(&self.client, self.qw_cubes(n), CubeDim::new_1d(self.cube_dim as u32), BufferArg::from_raw_parts(x.clone(), n), BufferArg::from_raw_parts(down.clone(), k * n), BufferArg::from_raw_parts(weights.clone(), k), BufferArg::from_raw_parts(shared.clone(), n), BufferArg::from_raw_parts(sgate.clone(), sg_len), BufferArg::from_raw_parts(out.clone(), n), n, k, sg_off);
+        }
+        out
+    }
+
+    /// Argmax index of `n` f32 on the device, as a 1-element f32 buffer holding the u32 bits.
+    pub fn qw_argmax(&self, x: &Handle, n: usize) -> Handle {
+        let out = self.scratch(4);
+        unsafe {
+            qw_argmax_kernel::launch(&self.client, CubeCount::Static(1, 1, 1), CubeDim::new_1d(256), BufferArg::from_raw_parts(x.clone(), n), BufferArg::from_raw_parts(out.clone(), 1), n);
         }
         out
     }

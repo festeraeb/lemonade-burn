@@ -18,6 +18,7 @@
 //! kernels in `lib.rs`.
 
 use crate::store::Gpu;
+use crate::qwen_ops::sigmoid_f;
 use crate::{cube_count, f16_to_f32, lane_sum, q6_row_partial, V4F, V4U};
 use cubecl::prelude::*;
 use lb_gguf::{GgmlType, QuantMat};
@@ -422,7 +423,7 @@ fn q5n_rows2(w: &[V4U], w2: &[V4U], x: &[V4F], blk0: usize, xrow4: usize, bpr: u
 
 /// Q5_K native matvec, 4 rows a plane, activations shared across the rows; needs plane ops and `rows % 4 == 0`.
 #[cube(launch)]
-fn q5_k_native_rows4_kernel(w: &[V4U], x: &[V4F], dims: &[u32], out: &mut [f32]) {
+fn q5_k_native_rows4_kernel(w: &[V4U], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] rr: usize) {
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
     let bpr = cols / 256usize;
@@ -430,27 +431,24 @@ fn q5_k_native_rows4_kernel(w: &[V4U], x: &[V4F], dims: &[u32], out: &mut [f32])
     let plane_id = (UNIT_POS / PLANE_DIM) as usize;
     let ppc = CUBE_DIM_X as usize / 32usize;
     let step = CUBE_COUNT as usize * ppc;
-    let groups = out.len() / 4usize;
+    let groups = out.len() / rr;
     let mut g = CUBE_POS as usize * ppc + plane_id;
     while g < groups {
-        let o0 = g * 4usize;
+        let o0 = g * rr;
         let t = o0 / rows;
         let r0 = o0 % rows;
-        let mut acc = Array::<f32>::new(4usize);
+        let mut acc = Array::<f32>::new(rr);
         #[unroll]
-        for i in 0..4usize {
+        for i in 0..rr {
             acc[i] = 0.0f32;
         }
-        q5n_rows(w, x, r0 * bpr, t * cols / 4usize, bpr, lane, 32usize, &mut acc, 4usize);
-        let s0 = plane_sum(acc[0usize]);
-        let s1 = plane_sum(acc[1usize]);
-        let s2 = plane_sum(acc[2usize]);
-        let s3 = plane_sum(acc[3usize]);
-        if lane == 0usize {
-            out[o0] = s0;
-            out[o0 + 1usize] = s1;
-            out[o0 + 2usize] = s2;
-            out[o0 + 3usize] = s3;
+        q5n_rows(w, x, r0 * bpr, t * cols / 4usize, bpr, lane, 32usize, &mut acc, rr);
+        #[unroll]
+        for i in 0..rr {
+            let sv = plane_sum(acc[i]);
+            if lane == 0usize {
+                out[o0 + i] = sv;
+            }
         }
         g += step;
     }
@@ -532,16 +530,18 @@ impl GpuQ5KNative {
     pub fn launch_permuted(&self, gpu: &Gpu, xp: &Handle, m: usize) -> Handle {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
-        if gpu.use_plane && gpu.plane_size.1 == 32 && self.rows % 4 == 0 && std::env::var("LB_QW_ROWS1").is_err() {
+        let rr: usize = std::env::var("LB_QW_R").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        if gpu.use_plane && gpu.plane_size.1 == 32 && self.rows % rr == 0 && std::env::var("LB_QW_ROWS1").is_err() {
             unsafe {
                 q5_k_native_rows4_kernel::launch(
                     &gpu.client,
-                    cube_count(n_out / 4, gpu.per_cube()),
+                    cube_count(n_out / rr, gpu.per_cube()),
                     CubeDim::new_1d(gpu.cube_dim as u32),
                     BufferArg::from_raw_parts(self.w.clone(), self.n_words / 4),
                     BufferArg::from_raw_parts(xp.clone(), m * self.cols / 4),
                     BufferArg::from_raw_parts(self.dims.clone(), 2),
                     BufferArg::from_raw_parts(out.clone(), n_out),
+                    rr,
                 );
             }
             return out;
@@ -898,7 +898,7 @@ fn q6n_rows(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], blk0: usize, xrow4: u
 
 /// Q6_K native matvec, 4 rows a plane, activations shared across the rows; needs plane ops and `rows % 4 == 0`.
 #[cube(launch)]
-fn q6_k_native_rows4_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32]) {
+fn q6_k_native_rows4_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] rr: usize) {
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
     let bpr = cols / 256usize;
@@ -906,27 +906,24 @@ fn q6_k_native_rows4_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], dims:
     let plane_id = (UNIT_POS / PLANE_DIM) as usize;
     let ppc = CUBE_DIM_X as usize / 32usize;
     let step = CUBE_COUNT as usize * ppc;
-    let groups = out.len() / 4usize;
+    let groups = out.len() / rr;
     let mut g = CUBE_POS as usize * ppc + plane_id;
     while g < groups {
-        let o0 = g * 4usize;
+        let o0 = g * rr;
         let t = o0 / rows;
         let r0 = o0 % rows;
-        let mut acc = Array::<f32>::new(4usize);
+        let mut acc = Array::<f32>::new(rr);
         #[unroll]
-        for i in 0..4usize {
+        for i in 0..rr {
             acc[i] = 0.0f32;
         }
-        q6n_rows(qq, sc, dd, x, r0 * bpr, t * cols / 4usize, bpr, lane, 32usize, &mut acc, 4usize);
-        let s0 = plane_sum(acc[0usize]);
-        let s1 = plane_sum(acc[1usize]);
-        let s2 = plane_sum(acc[2usize]);
-        let s3 = plane_sum(acc[3usize]);
-        if lane == 0usize {
-            out[o0] = s0;
-            out[o0 + 1usize] = s1;
-            out[o0 + 2usize] = s2;
-            out[o0 + 3usize] = s3;
+        q6n_rows(qq, sc, dd, x, r0 * bpr, t * cols / 4usize, bpr, lane, 32usize, &mut acc, rr);
+        #[unroll]
+        for i in 0..rr {
+            let sv = plane_sum(acc[i]);
+            if lane == 0usize {
+                out[o0 + i] = sv;
+            }
         }
         g += step;
     }
@@ -1063,11 +1060,12 @@ impl GpuQ6KNative {
     pub fn launch_permuted(&self, gpu: &Gpu, xp: &Handle, m: usize) -> Handle {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
-        if gpu.use_plane && gpu.plane_size.1 == 32 && self.rows % 4 == 0 && std::env::var("LB_QW_ROWS1").is_err() {
+        let rr: usize = std::env::var("LB_QW_R").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        if gpu.use_plane && gpu.plane_size.1 == 32 && self.rows % rr == 0 && std::env::var("LB_QW_ROWS1").is_err() {
             unsafe {
                 q6_k_native_rows4_kernel::launch(
                     &gpu.client,
-                    cube_count(n_out / 4, gpu.per_cube()),
+                    cube_count(n_out / rr, gpu.per_cube()),
                     CubeDim::new_1d(gpu.cube_dim as u32),
                     BufferArg::from_raw_parts(self.qq.clone(), self.n.0 / 4),
                     BufferArg::from_raw_parts(self.sc.clone(), self.n.1 / 4),
@@ -1075,6 +1073,7 @@ impl GpuQ6KNative {
                     BufferArg::from_raw_parts(xp.clone(), m * self.cols / 4),
                     BufferArg::from_raw_parts(self.dims.clone(), 2),
                     BufferArg::from_raw_parts(out.clone(), n_out),
+                    rr,
                 );
             }
             return out;
@@ -1828,6 +1827,111 @@ impl GpuNativeExperts {
                     gpu.use_plane,
                 ),
             }
+        }
+        out
+    }
+}
+
+// ---- the shared expert (Q8_0 matrices) fused into two launches: gate+up+SiLU, and down folded into the MoE combine.
+
+/// `h[r] = silu(gate_r . x) * (up_r . x)` over `rows` rows of Q8_0 (file density), plane a row, written in the 16-value-permuted order.
+#[cube(launch)]
+fn q8n_gate_up_silu_kernel(gq: &[V4U], gd: &[u32], uq: &[V4U], ud: &[u32], x: &[V4F], dims: &[u32], h: &mut [f32]) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut r = CUBE_POS as usize * ppc + plane_id;
+    while r < rows {
+        let pg = q8n_partial(gq, gd, x, r * bpr, 0usize, bpr, lane, 32usize);
+        let pu = q8n_partial(uq, ud, x, r * bpr, 0usize, bpr, lane, 32usize);
+        let g = plane_sum(pg);
+        let u = plane_sum(pu);
+        if lane == 0usize {
+            let a16 = r / 16usize;
+            let rem = r % 16usize;
+            h[a16 * 16usize + (rem % 4usize) * 4usize + rem / 4usize] = g / (1.0f32 + Exp::exp(-g)) * u;
+        }
+        r += step;
+    }
+    let _ = &mut sm;
+}
+
+/// `out = x + sum_r w_r down_r + sigmoid(sgate) * (Wd . hs)`: the MoE combine with the shared expert's Q8_0 down matrix folded in
+/// (`hs` = the shared hidden in permuted order, `cols` = its width), a plane an output.
+#[cube(launch)]
+fn q8n_combine_kernel(x: &[f32], down: &[f32], weights: &[f32], sgate: &[f32], dq: &[V4U], dd: &[u32], hs: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] kslots: usize, #[comptime] sg_off: usize) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let step = CUBE_COUNT as usize * ppc;
+    let mut i = CUBE_POS as usize * ppc + plane_id;
+    while i < rows {
+        let p = q8n_partial(dq, dd, hs, i * bpr, 0usize, bpr, lane, 32usize);
+        let sh = plane_sum(p);
+        if lane == 0usize {
+            let mut acc = 0.0f32;
+            let mut r = 0usize;
+            while r < kslots {
+                acc += weights[r] * down[r * rows + i];
+                r += 1usize;
+            }
+            acc += sigmoid_f(sgate[sg_off]) * sh;
+            out[i] = x[i] + acc;
+        }
+        i += step;
+    }
+}
+
+impl GpuQ8Native {
+    /// Shared-expert hidden: `silu(gate x) * (up x)` in permuted order, `x` permuted. Needs plane ops and a 32-lane plane.
+    pub fn gate_up_silu(gpu: &Gpu, gate: &GpuQ8Native, up: &GpuQ8Native, xp: &Handle) -> Handle {
+        let h = gpu.scratch(gate.rows * 4);
+        unsafe {
+            q8n_gate_up_silu_kernel::launch(
+                &gpu.client,
+                cube_count(gate.rows, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(gate.qs.clone(), gate.n.0 / 4),
+                BufferArg::from_raw_parts(gate.dd.clone(), gate.n.1),
+                BufferArg::from_raw_parts(up.qs.clone(), up.n.0 / 4),
+                BufferArg::from_raw_parts(up.dd.clone(), up.n.1),
+                BufferArg::from_raw_parts(xp.clone(), gate.cols / 4),
+                BufferArg::from_raw_parts(gate.dims.clone(), 2),
+                BufferArg::from_raw_parts(h.clone(), gate.rows),
+            );
+        }
+        h
+    }
+
+    /// `x + sum_r w_r down_r + sigmoid(sgate[sg_off]) * (self . hs)`; `self` is the shared down matrix (`rows` = n_embd).
+    #[allow(clippy::too_many_arguments)]
+    pub fn combine_shared(&self, gpu: &Gpu, x: &Handle, down: &Handle, weights: &Handle, sgate: &Handle, sg_len: usize, sg_off: usize, hs: &Handle, k: usize) -> Handle {
+        let out = gpu.scratch(self.rows * 4);
+        unsafe {
+            q8n_combine_kernel::launch(
+                &gpu.client,
+                cube_count(self.rows, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(x.clone(), self.rows),
+                BufferArg::from_raw_parts(down.clone(), k * self.rows),
+                BufferArg::from_raw_parts(weights.clone(), k),
+                BufferArg::from_raw_parts(sgate.clone(), sg_len),
+                BufferArg::from_raw_parts(self.qs.clone(), self.n.0 / 4),
+                BufferArg::from_raw_parts(self.dd.clone(), self.n.1),
+                BufferArg::from_raw_parts(hs.clone(), self.cols / 4),
+                BufferArg::from_raw_parts(self.dims.clone(), 2),
+                BufferArg::from_raw_parts(out.clone(), self.rows),
+                k,
+                sg_off,
+            );
         }
         out
     }
