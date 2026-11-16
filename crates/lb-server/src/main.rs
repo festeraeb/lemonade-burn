@@ -736,6 +736,10 @@ fn main() -> Result<()> {
         {
             // the cards are opened and the weights uploaded on the model thread itself: CUDA graphs are recorded on, and replayed from,
             // one OS thread's stream (cubecl gives every thread its own), so the whole pipeline lives on that thread
+            // chat history re-renders the previous assistant turn without its think block, so the reusable prefix ends a few tokens before the previous prompt's end
+            if std::env::var("LB_PROMPT_CACHE_TAIL").is_err() {
+                std::env::set_var("LB_PROMPT_CACHE_TAIL", "8");
+            }
             let (ltx, lrx) = std_mpsc::channel();
             let (path, ctx_arg) = (args.model.clone(), args.ctx);
             std::thread::Builder::new().name("lb-model".into()).spawn(move || match qwen::load(&path, ctx_arg) {

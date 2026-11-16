@@ -33,6 +33,10 @@ pub struct QSnap {
 }
 
 /// Prompts of at least this many new tokens go through the batched prefill (`LB_QW_PREFILL_MIN`, default 8; 0 = never).
+fn trace() -> bool {
+    std::env::var("LB_QW_TRACE").is_ok()
+}
+
 fn prefill_min() -> usize {
     std::env::var("LB_QW_PREFILL_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
 }
@@ -67,7 +71,12 @@ impl Decoder for QwenDev {
     type Cache = QCache;
     type Checkpoint = QSnap;
     fn checkpoint(&self, cache: &mut QCache) -> Option<QSnap> {
-        match self.pipe.snapshot(cache.len) {
+        let t0 = std::time::Instant::now();
+        let r = self.pipe.snapshot(cache.len);
+        if trace() {
+            eprintln!("qwen: checkpoint at {} tokens took {:.0} ms", cache.len, t0.elapsed().as_secs_f64() * 1e3);
+        }
+        match r {
             Ok(state) => Some(QSnap { len: cache.len, state }),
             Err(e) => {
                 eprintln!("lb-server: qwen checkpoint failed ({e}); this turn will not be reusable");
@@ -76,8 +85,12 @@ impl Decoder for QwenDev {
         }
     }
     fn rewind(&self, cache: &mut QCache, cp: &QSnap) -> bool {
+        let t0 = std::time::Instant::now();
         self.pipe.restore(&cp.state);
         cache.len = cp.len;
+        if trace() {
+            eprintln!("qwen: rewind to {} tokens took {:.0} ms", cp.len, t0.elapsed().as_secs_f64() * 1e3);
+        }
         true
     }
     fn new_cache(&self) -> QCache {
@@ -95,7 +108,11 @@ impl Decoder for QwenDev {
         assert!(cache.len + tokens.len() <= self.cap, "sequence exceeds the KV capacity {}", self.cap);
         let pm = prefill_min();
         if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= 4096 {
+            let t0 = std::time::Instant::now();
             let l = self.pipe.prefill(tokens, cache.len, 0).expect("device prefill");
+            if trace() {
+                eprintln!("qwen: prefill of {} tokens at {} took {:.0} ms", tokens.len(), cache.len, t0.elapsed().as_secs_f64() * 1e3);
+            }
             cache.len += tokens.len();
             return l;
         }
@@ -113,7 +130,11 @@ impl Decoder for QwenDev {
         assert!(cache.len + tokens.len() <= self.cap, "sequence exceeds the KV capacity {}", self.cap);
         let pm = prefill_min();
         if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= 4096 {
+            let t0 = std::time::Instant::now();
             let l = self.pipe.prefill(tokens, cache.len, 0).expect("device prefill");
+            if trace() {
+                eprintln!("qwen: prefill of {} tokens at {} took {:.0} ms", tokens.len(), cache.len, t0.elapsed().as_secs_f64() * 1e3);
+            }
             cache.len += tokens.len();
             return Some(l.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32);
         }
