@@ -5,16 +5,15 @@
 use crate::{Config, Layer, Model};
 use anyhow::{anyhow, Result};
 use lb_gguf::{GgmlType, QuantMat};
-use lb_q4_gpu::{Gpu, GpuNativeExperts, GpuQ5KNative, GpuQ6KNative, GpuQ8Native};
-use std::sync::Arc;
+use lb_q4_gpu::{Gpu, GpuNativeExperts, GpuQ5KNative, GpuQ6KNative, GpuQ8Mat};
 
 type Handle = lb_q4_gpu::cubecl_server::Handle;
 
 pub enum DMat {
     Q5(GpuQ5KNative),
     Q6(GpuQ6KNative),
-    /// One device copy of the Q8_0 matrix serves decode (matvec) and prefill (GEMM); `sh_fused` shares it too.
-    Q8(Arc<GpuQ8Native>),
+    /// One device copy of the Q8_0 matrix (decode layout) serves decode (rows matvec) and prefill (`GpuQ8Mat::gemm`).
+    Q8(GpuQ8Mat),
 }
 
 impl DMat {
@@ -22,7 +21,7 @@ impl DMat {
         let r = match q.ty {
             GgmlType::Q5K => GpuQ5KNative::upload(gpu, *q).map(DMat::Q5),
             GgmlType::Q6K => GpuQ6KNative::upload(gpu, *q).map(DMat::Q6),
-            GgmlType::Q8_0 => GpuQ8Native::upload(gpu, *q).map(|b| DMat::Q8(Arc::new(b))),
+            GgmlType::Q8_0 => GpuQ8Mat::upload(gpu, *q).map(DMat::Q8),
             t => return Err(anyhow!("no device kernel for {}", t.name())),
         };
         r.map_err(|e| anyhow!(e))
@@ -47,7 +46,7 @@ impl DMat {
         match self {
             DMat::Q5(m) => m.launch_permuted(gpu, xp, 1),
             DMat::Q6(m) => m.launch_permuted(gpu, xp, 1),
-            DMat::Q8(m) => m.launch_permuted(gpu, xp, 1),
+            DMat::Q8(m) => m.launch(gpu, x, 1),
         }
     }
 }
@@ -86,19 +85,12 @@ pub struct DevLayer {
     sh_gate: DMat,
     sh_up: DMat,
     sh_down: DMat,
-    /// All three shared matrices are Q8_0 (Qwen3.6, Tiel-Coder): gate+up+SiLU and down-into-combine as two launches.
-    sh_fused: Option<(Arc<GpuQ8Native>, Arc<GpuQ8Native>, Arc<GpuQ8Native>)>,
 }
 
 /// `LB_QW_SKIP=experts,shared,core,dense,route` skips those parts of every layer (timing ablation only: the results are wrong).
 fn skip(name: &str) -> bool {
     static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     S.get_or_init(|| std::env::var("LB_QW_SKIP").unwrap_or_default()).split(',').any(|x| x == name)
-}
-
-fn shf_on() -> bool {
-    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("LB_QW_SHF").is_ok())
 }
 
 /// `LB_QW_PTIME=1`: wait for the device after every phase of a prefill layer and add the time to a per-phase table (`ptime_report`).
@@ -198,10 +190,6 @@ impl DevModel {
             attn,
             router_sg: f(&[l.router.as_slice(), l.sh_gate_inp.as_slice()].concat()),
             experts: GpuNativeExperts::upload(gpu, c.n_expert, l.gate_exps, l.up_exps, l.down_exps).map_err(|e| anyhow!(e))?,
-            sh_fused: match (&sh_gate, &sh_up, &sh_down) {
-                (DMat::Q8(g), DMat::Q8(u), DMat::Q8(d)) => Some((g.clone(), u.clone(), d.clone())),
-                _ => None,
-            },
             sh_gate,
             sh_up,
             sh_down,
@@ -322,11 +310,10 @@ impl DevModel {
         let rv: Vec<(u32, u32)> = rbits.chunks_exact(2).map(|p| (p[0].to_bits(), p[1].to_bits())).collect();
         let down = l.experts.gemm(gpu, &h2, m, &rv);
         ph("experts gemm", &down);
-        let (g, u, dn) = l.sh_fused.as_ref().ok_or_else(|| anyhow!("prefill needs Q8_0 shared experts"))?;
-        let gg = g.gemm(gpu, &h2, m);
-        let uu = u.gemm(gpu, &h2, m);
+        let gg = l.sh_gate.gemm(gpu, &h2, m);
+        let uu = l.sh_up.gemm(gpu, &h2, m);
         let sh = gpu.qw_silu_mul(&gg, &uu, m * c.ff_shexp);
-        let shout = dn.gemm(gpu, &sh, m);
+        let shout = l.sh_down.gemm(gpu, &sh, m);
         ph("shared gemm", &shout);
         Ok(gpu.qp_combine_rows(&x1, &down, &weights, &shout, &logits, m, c.n_embd, c.n_used, c.n_expert))
     }
@@ -437,22 +424,16 @@ impl DevModel {
         let (x1, h2, h2p) = gpu.qw_add_rms(x, &y, &l.post_norm, c.n_embd, c.eps);
         let logits = gpu.qw_f32_matvec(&l.router_sg, &h2, c.n_expert + 1, c.n_embd);
         let (routes, weights) = gpu.qw_route(&logits, c.n_expert, c.n_used);
-        let h2p2 = h2p.clone();
         let down = if skip("experts") { self.zeros.clone() } else { l.experts.launch_permuted(gpu, h2p, &routes, c.n_used) };
-        let out = if let (Some((g, u, dn)), false, true) = (&l.sh_fused, skip("shared"), shf_on()) {
-            let hs = GpuQ8Native::gate_up_silu(gpu, g, u, &h2p2);
-            dn.combine_shared(gpu, &x1, &down, &weights, &logits, c.n_expert + 1, c.n_expert, &hs, c.n_used)
+        let shout = if skip("shared") {
+            self.zeros.clone()
         } else {
-            let shout = if skip("shared") {
-                self.zeros.clone()
-            } else {
-                let g = l.sh_gate.launch(gpu, &h2);
-                let u = l.sh_up.launch(gpu, &h2);
-                let sh = gpu.qw_silu_mul(&g, &u, c.ff_shexp);
-                l.sh_down.launch(gpu, &sh)
-            };
-            gpu.qw_moe_combine(&x1, &down, &weights, &shout, &logits, c.n_expert + 1, c.n_expert, c.n_embd, c.n_used)
+            let g = l.sh_gate.launch(gpu, &h2);
+            let u = l.sh_up.launch(gpu, &h2);
+            let sh = gpu.qw_silu_mul(&g, &u, c.ff_shexp);
+            l.sh_down.launch(gpu, &sh)
         };
+        let out = gpu.qw_moe_combine(&x1, &down, &weights, &shout, &logits, c.n_expert + 1, c.n_expert, c.n_embd, c.n_used);
         (x1, out)
     }
 }

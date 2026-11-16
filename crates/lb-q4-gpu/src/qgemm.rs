@@ -16,6 +16,8 @@ const LD: usize = 33;
 pub const QT_Q5K: u32 = 0;
 pub const QT_Q6K: u32 = 1;
 pub const QT_Q8: u32 = 2;
+/// Q8_0 in the decode (`GpuQ8Mat`) layout: quants repacked 4 bytes apart (`repack_q8_0`), f16 scales in pairs. Lets one device copy serve decode and prefill.
+pub const QT_Q8R: u32 = 3;
 
 /// Stage the weight slab (rows `r0..r0+64`, columns `32 kb ..`) as f32 values: unit `u` takes row `u / 4` and columns `8 (u % 4) ..+8`.
 /// `a0..a2` are the matrix's arrays (Q5_K: all-in-one words in `a0`; Q6_K: `ql+qh` words, scales, f16 `d`; Q8_0: quants, f16 `d`);
@@ -82,14 +84,30 @@ fn stage_k(a0: &[u32], a1: &[u32], a2: &[u32], ws: &mut Shared<[f32]>, eb: usize
             let bpr = cols / 32usize;
             let blk = eb + r * bpr + kb;
             let d = f16_to_f32((a1[blk / 2usize] >> (((blk % 2usize) * 16usize) as u32)) & 65535u32);
-            #[unroll]
-            for wi in 0..2usize {
-                let qw = a0[blk * 8usize + 2usize * p + wi];
+            if comptime!(qt == 3u32) {
+                // repacked layout: word `4 g + k` of a block holds bytes `16 g + 4 b + k`, b = 0..3; this unit's columns are `8 p ..+8`
+                let g16 = p / 2usize;
+                let bsh = (16usize * (p % 2usize)) as u32;
                 #[unroll]
-                for i in 0..4u32 {
-                    let by = (qw >> (8u32 * i)) & 255u32;
-                    let sv = (by as f32) - 256.0f32 * ((by >> 7u32) as f32);
-                    ws[rr * LD + 8usize * p + 4usize * wi + i as usize] = d * sv;
+                for k in 0..4usize {
+                    let qw = a0[blk * 8usize + 4usize * g16 + k];
+                    #[unroll]
+                    for hb in 0..2u32 {
+                        let by = (qw >> (bsh + 8u32 * hb)) & 255u32;
+                        let sv = (by as f32) - 256.0f32 * ((by >> 7u32) as f32);
+                        ws[rr * LD + 8usize * p + 4usize * (hb as usize) + k] = d * sv;
+                    }
+                }
+            } else {
+                #[unroll]
+                for wi in 0..2usize {
+                    let qw = a0[blk * 8usize + 2usize * p + wi];
+                    #[unroll]
+                    for i in 0..4u32 {
+                        let by = (qw >> (8u32 * i)) & 255u32;
+                        let sv = (by as f32) - 256.0f32 * ((by >> 7u32) as f32);
+                        ws[rr * LD + 8usize * p + 4usize * wi + i as usize] = d * sv;
+                    }
                 }
             }
         }
@@ -117,7 +135,7 @@ pub fn kq_gemm_kernel(
     let ty = (UNIT_POS / 16u32) as usize;
     let tx = (UNIT_POS % 16u32) as usize;
     let mut bpr = cols / 256usize;
-    if comptime!(qt == 2u32) {
+    if comptime!(qt >= 2u32) {
         bpr = cols / 32usize;
     }
     let mut t0 = 0usize;

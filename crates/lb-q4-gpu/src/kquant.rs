@@ -1953,8 +1953,9 @@ impl GpuQ8Native {
 // ---- prefill GEMMs (see `qgemm.rs`): many token rows against the same file-density weights
 
 use crate::qgemm::{kq_gemm_kernel, kq_gemm_v4_kernel, QT_Q5K, QT_Q6K, QT_Q8};
+pub(crate) use crate::qgemm::QT_Q8R;
 
-fn gemm_launch(gpu: &Gpu, qt: u32, a: [(&Handle, usize); 3], b: Option<[(&Handle, usize); 3]>, x: &Handle, routes: &Handle, n_routes: usize, perm: &Handle, n_perm: usize, tiles: &Handle, n_tiles: usize, dims: &[u32; 3], out: &Handle, n_out: usize, n_x: usize, (grouped, src_tok): (bool, bool), grid_y: usize) {
+pub(crate) fn gemm_launch(gpu: &Gpu, qt: u32, a: [(&Handle, usize); 3], b: Option<[(&Handle, usize); 3]>, x: &Handle, routes: &Handle, n_routes: usize, perm: &Handle, n_perm: usize, tiles: &Handle, n_tiles: usize, dims: &[u32; 3], out: &Handle, n_out: usize, n_x: usize, (grouped, src_tok): (bool, bool), grid_y: usize) {
     let dummy = gpu.const_u32(&[0u32]);
     let gate_up = b.is_some();
     let b = b.unwrap_or([(&dummy, 1), (&dummy, 1), (&dummy, 1)]);

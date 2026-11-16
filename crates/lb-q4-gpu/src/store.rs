@@ -970,6 +970,16 @@ impl GpuQ8Mat {
         out
     }
 
+    /// Prefill GEMM straight on the decode copy (repacked quants): `out[t, r] = W[r] . x[t]` for `m` token rows, `[m, rows]` (no row padding).
+    /// One device copy serves both decode and prefill. The default (V1) GEMM kernel only: `LB_QGEMM_V4` has no repacked-layout staging.
+    pub fn gemm(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+        assert!(std::env::var("LB_QGEMM_V4").is_err(), "LB_QGEMM_V4 does not support the shared Q8_0 layout");
+        let out = gpu.scratch(m * self.rows * 4);
+        let d = gpu.const_u32(&[0u32]);
+        crate::kquant::gemm_launch(gpu, crate::kquant::QT_Q8R, [(&self.qs, self.n_qs), (&self.sc, self.n_sc), (&d, 1)], None, x, &d, 1, &d, 1, &d, 1, &[self.rows as u32, self.cols as u32, m as u32], &out, m * self.rows, m * self.cols, (false, false), m.div_ceil(64));
+        out
+    }
+
     pub fn matvec(&self, gpu: &Gpu, x: &[f32], m: usize) -> Result<Vec<f32>, String> {
         let xh = gpu.upload_f32(x);
         let out = self.launch(gpu, &xh, m);
