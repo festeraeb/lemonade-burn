@@ -5,7 +5,8 @@
 //! flushed to the device thread after every layer (the lesson of `ENGINE_SYNC_COST.md`: CubeCL delivers a batch only when it is full or
 //! flushed, so without it the card idles while the host builds the next launches).
 
-use crate::device::DevModel;
+use crate::device::{DMat, DevModel};
+use crate::Mtp;
 use crate::Model;
 use anyhow::{anyhow, Result};
 use lb_gguf::QuantMat;
@@ -52,8 +53,19 @@ enum Got {
     Nothing,
 }
 
+/// The nextn block on the last stage's card: `eh_proj`, one attention+MoE layer with its own KV cache, the shared head norm.
+struct MtpDev {
+    dev: DevModel,
+    eh: DMat,
+    enorm: Vec<f32>,
+    hnorm: Vec<f32>,
+    shead: Handle,
+    x_in: Handle,
+}
+
 pub struct Pipeline<'m, 'a> {
     model: &'m Model<'a>,
+    mtp: Option<MtpDev>,
     stages: Vec<Stage>,
     flush: u32,
     graph_on: bool,
@@ -64,6 +76,11 @@ impl<'m, 'a> Pipeline<'m, 'a> {
     /// `split[i]` = number of layers on stage `i` (must sum to the layer count); stage `i` opens CUDA device `i` of
     /// `CUDA_VISIBLE_DEVICES`. `cap` = positions of KV cache per attention layer.
     pub fn new(model: &'m Model<'a>, split: &[usize], cap: usize) -> Result<Self> {
+        Self::new_spec(model, split, cap, 0)
+    }
+
+    /// As [`new`](Self::new) with the speculative-verify scratch for chunks of up to `spec_m` tokens (0 = none; needed by [`run_rows`](Self::run_rows)).
+    pub fn new_spec(model: &'m Model<'a>, split: &[usize], cap: usize, spec_m: usize) -> Result<Self> {
         let n = model.cfg.n_layer;
         if split.iter().sum::<usize>() != n {
             return Err(anyhow!("split {split:?} does not cover {n} layers"));
@@ -72,7 +89,7 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         let mut first = 0;
         for (i, &cnt) in split.iter().enumerate() {
             let gpu = Gpu::open_cuda(i).map_err(|e| anyhow!(e))?;
-            let dev = DevModel::upload(&gpu, model, first..first + cnt, cap)?;
+            let dev = DevModel::upload(&gpu, model, first..first + cnt, cap, spec_m)?;
             let head = if i + 1 == split.len() {
                 let out: QuantMat<'_> = model.output;
                 let out = match out.ty {
@@ -90,7 +107,7 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         }
         let flush = std::env::var("LB_QW_FLUSH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         let graph_on = std::env::var("LB_QW_GRAPH").map(|v| v != "0").unwrap_or(true);
-        Ok(Pipeline { model, stages, flush, graph_on, timing: std::env::var("LB_QW_TIMING").is_ok() })
+        Ok(Pipeline { model, mtp: None, stages, flush, graph_on, timing: std::env::var("LB_QW_TIMING").is_ok() })
     }
 
     /// Run three single-token steps (plain, capture, replay) and reset: the CUDA graphs of every stage exist before any prefill runs (a capture started after
@@ -255,6 +272,11 @@ impl<'m, 'a> Pipeline<'m, 'a> {
     /// stage, chunk `c + 1` on stage 0 while chunk `c` is on stage 1, a chunk's hidden rows handed over through the host. Returns the logits of the last
     /// token. State and KV cache afterwards are those of token-by-token steps. Any length up to the KV capacity (the attention kernel tiles its scores). `chunk` 0 picks a size giving each stage about four chunks (64..1024 tokens).
     pub fn prefill(&self, tokens: &[u32], pos0: usize, chunk: usize) -> Result<Vec<f32>> {
+        self.prefill_h(tokens, pos0, chunk, None)
+    }
+
+    /// [`prefill`](Self::prefill) that also appends the last stage's output row (the trunk hidden before the final norm) of every token to `rows`.
+    pub fn prefill_h(&self, tokens: &[u32], pos0: usize, chunk: usize, rows: Option<&std::sync::Mutex<Vec<f32>>>) -> Result<Vec<f32>> {
         use std::sync::mpsc;
         let c = &self.model.cfg;
         let cap = self.stages[0].dev.cap;
@@ -291,6 +313,7 @@ impl<'m, 'a> Pipeline<'m, 'a> {
                 let spans = spans.clone();
                 let flush = self.flush;
                 let ncfg = (c.n_embd, spans.len());
+                let coll = rows;
                 let tok_ptr = Raw(tokens.as_ptr());
                 let tok_len = tokens.len();
                 sc.spawn(move || {
@@ -316,7 +339,7 @@ impl<'m, 'a> Pipeline<'m, 'a> {
                             let mut cur = s.gpu.upload_f32(&xh);
                             s.dev.set_chunk(&s.gpu, pos0 + p, m);
                             for l in 0..s.dev.layers.len() {
-                                cur = s.dev.prefill_layer(&s.gpu, l, &cur, m)?;
+                                cur = s.dev.prefill_layer(&s.gpu, l, &cur, m, false)?;
                                 if flush > 0 {
                                     s.gpu.flush_queue();
                                 }
@@ -325,6 +348,9 @@ impl<'m, 'a> Pipeline<'m, 'a> {
                         };
                         match run() {
                             Ok(v) => {
+                                if let (None, Some(co)) = (&next, coll) {
+                                    co.lock().unwrap().extend_from_slice(&v);
+                                }
                                 if let Some(nx) = &next {
                                     let _ = nx.send(Ok((ci, v)));
                                 } else if ci + 1 == spans.len() {
@@ -353,6 +379,132 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         }
         let row = last_rx.recv().map_err(|e| anyhow!("prefill produced no result: {e}"))??;
         self.head_logits(&row)
+    }
+
+    /// Upload the nextn block (call once, after `new_spec`). Its attention KV cache holds the same `cap` positions as the trunk's.
+    pub fn attach_mtp(&mut self, mtp: &Mtp<'_>) -> Result<()> {
+        let c = &self.model.cfg;
+        let s = self.stages.last().unwrap();
+        let dev = DevModel::upload_layers(&s.gpu, c, &[&mtp.layer], s.dev.cap, 0)?;
+        let eh = DMat::new(&s.gpu, &mtp.eh_proj)?;
+        let x_in = s.gpu.upload_f32(&vec![0.0; 2 * c.n_embd]);
+        self.mtp = Some(MtpDev { dev, eh, enorm: mtp.enorm.clone(), hnorm: mtp.hnorm.clone(), shead: s.gpu.upload_f32(&mtp.shead_norm), x_in });
+        Ok(())
+    }
+
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    fn mtp_cat(&self, hid: &[f32], tok: u32) -> Vec<f32> {
+        let c = &self.model.cfg;
+        let m = self.mtp.as_ref().unwrap();
+        let mut e = vec![0f32; c.n_embd];
+        self.model.tok_embd.dequant_row(tok as usize, &mut e);
+        let mut cat = crate::rms_norm(&e, &m.enorm, c.eps);
+        cat.extend(crate::rms_norm(hid, &m.hnorm, c.eps));
+        cat
+    }
+
+    /// One nextn step: given the trunk hidden `hid` of the position before `tok` and `tok` at head-cache entry `pos`, writes the entry and returns
+    /// the greedy draft (the token after `tok`) and the block's hidden output (the next step's `hid`).
+    pub fn mtp_draft(&self, hid: &[f32], tok: u32, pos: usize) -> Result<(u32, Vec<f32>)> {
+        let c = &self.model.cfg;
+        let m = self.mtp.as_ref().ok_or_else(|| anyhow!("no nextn block"))?;
+        let s = self.stages.last().unwrap();
+        let h = s.head.as_ref().unwrap();
+        s.gpu.write_f32(&m.x_in, &self.mtp_cat(hid, tok));
+        m.dev.set_pos(&s.gpu, pos);
+        let x = m.eh.launch(&s.gpu, &m.x_in);
+        let (_, y) = m.dev.layer_forward(&s.gpu, 0, &x, pos);
+        let nrm = s.gpu.qw_rms(&y, &m.shead, 1, c.n_embd, c.eps).0;
+        let logits = match &h.out {
+            HeadMat::Q6(w) => w.launch(&s.gpu, &nrm, 1),
+            HeadMat::Q8(w) => w.launch(&s.gpu, &nrm, 1),
+        };
+        let am = s.gpu.qw_argmax(&logits, c.vocab);
+        let mut r = s.gpu.read_all(vec![(am, 1), (y, c.n_embd)]).map_err(|e| anyhow!(e))?;
+        let hid = r.pop().unwrap();
+        Ok((r[0][0].to_bits(), hid))
+    }
+
+    /// The head-cache entry `pos` only (no draft): the catch-up after a verify.
+    pub fn mtp_kv(&self, hid: &[f32], tok: u32, pos: usize) {
+        let m = self.mtp.as_ref().unwrap();
+        let s = self.stages.last().unwrap();
+        s.gpu.write_f32(&m.x_in, &self.mtp_cat(hid, tok));
+        m.dev.set_pos(&s.gpu, pos);
+        let x = m.eh.launch(&s.gpu, &m.x_in);
+        m.dev.kv_only(&s.gpu, 0, &x);
+    }
+
+    /// Head-cache entries `j0 .. j0 + toks.len()` in bulk: entry `j0 + i` pairs the trunk hidden row `i` of `hs` (`[n, n_embd]`) with `toks[i]`.
+    pub fn mtp_prefill(&self, hs: &[f32], toks: &[u32], j0: usize) -> Result<()> {
+        let c = &self.model.cfg;
+        let m = self.mtp.as_ref().ok_or_else(|| anyhow!("no nextn block"))?;
+        let s = self.stages.last().unwrap();
+        let chunk = 128usize;
+        let mut off = 0;
+        while off < toks.len() {
+            let mm = chunk.min(toks.len() - off);
+            let mut cat = Vec::with_capacity(mm * 2 * c.n_embd);
+            for i in off..off + mm {
+                cat.extend(self.mtp_cat(&hs[i * c.n_embd..(i + 1) * c.n_embd], toks[i]));
+            }
+            let xin = s.gpu.upload_f32(&cat);
+            let x = m.eh.gemm(&s.gpu, &xin, mm);
+            m.dev.set_chunk(&s.gpu, j0 + off, mm);
+            let y = m.dev.prefill_layer(&s.gpu, 0, &x, mm, false)?;
+            s.gpu.read_all(vec![(y, 1)]).map_err(|e| anyhow!(e))?;
+            off += mm;
+        }
+        Ok(())
+    }
+
+    /// Verify pass: `tokens` at `pos0 ..` through every stage as one batched chunk (the prefill kernels, on this thread so the stream order matches
+    /// the decode graphs'). Checkpoints the recurrent state first and records the delta-net inputs so [`spec_rollback`](Self::spec_rollback) can
+    /// shorten the chunk. Returns the greedy token after each row and the trunk hidden of each row (`[m, n_embd]`).
+    pub fn run_rows(&self, tokens: &[u32], pos0: usize) -> Result<(Vec<u32>, Vec<f32>)> {
+        let c = &self.model.cfg;
+        let m = tokens.len();
+        if pos0 + m > self.stages[0].dev.cap {
+            return Err(anyhow!("verify past the KV capacity"));
+        }
+        let mut xh = vec![0f32; m * c.n_embd];
+        for (i, &t) in tokens.iter().enumerate() {
+            self.model.tok_embd.dequant_row(t as usize, &mut xh[i * c.n_embd..(i + 1) * c.n_embd]);
+        }
+        for s in &self.stages {
+            s.dev.spec_checkpoint(&s.gpu);
+            let mut cur = s.gpu.upload_f32(&xh);
+            s.dev.set_chunk(&s.gpu, pos0, m);
+            for l in 0..s.dev.layers.len() {
+                cur = s.dev.prefill_layer(&s.gpu, l, &cur, m, true)?;
+                s.gpu.flush_queue();
+            }
+            xh = s.gpu.read_all(vec![(cur, m * c.n_embd)]).map_err(|e| anyhow!(e))?.remove(0);
+        }
+        let s = self.stages.last().unwrap();
+        let h = s.head.as_ref().ok_or_else(|| anyhow!("no head"))?;
+        let mut ams = Vec::new();
+        for r in 0..m {
+            let x = s.gpu.upload_f32(&xh[r * c.n_embd..(r + 1) * c.n_embd]);
+            let nrm = s.gpu.qw_rms(&x, &h.norm, 1, c.n_embd, c.eps).0;
+            let logits = match &h.out {
+                HeadMat::Q6(w) => w.launch(&s.gpu, &nrm, 1),
+                HeadMat::Q8(w) => w.launch(&s.gpu, &nrm, 1),
+            };
+            ams.push((s.gpu.qw_argmax(&logits, c.vocab), 1usize));
+        }
+        let g = s.gpu.read_all(ams).map_err(|e| anyhow!(e))?.into_iter().map(|v| v[0].to_bits()).collect();
+        Ok((g, xh))
+    }
+
+    /// After [`run_rows`](Self::run_rows) at `pos0`: leave the recurrent state as after only the first `keep` of its tokens.
+    pub fn spec_rollback(&self, pos0: usize, keep: usize) {
+        for s in &self.stages {
+            s.dev.spec_replay(&s.gpu, pos0, keep);
+        }
     }
 
     /// Host copy of the whole sequence state at `len` tokens.

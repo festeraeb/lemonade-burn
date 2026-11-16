@@ -17,7 +17,7 @@ pub enum DMat {
 }
 
 impl DMat {
-    fn new(gpu: &Gpu, q: &QuantMat<'_>) -> Result<Self> {
+    pub(crate) fn new(gpu: &Gpu, q: &QuantMat<'_>) -> Result<Self> {
         let r = match q.ty {
             GgmlType::Q5K => GpuQ5KNative::upload(gpu, *q).map(DMat::Q5),
             GgmlType::Q6K => GpuQ6KNative::upload(gpu, *q).map(DMat::Q6),
@@ -26,7 +26,7 @@ impl DMat {
         };
         r.map_err(|e| anyhow!(e))
     }
-    fn launch(&self, gpu: &Gpu, x: &Handle) -> Handle {
+    pub(crate) fn launch(&self, gpu: &Gpu, x: &Handle) -> Handle {
         match self {
             DMat::Q5(m) => m.launch(gpu, x, 1),
             DMat::Q6(m) => m.launch(gpu, x, 1),
@@ -34,7 +34,7 @@ impl DMat {
         }
     }
     /// Tiled GEMM over `m` token rows (prefill): `[m, rows]`.
-    fn gemm(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
+    pub(crate) fn gemm(&self, gpu: &Gpu, x: &Handle, m: usize) -> Handle {
         match self {
             DMat::Q5(a) => a.gemm(gpu, x, m),
             DMat::Q6(a) => a.gemm(gpu, x, m),
@@ -123,7 +123,18 @@ pub struct LayerSnap {
     vc: Vec<f32>,
 }
 
+/// Per delta-net layer scratch for speculative verification: the layer's inputs of the last verified chunk (to replay the recurrent update for a
+/// shorter prefix) and the state as it was before the chunk.
+pub struct DnKeep {
+    qkv: Handle,
+    z: Handle,
+    ba: Handle,
+    ck_conv: Handle,
+    ck_s: Handle,
+}
+
 pub struct DevModel {
+    pub spec: Vec<Option<DnKeep>>,
     pp2: Handle,
     pp1: Handle,
     zeros: Handle,
@@ -136,15 +147,34 @@ pub struct DevModel {
 
 impl DevModel {
     /// Upload layers `range` of `m` to `gpu`; attention caches hold `cap` positions.
-    pub fn upload(gpu: &Gpu, m: &Model<'_>, range: std::ops::Range<usize>, cap: usize) -> Result<Self> {
-        let c = m.cfg.clone();
+    pub fn upload(gpu: &Gpu, m: &Model<'_>, range: std::ops::Range<usize>, cap: usize, spec_m: usize) -> Result<Self> {
+        let ls: Vec<&Layer<'_>> = range.map(|il| &m.layers[il]).collect();
+        Self::upload_layers(gpu, &m.cfg, &ls, cap, spec_m)
+    }
+
+    /// As [`upload`](Self::upload) for explicit layers (the nextn layer is not in `Model::layers`). `spec_m` > 0 allocates the speculative-verify
+    /// scratch for chunks of up to that many tokens.
+    pub fn upload_layers(gpu: &Gpu, cfg: &Config, ls: &[&Layer<'_>], cap: usize, spec_m: usize) -> Result<Self> {
+        let c = cfg.clone();
         let mut layers = Vec::new();
-        for il in range {
-            layers.push(Self::upload_layer(gpu, &c, &m.layers[il], cap)?);
+        let mut spec = Vec::new();
+        for l in ls {
+            layers.push(Self::upload_layer(gpu, &c, l, cap)?);
+            spec.push(if spec_m > 0 && l.lin.is_some() {
+                Some(DnKeep {
+                    qkv: gpu.upload_f32(&vec![0.0; spec_m * c.conv_channels()]),
+                    z: gpu.upload_f32(&vec![0.0; spec_m * c.d_inner]),
+                    ba: gpu.upload_f32(&vec![0.0; spec_m * 2 * c.n_v_heads]),
+                    ck_conv: gpu.upload_f32(&vec![0.0; 2 * (c.d_conv - 1) * c.conv_channels()]),
+                    ck_s: gpu.upload_f32(&vec![0.0; c.n_v_heads * c.head_v() * c.head_k]),
+                })
+            } else {
+                None
+            });
         }
         let theta_scale = c.rope_base.powf(-2.0 / c.n_rot as f32);
         let zeros = gpu.upload_f32(&vec![0.0f32; 16384]);
-        Ok(DevModel { pp2: gpu.upload_u32(vec![0, 0]), pp1: gpu.upload_u32(vec![0]), zeros, cfg: c, cap, layers, theta_scale, pos_h: gpu.upload_u32(vec![0]) })
+        Ok(DevModel { spec, pp2: gpu.upload_u32(vec![0, 0]), pp1: gpu.upload_u32(vec![0]), zeros, cfg: c, cap, layers, theta_scale, pos_h: gpu.upload_u32(vec![0]) })
     }
 
     fn upload_layer(gpu: &Gpu, c: &Config, l: &Layer<'_>, cap: usize) -> Result<DevLayer> {
@@ -189,11 +219,33 @@ impl DevModel {
             lin,
             attn,
             router_sg: f(&[l.router.as_slice(), l.sh_gate_inp.as_slice()].concat()),
-            experts: GpuNativeExperts::upload(gpu, c.n_expert, l.gate_exps, l.up_exps, l.down_exps).map_err(|e| anyhow!(e))?,
+            experts: Self::upload_experts(gpu, c, l)?,
             sh_gate,
             sh_up,
             sh_down,
         })
+    }
+
+    /// The routed experts of a layer. A Q8_0 gate/up pair (the nextn layer of the Q5_K_M file) has no device kernel and is requantised to Q6_K first.
+    fn upload_experts(gpu: &Gpu, c: &Config, l: &Layer<'_>) -> Result<GpuNativeExperts> {
+        use rayon::prelude::*;
+        let conv = |q: QuantMat<'_>| -> Vec<u8> {
+            let rb_in = q.ty.row_bytes(q.cols).unwrap();
+            let rb_out = GgmlType::Q6K.row_bytes(q.cols).unwrap();
+            let mut out = vec![0u8; q.rows * rb_out];
+            out.par_chunks_mut(rb_out).enumerate().for_each_init(|| vec![0f32; q.cols], |buf, (r, o)| {
+                q.ty.dequant_row(&q.bytes[r * rb_in..(r + 1) * rb_in], buf);
+                o.copy_from_slice(&lb_gguf::types::quantize_q6_k(buf));
+            });
+            out
+        };
+        if l.gate_exps.ty == GgmlType::Q8_0 && l.up_exps.ty == GgmlType::Q8_0 {
+            let (g, u) = (conv(l.gate_exps), conv(l.up_exps));
+            let gq = QuantMat::new(GgmlType::Q6K, l.gate_exps.rows, l.gate_exps.cols, &g);
+            let uq = QuantMat::new(GgmlType::Q6K, l.up_exps.rows, l.up_exps.cols, &u);
+            return GpuNativeExperts::upload(gpu, c.n_expert, gq, uq, l.down_exps).map_err(|e| anyhow!(e));
+        }
+        GpuNativeExperts::upload(gpu, c.n_expert, l.gate_exps, l.up_exps, l.down_exps).map_err(|e| anyhow!(e))
     }
 
     /// Time the parts of layer `i` (microseconds per call, `reps` calls queued then one sync), for finding what limits a token.
@@ -265,7 +317,7 @@ impl DevModel {
 
     /// One layer for a chunk of `m` tokens (`x` `[m, n_embd]`): tiled GEMMs, batched glue kernels, routed experts grouped by expert on the host (one
     /// read of the routes a layer). Leaves the recurrent state and KV cache as `m` single-token steps would. Returns the layer output `[m, n_embd]`.
-    pub fn prefill_layer(&self, gpu: &Gpu, i: usize, x: &Handle, m: usize) -> Result<Handle> {
+    pub fn prefill_layer(&self, gpu: &Gpu, i: usize, x: &Handle, m: usize, rec: bool) -> Result<Handle> {
         let c = &self.cfg;
         let l = &self.layers[i];
         let t0 = std::cell::Cell::new(std::time::Instant::now());
@@ -283,6 +335,13 @@ impl DevModel {
             let z = d.z.gemm(gpu, &h, m);
             let ba = gpu.qp_f32_rows(&d.ba, &h, m, 2 * c.n_v_heads, c.n_embd);
             ph("dn proj gemm", &ba);
+            if rec {
+                if let Some(k) = &self.spec[i] {
+                    gpu.qw_copy(&qkv, &k.qkv, m * c.conv_channels());
+                    gpu.qw_copy(&z, &k.z, m * c.d_inner);
+                    gpu.qw_copy(&ba, &k.ba, m * 2 * c.n_v_heads);
+                }
+            }
             let core = gpu.qp_delta_net(&qkv, &z, &ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, &self.pp2, m, (c.conv_channels(), c.n_k_heads, c.n_v_heads, c.head_k), c.eps);
             ph("dn core", &core);
             let y = d.out.gemm(gpu, &core, m);
@@ -364,6 +423,44 @@ impl DevModel {
         }
     }
 
+    /// Save every delta-net layer's recurrent state (the point a speculative chunk can be rolled back to).
+    pub fn spec_checkpoint(&self, gpu: &Gpu) {
+        let c = &self.cfg;
+        for (l, k) in self.layers.iter().zip(&self.spec) {
+            if let (Some(d), Some(k)) = (&l.lin, k) {
+                gpu.qw_copy(&d.conv_state, &k.ck_conv, 2 * (c.d_conv - 1) * c.conv_channels());
+                gpu.qw_copy(&d.s, &k.ck_s, c.n_v_heads * c.head_v() * c.head_k);
+            }
+        }
+    }
+
+    /// Roll the recurrent state back to the checkpoint and re-apply the first `keep` tokens of the last verified chunk (from its recorded layer
+    /// inputs), so the state is exactly that after `keep` tokens. The attention KV caches need nothing: positions past `keep` are overwritten
+    /// before they are read.
+    pub fn spec_replay(&self, gpu: &Gpu, p0: usize, keep: usize) {
+        let c = &self.cfg;
+        self.set_chunk(gpu, p0, keep);
+        for (l, k) in self.layers.iter().zip(&self.spec) {
+            if let (Some(d), Some(k)) = (&l.lin, k) {
+                gpu.qw_copy(&k.ck_conv, &d.conv_state, 2 * (c.d_conv - 1) * c.conv_channels());
+                gpu.qw_copy(&k.ck_s, &d.s, c.n_v_heads * c.head_v() * c.head_k);
+                let _ = gpu.qp_delta_net(&k.qkv, &k.z, &k.ba, &d.conv, &d.dt, &d.a, &d.norm, &d.conv_state, &d.s, &self.pp2, keep, (c.conv_channels(), c.n_k_heads, c.n_v_heads, c.head_k), c.eps);
+            }
+        }
+    }
+
+    /// The cache-writing half of an attention layer for one token (the nextn layer's catch-up: its K/V entry needs only the attention input).
+    pub fn kv_only(&self, gpu: &Gpu, i: usize, x: &Handle) {
+        let c = &self.cfg;
+        let l = &self.layers[i];
+        let a = l.attn.as_ref().expect("attention layer");
+        let (h, hp) = gpu.qw_rms(x, &l.attn_norm, 1, c.n_embd, c.eps);
+        let qf = a.q.launch2(gpu, &h, &hp);
+        let k = a.k.launch2(gpu, &h, &hp);
+        let v = a.v.launch2(gpu, &h, &hp);
+        let _ = gpu.qw_attention(&qf, &k, &v, &a.qn, &a.kn, &a.kc, &a.vc, &self.pos_h, (c.n_head, c.n_head_kv, c.head_dim, c.n_rot / 2, self.cap), c.eps, self.theta_scale);
+    }
+
     /// Every persistent device buffer of the block (states, KV caches).
     pub fn persistent(&self) -> Vec<Handle> {
         let mut v = Vec::new();
@@ -376,6 +473,9 @@ impl DevModel {
                 v.push(a.kc.clone());
                 v.push(a.vc.clone());
             }
+        }
+        for k in self.spec.iter().flatten() {
+            v.extend([k.qkv.clone(), k.z.clone(), k.ba.clone(), k.ck_conv.clone(), k.ck_s.clone()]);
         }
         v
     }

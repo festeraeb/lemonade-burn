@@ -451,9 +451,73 @@ pub fn quantize_q8_0(x: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Quantize f32 to Q6_K bytes (whole 256-blocks): per group of 16 `sc = amax / 32` (signed), superblock `d = max|sc| / 127`, `q = round(x / (d sc)) + 32`
+/// clamped 0..63. Not ggml's iterative search, but within a few percent of its error; used to turn a Q8_0 expert matrix into a kind the device kernels read.
+pub fn quantize_q6_k(x: &[f32]) -> Vec<u8> {
+    assert_eq!(x.len() % 256, 0);
+    let mut out = Vec::with_capacity(x.len() / 256 * 210);
+    for blk in x.chunks_exact(256) {
+        let mut gs = [0f32; 16];
+        for (g, c) in gs.iter_mut().zip(blk.chunks_exact(16)) {
+            let (mut amax, mut m) = (0f32, 0f32);
+            for &v in c {
+                if v.abs() > amax {
+                    amax = v.abs();
+                    m = v;
+                }
+            }
+            *g = m / -32.0; // ggml sign convention: the extreme value lands on q = 0 (-32)
+        }
+        let gmax = gs.iter().fold(0f32, |a, v| if v.abs() > a.abs() { *v } else { a });
+        let d = gmax / -128.0;
+        let d16 = f16::from_f32(d);
+        let df = d16.to_f32();
+        let id = if df != 0.0 { 1.0 / df } else { 0.0 };
+        let mut sc = [0i8; 16];
+        for (s, g) in sc.iter_mut().zip(&gs) {
+            *s = (g * id).round().clamp(-128.0, 127.0) as i8;
+        }
+        let mut q = [0u8; 256];
+        for (gi, c) in blk.chunks_exact(16).enumerate() {
+            let dd = df * sc[gi] as f32;
+            let idd = if dd != 0.0 { 1.0 / dd } else { 0.0 };
+            for (j, &v) in c.iter().enumerate() {
+                q[gi * 16 + j] = ((v * idd).round().clamp(-32.0, 31.0) as i32 + 32) as u8;
+            }
+        }
+        let mut ql = [0u8; 128];
+        let mut qh = [0u8; 64];
+        for h in 0..2 {
+            for l in 0..32 {
+                let (q1, q2, q3, q4) = (q[128 * h + l], q[128 * h + l + 32], q[128 * h + l + 64], q[128 * h + l + 96]);
+                ql[64 * h + l] = (q1 & 15) | ((q3 & 15) << 4);
+                ql[64 * h + l + 32] = (q2 & 15) | ((q4 & 15) << 4);
+                qh[32 * h + l] = (q1 >> 4) | ((q2 >> 4) << 2) | ((q3 >> 4) << 4) | ((q4 >> 4) << 6);
+            }
+        }
+        out.extend_from_slice(&ql);
+        out.extend_from_slice(&qh);
+        out.extend(sc.iter().map(|&s| s as u8));
+        out.extend_from_slice(&d16.to_le_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q6_k_quantizer_round_trip() {
+        let x: Vec<f32> = (0..512).map(|i| (((i * 7919) % 1013) as f32 / 1013.0 - 0.5) * 0.2).collect();
+        let b = quantize_q6_k(&x);
+        assert_eq!(b.len(), 420);
+        let mut y = vec![0f32; 512];
+        GgmlType::Q6K.dequant_row(&b, &mut y);
+        let e: f32 = x.iter().zip(&y).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / 512.0;
+        let v: f32 = x.iter().map(|a| a * a).sum::<f32>() / 512.0;
+        assert!(e / v < 5e-4, "rel mse {}", e / v);
+    }
 
     #[test]
     fn q4_0_round_trip_is_within_half_step() {

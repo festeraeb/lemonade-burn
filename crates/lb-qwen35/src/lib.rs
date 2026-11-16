@@ -8,6 +8,7 @@
 //! and are dequantised row by row (`lb_gguf`, bit-identical to ggml's `to_float` on every row of the Q5_K_M file).
 
 pub mod chat;
+pub mod spec;
 #[cfg(feature = "gpu")]
 pub mod device;
 #[cfg(feature = "gpu")]
@@ -139,6 +140,7 @@ pub struct Model<'a> {
     pub(crate) layers: Vec<Layer<'a>>,
 }
 
+#[derive(Clone)]
 pub enum LayerState {
     Lin { conv: Vec<f32>, s: Vec<f32> },
     Attn { k: Vec<f32>, v: Vec<f32> },

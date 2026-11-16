@@ -124,6 +124,14 @@ fn qw_add_kernel(a: &[f32], b: &[f32], out: &mut [f32]) {
 }
 
 #[cube(launch)]
+fn qw_copy_kernel(src: &[f32], dst: &mut [f32]) {
+    let i = ABSOLUTE_POS as usize;
+    if i < dst.len() {
+        dst[i] = src[i];
+    }
+}
+
+#[cube(launch)]
 fn qw_silu_mul_kernel(g: &[f32], u: &[f32], out: &mut [f32]) {
     let i = ABSOLUTE_POS as usize;
     if i < out.len() {
@@ -772,6 +780,13 @@ impl Gpu {
             qw_add_kernel::launch(&self.client, self.qw_cubes(n), CubeDim::new_1d(self.cube_dim as u32), BufferArg::from_raw_parts(a.clone(), n), BufferArg::from_raw_parts(b.clone(), n), BufferArg::from_raw_parts(out.clone(), n));
         }
         out
+    }
+
+    /// Device-to-device copy of the first `n` f32 of `src` into `dst` (both persistent or scratch; `dst` may be larger).
+    pub fn qw_copy(&self, src: &Handle, dst: &Handle, n: usize) {
+        unsafe {
+            qw_copy_kernel::launch(&self.client, self.qw_cubes(n), CubeDim::new_1d(self.cube_dim as u32), BufferArg::from_raw_parts(src.clone(), n), BufferArg::from_raw_parts(dst.clone(), n));
+        }
     }
 
     pub fn qw_silu_mul(&self, g: &Handle, u: &Handle, n: usize) -> Handle {
