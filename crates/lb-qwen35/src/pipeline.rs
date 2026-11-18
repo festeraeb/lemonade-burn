@@ -135,6 +135,21 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         Ok(())
     }
 
+    /// The speculative graphs (the verify pass of every stage, the nextn draft step) are recorded here, before any prefill has run, for the same
+    /// reason as the decode graphs: a recording started after stage threads wrote shared buffers can be invalidated. Needs `new_spec` and `attach_mtp`.
+    pub fn warm_spec(&self, tok: u32) -> Result<()> {
+        if self.mtp.is_none() || self.vm < 2 {
+            return Ok(());
+        }
+        let zeros = vec![0f32; self.model.cfg.n_embd];
+        for i in 0..3 {
+            self.run_rows(&vec![tok; self.vm], 0)?;
+            self.mtp_draft(&zeros, tok, i)?;
+        }
+        self.reset();
+        Ok(())
+    }
+
     pub fn reset(&self) {
         for s in &self.stages {
             s.dev.reset(&s.gpu);
@@ -475,8 +490,14 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         if kind == 2 {
             match s.gpu.client.graph_prepare() {
                 Ok(()) => {
+                    if std::env::var("LB_SCRATCH_LOG").is_ok() {
+                        eprintln!("--- draft pass A (eager)");
+                    }
                     let o = self.build_draft(m);
                     s.gpu.read_all(vec![(o.1, 1)]).map_err(|e| anyhow!(e))?;
+                    if std::env::var("LB_SCRATCH_LOG").is_ok() {
+                        eprintln!("--- draft pass A synced, pooled buffers: {}", s.gpu.pooled());
+                    }
                 }
                 Err(e) => {
                     eprintln!("lb-qwen35: draft graph_prepare refused ({e:?})");
@@ -492,6 +513,9 @@ impl<'m, 'a> Pipeline<'m, 'a> {
                 Ok(self.build_draft(m))
             }
             Ok(()) => {
+                if std::env::var("LB_SCRATCH_LOG").is_ok() {
+                    eprintln!("--- draft capture begins");
+                }
                 let (y, am) = self.build_draft(m);
                 match s.gpu.client.stop_capture() {
                     Ok(graph) => {

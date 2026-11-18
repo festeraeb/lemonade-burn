@@ -24,6 +24,7 @@ fn main() -> Result<()> {
         eprintln!("nextn block uploaded in {:.1}s", t.elapsed().as_secs_f64());
     }
     pipe.warm_decode(g.meta_u64("tokenizer.ggml.bos_token_id").unwrap_or(248044) as u32)?;
+    pipe.warm_spec(g.meta_u64("tokenizer.ggml.bos_token_id").unwrap_or(248044) as u32)?;
     let prompts: Vec<(String, String)> = if a.len() > 4 {
         a[4..].iter().map(|p| (p.clone(), std::fs::read_to_string(p).unwrap())).collect()
     } else {
