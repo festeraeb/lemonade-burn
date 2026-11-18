@@ -70,11 +70,12 @@ pub fn load(path: &Path, ctx: usize) -> Result<(QwenDev, Arc<TextCodec>, usize)>
     };
     let cap = ctx.min(model.cfg_context(g));
     let nextn = g.meta_u64("qwen35moe.nextn_predict_layers").unwrap_or(0) > 0;
-    // LB_MTP=1 turns the draft on (default off); LB_MTP_DEPTH (1..7, default 3) is the most tokens the nextn head drafts per verify;
-    // LB_MTP_ADAPT=0 drafts exactly LB_MTP_DEPTH every round instead of picking 0..=LB_MTP_DEPTH by measured acceptance and round time
+    // LB_MTP=1 turns the draft on (default off); LB_MTP_DEPTH (1..7, default 1) is how many tokens the nextn head drafts per verify (the most,
+    // with LB_MTP_ADAPT=1: then each round picks 0..=LB_MTP_DEPTH by measured acceptance and round time). Measured 2026-11-18 on 2 P100s,
+    // Qwen3.6-35B-A3B Q5_K_M, server greedy: depth 1 fixed +14/-2/+15/+16 % (code/prose/primes/4k) vs off; adaptive max 2 +11/-4/+12/+9 %.
     let mtp_on = nextn && std::env::var("LB_MTP").map(|v| v == "1" || v == "on").unwrap_or(false);
-    let depth: usize = std::env::var("LB_MTP_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 7);
-    let adapt = std::env::var("LB_MTP_ADAPT").map(|v| v != "0").unwrap_or(true);
+    let depth: usize = std::env::var("LB_MTP_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 7);
+    let adapt = std::env::var("LB_MTP_ADAPT").map(|v| v == "1").unwrap_or(false);
     let mut pipe = Pipeline::new_spec(model, &split, cap, if mtp_on { depth + 1 } else { 0 })?;
     if mtp_on {
         pipe.attach_mtp(&model.load_mtp(g)?)?;
