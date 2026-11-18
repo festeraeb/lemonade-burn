@@ -43,6 +43,10 @@ const POOL_PER_SIZE: usize = 64;
 pub struct Gpu {
     pub client: Client,
     pub name: String,
+    /// Largest prefill chunk (rows) this card's family is known to run safely (Vega 10: 128); `None` = no known limit.
+    pub max_batch_rows: Option<usize>,
+    /// sysfs facts about the card (wgpu adapters with a PCI bus), read at open
+    pub card: Option<lb_ternary_gpu::card_facts::CardFacts>,
     /// Units per cube for the matvec kernels (`LB_Q4_CUBE` overrides).
     pub cube_dim: usize,
     /// Reduce with `plane_sum` (device has subgroup ops); otherwise one output per cube.
@@ -232,7 +236,26 @@ fn cuda_compute_capability(index: usize) -> Option<(u32, u32)> {
 impl Gpu {
     /// Open the device named by `LB_CUDA_DEVICE` or `LB_WGPU_DEVICE` (see `pick_cube_device`).
     pub fn open() -> Result<Self, String> {
-        Self::open_device(pick_cube_device()?)
+        let mut g = Self::open_device(pick_cube_device()?)?;
+        if std::env::var("LB_CUDA_DEVICE").is_err() {
+            g.note_card(&std::env::var("LB_WGPU_DEVICE").unwrap_or_default());
+        }
+        Ok(g)
+    }
+
+    /// Read the card's family, BAR, power cap and link from sysfs (wgpu adapters; read-only), log them once, and take the family's limits
+    /// (Vega 10: prefill chunks of at most 128 rows). Falls back to the adapter name when the bus is not readable.
+    fn note_card(&mut self, spec: &str) {
+        let Some((row, facts)) = lb_ternary_gpu::card_for_spec(spec) else { return };
+        let limits = match &facts {
+            Some(f) => {
+                eprintln!("lb-q4-gpu: {} {}", row.name, f.summary());
+                f.limits()
+            }
+            None => lb_ternary_gpu::card_facts::family_limits_by_name(&row.name),
+        };
+        self.max_batch_rows = limits.max_batch_rows;
+        self.card = facts;
     }
 
     /// Open CUDA device `index` (driver order inside `CUDA_VISIBLE_DEVICES`), whatever
@@ -248,7 +271,9 @@ impl Gpu {
     /// `lb_ternary_gpu::pick_device_spec`) whatever `LB_WGPU_DEVICE` says: a further card in the
     /// same process (in-box expert cards, a prefill card) on the Vulkan runtime.
     pub fn open_wgpu(spec: &str) -> Result<Self, String> {
-        Self::open_device(cubecl::Device::Wgpu(lb_ternary_gpu::pick_device_spec(spec)?))
+        let mut g = Self::open_device(cubecl::Device::Wgpu(lb_ternary_gpu::pick_device_spec(spec)?))?;
+        g.note_card(spec);
+        Ok(g)
     }
 
     fn open_device(dev: cubecl::Device) -> Result<Self, String> {
@@ -298,6 +323,8 @@ impl Gpu {
             tensor_cores,
             client,
             name: format!("{dev:?}"),
+            max_batch_rows: None,
+            card: None,
             cube_dim,
             use_plane,
             plane_size: (pmin, pmax),

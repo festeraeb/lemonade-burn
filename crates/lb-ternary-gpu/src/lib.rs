@@ -1,6 +1,8 @@
 //! Ternary GEMM on the GPU (CubeCL, wgpu runtime). Same layout and exact integers as
 //! `lb_ternary::ternary_gemm_i32(w, x, Kernel::Scalar)`: out[t * rows + r] = sum_k w[r,k] * x_q[t,k].
 
+pub mod card_facts;
+
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuDevice;
 use lb_ternary::{QuantActs, TernaryView};
@@ -135,6 +137,15 @@ pub fn pick_device_spec(spec: &str) -> Result<WgpuDevice, String> {
         "integrated" => WgpuDevice::new(WgpuDeviceKind::IntegratedGpu(n)),
         _ => return Err(format!("LB_WGPU_DEVICE {spec:?}: use default, discrete:N, integrated:N, name:<text> or bus:<pci id>")),
     })
+}
+
+/// The adapter a wgpu spec names right now and, when its PCI bus is known, the kernel's facts about the card (sysfs, read-only).
+/// `None` for `default`/`integrated:N` or when nothing matches.
+pub fn card_for_spec(spec: &str) -> Option<(AdapterRow, Option<card_facts::CardFacts>)> {
+    let idx = if spec.is_empty() || spec == "default" { return None } else { resolve_discrete(spec).ok()? };
+    let row = list_adapters().into_iter().find(|r| r.discrete_index == Some(idx))?;
+    let facts = (!row.bus.is_empty()).then(|| card_facts::read_card_facts(&row.bus)).flatten();
+    Some((row, facts))
 }
 
 /// The wgpu device from `LB_WGPU_DEVICE`: unset or "default" = wgpu's choice, "discrete:N" = the
