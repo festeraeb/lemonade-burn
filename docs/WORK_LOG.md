@@ -1188,3 +1188,7 @@ Branch `fable/work-to-weights-2026-11-11`; write-up `docs/WORK_TO_WEIGHTS.md`. N
   `062392b8d2b0361a` (the CPU path gives the one-card sha), with all experts on one host (unix, TCP, RoCE loopback), split over two,
   split with part on the trunk, one host SIGKILLed mid-decode and mid-greedy, one host SIGSTOPped (deadline). 8 arms, all pass.
 * Not run: anything on a card, a host on another node, the llama.cpp oracle.
+
+## 2026-11-18: qwen35 MTP finished and measured (claude-t440-env1)
+
+Branch fable/engine-qwen35-mtp-2026-11-16 (1ee9df5 CPU loop, 339e92b device loop, 306a253 verify graphs, bceb32c warm_spec, a73c334 merge of a98831f, af4a2a3 adaptive depth + per-size verify graphs, 4ab5e29 server defaults). c4 P100 AF+D8, Qwen3.6-35B-A3B-Q5_K_M, split 21,19: every MTP run token-identical to plain (24/24 qwen35-dev-mtp, 16/16 server). Decode tok/s plain -> depth 1: code 67.5 -> 78.4, prose 64.1 -> 67.4, primes 68.1 -> 80.7, 4k context 43.8 -> 54.4; depth 2/3 and the adaptive picker do not beat depth 1 (2-row verify 21.5 ms vs ~15 ms a plain token). Server: LB_MTP=1 (off by default), LB_MTP_DEPTH=1 default, LB_MTP_ADAPT=1 opt-in. Full tables: ~/agentnotes/c1-gemini-lessons-for-engine-2026-11-18.md.
