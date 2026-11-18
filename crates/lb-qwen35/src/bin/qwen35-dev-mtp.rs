@@ -1,4 +1,4 @@
-//! qwen35-dev-mtp <model.gguf> <n_gen> <depths e.g. 0,1,2,3> [prompt.txt ...] : device greedy decode, plain (depth 0) vs MTP speculation, per prompt:
+//! qwen35-dev-mtp <model.gguf> <n_gen> <depths e.g. 0,1,2,3,a3 (aN = adaptive depth up to N)> [prompt.txt ...] : device greedy decode, plain (depth 0) vs MTP speculation, per prompt:
 //! token-for-token equality with the plain run, decode tokens/s, rounds and acceptance. One JSON line per (prompt, depth).
 //! Cards: `CUDA_VISIBLE_DEVICES=uuid0,...` in stage order, `QWEN_SPLIT`, `QWEN_CAP` (KV positions, default 8192), `LB_QW_PREFILL_CHUNK`.
 use anyhow::Result;
@@ -11,11 +11,12 @@ fn main() -> Result<()> {
     let m = Model::load(&g)?;
     let tk = tokenizer::from_gguf(&g)?;
     let n: usize = a[2].parse()?;
-    let depths: Vec<usize> = a[3].split(',').map(|x| x.parse().unwrap()).collect();
+    // (depth, adaptive): "aN" = adaptive with largest depth N
+    let depths: Vec<(usize, bool)> = a[3].split(',').map(|x| match x.strip_prefix('a') { Some(n) => (n.parse().unwrap(), true), None => (x.parse().unwrap(), false) }).collect();
     let split: Vec<usize> = std::env::var("QWEN_SPLIT").unwrap_or_else(|_| format!("{}", m.cfg.n_layer)).split(',').map(|x| x.parse().unwrap()).collect();
     let cap: usize = std::env::var("QWEN_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
     let chunk: usize = std::env::var("LB_QW_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let maxd = depths.iter().cloned().max().unwrap_or(0);
+    let maxd = depths.iter().map(|d| d.0).max().unwrap_or(0);
     let mut pipe = Pipeline::new_spec(&m, &split, cap, if maxd > 0 { maxd + 1 } else { 0 })?;
     if maxd > 0 {
         let mtp = m.load_mtp(&g)?;
@@ -36,13 +37,14 @@ fn main() -> Result<()> {
         let text = chat::render(&[chat::Msg { role: "user", content: p }], true, false);
         let ids = tokenizer::encode(&tk, &text)?;
         let mut plain: Vec<u32> = Vec::new();
-        for &d in &depths {
+        for &(d, adapt) in &depths {
+            let mk = || if adapt { SpecDev::adaptive(d) } else { SpecDev::new(d.max(1)) };
             if d > 0 {
                 // warm-up (compiles kernels, records the graphs) so the timed run measures steady state
                 pipe.reset();
                 let rows = Mutex::new(Vec::new());
                 let lg = pipe.prefill_h(&ids, 0, chunk, Some(&rows))?;
-                let mut sd = SpecDev::new(d);
+                let mut sd = mk();
                 sd.after_prefill(&pipe, &ids, 0, &rows.into_inner().unwrap())?;
                 let (mut next, mut len) = (argmax(&lg), ids.len());
                 for _ in 0..12 {
@@ -55,7 +57,7 @@ fn main() -> Result<()> {
             let t0 = std::time::Instant::now();
             let lg = pipe.prefill_h(&ids, 0, chunk, Some(&rows))?;
             let rows = rows.into_inner().unwrap();
-            let mut sd = SpecDev::new(d.max(1));
+            let mut sd = mk();
             if d > 0 {
                 sd.after_prefill(&pipe, &ids, 0, &rows)?;
             }
@@ -81,9 +83,11 @@ fn main() -> Result<()> {
             }
             let div = if d == 0 { None } else { plain.iter().zip(&out).position(|(x, y)| x != y) };
             let s = &sd.stats;
+            let label = if adapt { format!("\"a{d}\"") } else { d.to_string() };
+            let at: Vec<String> = s.at_depth[..=d].iter().map(|x| x.to_string()).collect();
             let acc: Vec<String> = (0..d).map(|i| format!("{:.3}", s.prefix_ok[i] as f64 / s.rounds.max(1) as f64)).collect();
-            println!("{{\"prompt\":\"{name}\",\"prompt_tokens\":{},\"n\":{n},\"depth\":{d},\"prefill_s\":{prefill_s:.2},\"decode_s\":{dec_s:.3},\"tok_s\":{:.2},\"equal_to_plain\":{},\"first_divergence\":{},\"rounds\":{},\"tokens_per_round\":{:.3},\"prefix_accept\":[{}],\"draft_ms_per_round\":{:.2},\"verify_ms_per_round\":{:.2},\"fixup_ms_per_round\":{:.2}}}",
-                ids.len(), n as f64 / dec_s, d == 0 || div.is_none(), div.map(|x| x as i64).unwrap_or(-1), s.rounds, s.emitted as f64 / s.rounds.max(1) as f64, acc.join(","),
+            println!("{{\"prompt\":\"{name}\",\"prompt_tokens\":{},\"n\":{n},\"depth\":{label},\"rounds_at_depth\":[{}],\"prefill_s\":{prefill_s:.2},\"decode_s\":{dec_s:.3},\"tok_s\":{:.2},\"equal_to_plain\":{},\"first_divergence\":{},\"rounds\":{},\"tokens_per_round\":{:.3},\"prefix_accept\":[{}],\"draft_ms_per_round\":{:.2},\"verify_ms_per_round\":{:.2},\"fixup_ms_per_round\":{:.2}}}",
+                ids.len(), at.join(","), n as f64 / dec_s, d == 0 || div.is_none(), div.map(|x| x as i64).unwrap_or(-1), s.rounds, s.emitted as f64 / s.rounds.max(1) as f64, acc.join(","),
                 s.draft_s * 1e3 / s.rounds.max(1) as f64, s.verify_s * 1e3 / s.rounds.max(1) as f64, s.fixup_s * 1e3 / s.rounds.max(1) as f64);
         }
     }

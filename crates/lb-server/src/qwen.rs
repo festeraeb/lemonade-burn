@@ -70,13 +70,15 @@ pub fn load(path: &Path, ctx: usize) -> Result<(QwenDev, Arc<TextCodec>, usize)>
     };
     let cap = ctx.min(model.cfg_context(g));
     let nextn = g.meta_u64("qwen35moe.nextn_predict_layers").unwrap_or(0) > 0;
-    // LB_MTP=0 turns the draft off; LB_MTP_DEPTH (1..3, default 2) is how many tokens the nextn head drafts per verify
-    let mtp_on = nextn && std::env::var("LB_MTP").map(|v| v != "0").unwrap_or(true);
-    let depth: usize = std::env::var("LB_MTP_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 7);
+    // LB_MTP=1 turns the draft on (default off); LB_MTP_DEPTH (1..7, default 3) is the most tokens the nextn head drafts per verify;
+    // LB_MTP_ADAPT=0 drafts exactly LB_MTP_DEPTH every round instead of picking 0..=LB_MTP_DEPTH by measured acceptance and round time
+    let mtp_on = nextn && std::env::var("LB_MTP").map(|v| v == "1" || v == "on").unwrap_or(false);
+    let depth: usize = std::env::var("LB_MTP_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 7);
+    let adapt = std::env::var("LB_MTP_ADAPT").map(|v| v != "0").unwrap_or(true);
     let mut pipe = Pipeline::new_spec(model, &split, cap, if mtp_on { depth + 1 } else { 0 })?;
     if mtp_on {
         pipe.attach_mtp(&model.load_mtp(g)?)?;
-        eprintln!("lb-qwen35: MTP speculative decoding on, depth {depth} (greedy requests)");
+        eprintln!("lb-qwen35: MTP speculative decoding on, depth {} {depth} (greedy requests)", if adapt { "adaptive 0..=" } else { "fixed" });
     }
     pipe.warm_decode(g.meta_u64("tokenizer.ggml.bos_token_id").unwrap_or(248044) as u32)?;
     pipe.warm_spec(g.meta_u64("tokenizer.ggml.bos_token_id").unwrap_or(248044) as u32)?;
@@ -85,7 +87,7 @@ pub fn load(path: &Path, ctx: usize) -> Result<(QwenDev, Arc<TextCodec>, usize)>
     let eos = g.meta_u64("tokenizer.ggml.eos_token_id").unwrap_or(248046) as u32;
     let codec = Arc::new(TextCodec { tok, bos, style: ChatStyle::Qwen35, stops: vec![eos, bos] });
     let vocab = model.cfg.vocab;
-    Ok((QwenDev { pipe, cap, bos, vocab, spec: mtp_on.then(|| RefCell::new(SpecDev::new(depth))), served: Cell::new(0), spec_cap: depth + 1 }, codec, cap))
+    Ok((QwenDev { pipe, cap, bos, vocab, spec: mtp_on.then(|| RefCell::new(if adapt { SpecDev::adaptive(depth) } else { SpecDev::new(depth) })), served: Cell::new(0), spec_cap: depth + 1 }, codec, cap))
 }
 
 impl QwenDev {
@@ -229,7 +231,7 @@ impl Decoder for QwenDev {
         if let (Some(sp), true) = (&self.spec, trace() || std::env::var("LB_MTP_LOG").is_ok()) {
             let sp = sp.borrow();
             let s = &sp.stats;
-            eprintln!("qwen mtp: {} rounds, {:.2} tokens/round, prefix accept {:?}, draft {:.1} verify {:.1} fixup {:.1} ms/round", s.rounds, s.emitted as f64 / s.rounds.max(1) as f64, &s.prefix_ok[..sp.depth], s.draft_s * 1e3 / s.rounds.max(1) as f64, s.verify_s * 1e3 / s.rounds.max(1) as f64, s.fixup_s * 1e3 / s.rounds.max(1) as f64);
+            eprintln!("qwen mtp: {} rounds, {:.2} tokens/round, prefix accept {:?}, draft {:.1} verify {:.1} fixup {:.1} ms/round, rounds at depth {:?}", s.rounds, s.emitted as f64 / s.rounds.max(1) as f64, &s.prefix_ok[..sp.depth], s.draft_s * 1e3 / s.rounds.max(1) as f64, s.verify_s * 1e3 / s.rounds.max(1) as f64, s.fixup_s * 1e3 / s.rounds.max(1) as f64, &s.at_depth[..=sp.depth]);
         }
     }
     fn discard_request(&self) {
