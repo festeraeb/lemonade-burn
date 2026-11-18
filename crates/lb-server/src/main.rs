@@ -880,7 +880,26 @@ async fn topology(State(st): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
+/// The libdevice folder shipped with the engine: `cuda-path/` beside the binary, or beside its `bin/` folder
+/// (the `<bundle>/{bin,lib,cuda-path}` layout). NVRTC needs `nvvm/libdevice/libdevice.10.bc` to compile any
+/// kernel that calls `exp`, and CubeCL only looks at `CUDA_PATH` or a system toolkit, so a host with just the
+/// NVIDIA driver could not run the engine without this.
+fn bundled_cuda_path(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = exe.parent()?;
+    let mut candidates = vec![dir.join("cuda-path")];
+    if let Some(up) = dir.parent() {
+        candidates.push(up.join("cuda-path"));
+    }
+    candidates.into_iter().find(|c| c.join("nvvm/libdevice/libdevice.10.bc").is_file())
+}
+
 fn main() -> Result<()> {
+    // before any thread starts: an explicit CUDA_PATH wins, then the bundle's own libdevice, then CubeCL's defaults
+    if std::env::var_os("CUDA_PATH").is_none() {
+        if let Some(p) = std::env::current_exe().ok().and_then(|e| bundled_cuda_path(&e)) {
+            std::env::set_var("CUDA_PATH", p);
+        }
+    }
     let args = Args::parse();
     if let Some(t) = args.threads {
         rayon::ThreadPoolBuilder::new().num_threads(t).build_global()?;
@@ -1205,6 +1224,26 @@ mod http_tests {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn bundled_cuda_path_finds_libdevice_beside_the_binary_or_its_bin_folder() {
+        let root = std::env::temp_dir().join(format!("lb-cuda-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("lemonade-burn-server");
+        assert_eq!(bundled_cuda_path(&exe), None, "no libdevice anywhere");
+        // an empty cuda-path folder is not enough
+        std::fs::create_dir_all(root.join("cuda-path/nvvm")).unwrap();
+        assert_eq!(bundled_cuda_path(&exe), None);
+        std::fs::create_dir_all(root.join("cuda-path/nvvm/libdevice")).unwrap();
+        std::fs::write(root.join("cuda-path/nvvm/libdevice/libdevice.10.bc"), b"x").unwrap();
+        assert_eq!(bundled_cuda_path(&exe), Some(root.join("cuda-path")), "<bundle>/{{bin,cuda-path}}");
+        std::fs::create_dir_all(bin.join("cuda-path/nvvm/libdevice")).unwrap();
+        std::fs::write(bin.join("cuda-path/nvvm/libdevice/libdevice.10.bc"), b"x").unwrap();
+        assert_eq!(bundled_cuda_path(&exe), Some(bin.join("cuda-path")), "beside the binary wins");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     struct Fake {
         discards: AtomicUsize,
