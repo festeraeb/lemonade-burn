@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::dense::DenseStore;
 use crate::moe::{moe_ffn, ExpertStore, Placement, PlacementStats, Route, Scraper};
 use crate::weights::{Ffn, MatRef, Operator, Weights};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::{Bool, Device, Tensor, TensorData};
 use lb_gguf::{matvec_f32, Gguf};
@@ -54,6 +54,9 @@ pub struct Lfm2 {
     /// it only copies tensors out, so the forward pass computes the same numbers either way.
     capture_on: AtomicBool,
     capture: std::sync::Mutex<Vec<CapturedLayer>>,
+    /// Matrices replaced by factorised sub-1-bit layers (`attach_littlebit`), keyed by the GGUF
+    /// offset of the matrix they replace (`MatRef::start`).
+    pub littlebit: std::collections::HashMap<usize, Arc<lb_littlebit::Linear>>,
 }
 
 /// One layer of one forward pass, captured on the host path for `m` tokens at `pos0..`.
@@ -177,6 +180,7 @@ impl Lfm2 {
             pcard: None,
             capture_on: AtomicBool::new(false),
             capture: std::sync::Mutex::new(Vec::new()),
+            littlebit: std::collections::HashMap::new(),
         })
     }
 
@@ -440,8 +444,24 @@ impl Lfm2 {
         self.from_vec(out, m, w.rows)
     }
 
+    /// Replace the GGUF matrices named in a LittleBit sidecar (`lb_littlebit::sidecar`) by their
+    /// factorised layers. Returns how many were attached. Every name must exist with the same shape.
+    pub fn attach_littlebit(&mut self, path: &Path) -> Result<usize> {
+        let layers = lb_littlebit::sidecar::read(path)?;
+        let g = &self.w.gguf;
+        for (name, l) in layers {
+            let t = g.tensor(&name).with_context(|| format!("littlebit: {name} is not in the GGUF"))?;
+            anyhow::ensure!(t.dims.len() == 2 && t.dims[0] == l.inp && t.dims[1] == l.out, "littlebit: {name} is [{}, {}] in the sidecar, dims {:?} in the GGUF", l.out, l.inp, t.dims);
+            self.littlebit.insert(t.offset, Arc::new(l));
+        }
+        Ok(self.littlebit.len())
+    }
+
     /// The matmul itself, on whichever side holds the weights.
     fn linear_vec(&self, xv: &[f32], w: &MatRef, m: usize) -> Vec<f32> {
+        if let Some(l) = self.littlebit.get(&w.start) {
+            return l.forward(xv, m);
+        }
         #[cfg(feature = "gpu")]
         if let Some(gpu) = self.store.gpu.as_ref() {
             // a device fault here would be silent corruption if we guessed at the result:
@@ -709,7 +729,7 @@ impl Lfm2 {
         // One decode token device-resident when asked and possible (see `device_decode.rs`);
         // `None` means it declined and nothing changed, so the path below runs as before.
         #[cfg(feature = "gpu")]
-        if tokens.len() == 1 && self.store.knobs.device_decode() && !self.capture_enabled() {
+        if tokens.len() == 1 && self.store.knobs.device_decode() && !self.capture_enabled() && self.littlebit.is_empty() {
             if let Some(logits) = crate::device_decode::token(self, tokens[0], cache) {
                 return logits;
             }
@@ -717,7 +737,7 @@ impl Lfm2 {
         // a prompt (several tokens) device-resident when asked and possible (`device_prefill.rs`);
         // `None` means it declined before touching any state, so the host path runs as before
         #[cfg(feature = "gpu")]
-        if tokens.len() > 1 && self.store.knobs.device_prefill() && !self.capture_enabled() {
+        if tokens.len() > 1 && self.store.knobs.device_prefill() && !self.capture_enabled() && self.littlebit.is_empty() {
             if let Some(logits) = crate::device_prefill::prefill(self, tokens, cache, all_logits) {
                 return logits;
             }
