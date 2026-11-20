@@ -113,21 +113,54 @@ pub struct PathStats {
     pub corner_after: f32,
 }
 
+/// Top-`r` singular triplets of `w`: `(P_r, σ_r, Q_r)` with `w ≈ P diag(σ) Qᵀ`, largest first.
+/// For `r` well below the smaller side, a randomized range finder (Gaussian sketch of `r + 16`
+/// columns, two power iterations with re-orthonormalisation) and an SVD of the small projected
+/// matrix; otherwise the full SVD.
+fn top_svd(w: &DMatrix<f32>, r: usize, seed: u64) -> (DMatrix<f32>, Vec<f32>, DMatrix<f32>) {
+    let (m, n) = (w.nrows(), w.ncols());
+    let k = (r + 16).min(m.min(n));
+    if 2 * k >= m.min(n) {
+        let svd = w.clone().svd(true, true);
+        let mut idx: Vec<usize> = (0..svd.singular_values.len()).collect();
+        idx.sort_by(|&a, &b| svd.singular_values[b].total_cmp(&svd.singular_values[a]));
+        let (pu, qt) = (svd.u.as_ref().unwrap(), svd.v_t.as_ref().unwrap());
+        let p = DMatrix::from_fn(m, r, |i, c| pu[(i, idx[c])]);
+        let q = DMatrix::from_fn(n, r, |i, c| qt[(idx[c], i)]);
+        return (p, idx.iter().take(r).map(|&c| svd.singular_values[c]).collect(), q);
+    }
+    let mut rng = Rng(seed ^ 0x5eed_5eed);
+    let omega = DMatrix::<f32>::from_fn(n, k, |_, _| rng.gauss());
+    let mut y = w * omega;
+    for _ in 0..2 {
+        let qy = y.qr().q();
+        let z = (w.transpose() * qy).qr().q();
+        y = w * z;
+    }
+    let qm = y.qr().q(); // m x k
+    let b = qm.transpose() * w; // k x n
+    let svd = b.svd(true, true);
+    let mut idx: Vec<usize> = (0..svd.singular_values.len()).collect();
+    idx.sort_by(|&a, &c| svd.singular_values[c].total_cmp(&svd.singular_values[a]));
+    let ub = svd.u.as_ref().unwrap(); // k x k
+    let vt = svd.v_t.as_ref().unwrap(); // k x n
+    let ub_r = DMatrix::from_fn(k, r, |i, c| ub[(i, idx[c])]);
+    let p = &qm * ub_r;
+    let q = DMatrix::from_fn(n, r, |i, c| vt[(idx[c], i)]);
+    (p, idx.iter().take(r).map(|&c| svd.singular_values[c]).collect(), q)
+}
+
 /// One path from `w` at rank `r`; also returns the dense approximation it stands for.
 fn path(w: &DMatrix<f32>, o: &Opts, seed: u64) -> (Path, DMatrix<f32>, PathStats) {
     let (out, inp) = (w.nrows(), w.ncols());
     let r = o.r.min(out.min(inp));
-    let svd = w.clone().svd(true, true);
-    // nalgebra does not promise sorted singular values: order them
-    let mut idx: Vec<usize> = (0..svd.singular_values.len()).collect();
-    idx.sort_by(|&a, &b| svd.singular_values[b].total_cmp(&svd.singular_values[a]));
-    let (pu, qt) = (svd.u.as_ref().unwrap(), svd.v_t.as_ref().unwrap());
+    let (pu, sv, qv) = top_svd(w, r, seed);
     let mut up = DMatrix::<f32>::zeros(out, r);
     let mut vp = DMatrix::<f32>::zeros(inp, r);
-    for (c, &k) in idx.iter().take(r).enumerate() {
-        let s = svd.singular_values[k].max(0.0).sqrt();
-        up.set_column(c, &(pu.column(k) * s));
-        vp.set_column(c, &(qt.row(k).transpose() * s));
+    for c in 0..r {
+        let s = sv[c].max(0.0).sqrt();
+        up.set_column(c, &(pu.column(c) * s));
+        vp.set_column(c, &(qv.column(c) * s));
     }
     let stack = |a: &DMatrix<f32>, b: &DMatrix<f32>| {
         let mut z = DMatrix::<f32>::zeros(out + inp, r);
@@ -186,6 +219,21 @@ pub fn convert(w: &[f32], out: usize, inp: usize, o: &Opts) -> (Linear, f32, Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn randomized_svd_finds_the_top_subspace() {
+        // a 300 x 200 matrix with a clear spectrum: the randomized path (r = 20) must match the full SVD's top values
+        let mut rng = Rng(5);
+        let a = DMatrix::<f32>::from_fn(300, 30, |_, _| rng.gauss());
+        let b = DMatrix::<f32>::from_fn(30, 200, |_, _| rng.gauss());
+        let w = a * b + DMatrix::<f32>::from_fn(300, 200, |_, _| 0.01 * rng.gauss());
+        let (_, s_fast, _) = top_svd(&w, 20, 1);
+        let mut full: Vec<f32> = w.clone().svd(false, false).singular_values.iter().copied().collect();
+        full.sort_by(|a, b| b.total_cmp(a));
+        for i in 0..20 {
+            assert!((s_fast[i] - full[i]).abs() <= 2e-3 * full[i], "sigma {i}: {} vs {}", s_fast[i], full[i]);
+        }
+    }
 
     #[test]
     fn the_layer_reproduces_its_own_dense_approximation_and_more_rank_helps() {

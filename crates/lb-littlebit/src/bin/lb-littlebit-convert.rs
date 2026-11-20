@@ -174,7 +174,12 @@ fn convert_experts(a: &Args, g: &Gguf, tsv: &std::path::Path, paths: usize) -> R
     let cold = cold_experts(tsv, &n_layer_experts, a.keep_mass)?;
     let total: usize = n_layer_experts.values().sum();
     eprintln!("{} of {} experts converted (keep-mass {}), bpw {}, ITQ {}", cold.len(), total, a.keep_mass, a.bpw, a.itq_iters);
-    let jobs: Vec<(&lb_gguf::TensorInfo, usize)> = cold.iter().flat_map(|&(l, e)| exps.iter().filter(move |t| layer_of(&t.name) == l).map(move |t| (*t, e))).collect();
+    let jobs: Vec<(&lb_gguf::TensorInfo, usize)> = cold
+        .iter()
+        .flat_map(|&(l, e)| exps.iter().filter(move |t| layer_of(&t.name) == l).map(move |t| (*t, e)))
+        .filter(|(t, _)| a.only.as_ref().map_or(true, |o| t.name.contains(o.as_str())))
+        .collect();
+    eprintln!("{} matrices to convert", jobs.len());
     let t0 = Instant::now();
     let results: Vec<(String, lb_littlebit::Linear, f32)> = jobs
         .par_iter()
@@ -187,7 +192,9 @@ fn convert_experts(a: &Args, g: &Gguf, tsv: &std::path::Path, paths: usize) -> R
             }
             let r = rank_for_bpw(rows, cols, a.bpw, paths);
             let opts = convert::Opts { r, residual: paths == 2, itq_iters: a.itq_iters, seed: a.seed.wrapping_add(*e as u64) };
-            let (lin, rel, _) = convert::convert(&w, rows, cols, &opts);
+            let t1 = Instant::now();
+            let (lin, rel, st) = convert::convert(&w, rows, cols, &opts);
+            eprintln!("{}#e{} [{} x {}] r {} rel.err {:.4} flip-risk {:.2}% -> {:.2}% in {:.1} s", t.name, e, rows, cols, r, rel, 100.0 * st[0].risk_before, 100.0 * st[0].risk_after, t1.elapsed().as_secs_f64());
             (format!("{}#e{}", t.name, e), lin, rel)
         })
         .collect();
