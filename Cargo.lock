@@ -4004,6 +4004,7 @@ dependencies = [
  "cudarc",
  "half",
  "lb-gguf",
+ "lb-littlebit",
  "lb-ternary-gpu",
  "libc",
  "rayon",

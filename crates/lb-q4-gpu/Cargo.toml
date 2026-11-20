@@ -20,6 +20,7 @@ vulkan = ["cubecl/vulkan"]
 
 [dependencies]
 lb-gguf.workspace = true
+lb-littlebit.workspace = true
 lb-ternary-gpu = { path = "../lb-ternary-gpu" }
 cubecl.workspace = true
 # `StreamId` for the expert staging ring's second stream (`Gpu::side_stream`); already in the
