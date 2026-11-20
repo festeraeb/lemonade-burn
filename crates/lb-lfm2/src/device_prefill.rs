@@ -71,6 +71,15 @@ pub fn ubatch() -> usize {
     std::env::var("LB_PREFILL_UBATCH").ok().and_then(|v| v.parse().ok()).filter(|v: &usize| *v > 0).unwrap_or(2048)
 }
 
+/// Rows per chunk on a given card: an explicit `LB_PREFILL_UBATCH` wins; otherwise the default, capped by the card family's known limit
+/// (`Gpu::max_batch_rows`: 128 on Vega 10, where bigger chunks hung the MI25's compute ring under llama.cpp).
+pub fn ubatch_for(card_max: Option<usize>) -> usize {
+    if std::env::var("LB_PREFILL_UBATCH").ok().and_then(|v| v.parse::<usize>().ok()).is_some_and(|v| v > 0) {
+        return ubatch();
+    }
+    card_max.map_or(ubatch(), |c| ubatch().min(c.max(1)))
+}
+
 /// `LB_PREFILL_TIMING=1`: sync after every kind of step and total the wall time per kind
 /// ([`TIMING`]). Slower (hundreds of extra syncs a chunk); for finding where a chunk's time goes.
 pub fn timing_on() -> bool {
@@ -437,7 +446,7 @@ pub fn prefill(m: &Lfm2, tokens: &[u32], cache: &mut Cache, all_logits: bool) ->
         (d.k.clone(), d.v.clone(), d.conv.clone())
     };
 
-    let ub = ubatch().min(n);
+    let ub = ubatch_for(gpu.max_batch_rows).min(n);
     // one routes/weights pair for the chunk, reused by every MoE layer
     let routes = gpu.upload_u32(vec![0u32; 2 * ub * k_used]);
     let weights = gpu.upload_f32(&vec![0f32; ub * k_used]);
@@ -577,4 +586,22 @@ fn fail(m: &Lfm2, cache: &mut Cache, why: &str) -> Option<Tensor<2>> {
     cache.dev = None;
     m.timings.dd_fallbacks.fetch_add(1, Ordering::Relaxed);
     None
+}
+
+#[cfg(test)]
+mod ubatch_tests {
+    use super::{ubatch, ubatch_for};
+
+    #[test]
+    fn card_limit_caps_the_default_chunk() {
+        if std::env::var_os("LB_PREFILL_UBATCH").is_some() {
+            // an explicit setting wins over the card limit by design; nothing to check here
+            assert_eq!(ubatch_for(Some(128)), ubatch());
+            return;
+        }
+        assert_eq!(ubatch_for(None), 2048);
+        assert_eq!(ubatch_for(Some(128)), 128);
+        assert_eq!(ubatch_for(Some(4096)), 2048);
+        assert_eq!(ubatch_for(Some(0)), 1);
+    }
 }

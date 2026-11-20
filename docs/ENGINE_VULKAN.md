@@ -7,7 +7,7 @@ Raw results: `/mnt/fast/eng123/vulkan-results/` (t440) and `/mnt/models/vk/resul
 Test box: c1 (HP ML350p Gen8), 2 x E5-2680 v2 (no AVX2), 149 GB RAM visible at test time, kernel 7.x, amdgpu + RADV (Mesa, Vulkan 1.4),
 no ROCm. Vulkan order at test time (read `vulkaninfo` every time, it changes when a card is added): `discrete:0` RX 6700 XT 12 GB
 (wave 32/64), `discrete:1` Radeon Pro WX 5100 8 GB (Polaris, wave 64, PCIe 3 x16), `discrete:2` RX 570 4 GB (Polaris). The 6700 XT
-holds the `granite-8b-c1` seat, so all throughput numbers below are from the WX 5100 and RX 570 (no seat); the 6700 XT got only the
+holds the `granite-8b-c1` seat, so all throughput numbers below are from the WX 5100 and RX 570 (**correction, phase 2: the WX 5100 also held the live seat `granite-3b-c1`, 4.3 GB of its VRAM, so the WX 5100 numbers in sections 3-5 were taken on a shared card; see section 10**); the 6700 XT got only the
 small kernel tests, run beside the live seat. Pinned versions: cubecl 0.11.2, wgpu 30.0.1, burn 0.22.1.
 
 ## 0. What happened before
@@ -158,7 +158,7 @@ copies and repacks execute, while the same kernel on resident data (`bank launch
 wait is the backlog of the previous layers' uploads, not kernel time. The 3072 run also holds the card at 7.9 of 8 GB, so part of it may be the driver
 spilling buffers to system memory (`expert_down` read 15 ms at 3072 and 0.23 ms at 1024).
 
-**VRAM use**: E2 cache 1024 MiB + 751 MB dense: 6.71 GB used on the card; cache 3072: 7.89 GB (8 GB card). So the pools hold about 5 GB
+**VRAM use** (**phase 2: the 'slack' below was the granite-3b seat's 4.3 GB; the real pool slack is ~0.4 GB, section 10**): E2 cache 1024 MiB + 751 MB dense: 6.71 GB used on the card; cache 3072: 7.89 GB (8 GB card). So the pools hold about 5 GB
 of slack at 1 GB cache. This decides what fits (7) and is unexplained (adaptive pool pages sized to the largest request, like the ~2 GB on
 the P100 in ENGINE_E1_CACHE; the persistent pool is used for the slots only).
 
@@ -285,3 +285,90 @@ On t440: `cd /mnt/fast/eng123/vulkan; CARGO_TARGET_DIR=/mnt/fast/eng123/e2sync-t
 Copy to c1 `/mnt/models/vk/bin`. On c1: `LB_WGPU_DEVICE=discrete:N ./bin/kernel_parity dump out.bin`; `NP=1 ./c1_agree.sh label N 3072`;
 `./c1_short.sh label N 3072` (E2 profile); `./c1_trace.sh label N 3072` (launch trace). Knobs added: `LB_NO_PREFAULT=1`, `LB_NO_BORROW=1` (back to the host copy),
 `--features vulkan` (SPIR-V). Result files named in the text live under the two results folders above.
+
+## 10. Phase 2 (2026-11-15, same branch): what the two unexplained numbers were, the changes, multi-adapter, the gate
+
+All [measured] on c1 unless marked. Raw: `/mnt/fast/eng123/vulkan-results/phase2/` (`phase2.jsonl`, `c1-results/`), on c1 `/mnt/models/vk/results/`.
+Teacher-forced decode against the CUDA all-resident reference `tf-ref.bin` (prompt 1 = 322 positions unless "5 prompts" = 1590).
+
+### 10.1 The two unexplained numbers
+
+**~5 GB of pool slack = a live seat.** `granite-3b-c1` (llama.cpp, Vulkan1 = WX 5100) holds 4304 MiB of the WX 5100 all the time. On the card with the
+seat stopped, 24B + cache 3072 MiB uses 4270 MiB: dense 751 + cache 3068 = 3819, so the real slack is about 450 MiB (RX 570, nothing on it: 2612 used
+for 751 + 1498 = 2249, slack 363 MiB). Sharing the card pushed 1.26 GB into GTT (system memory) at cache 3072: the slot buffers the kernels read
+were partly in host memory (`expert_down` 19 ms a layer on the shared card against 0.23 ms at cache 1024).
+
+**15 ms a miss in the model vs 3.3 ms isolated = c1's NUMA node 1 memory.** `stream`-style tests on c1: a `dd` of the GGUF from the page cache ran at
+0.7-1.2 GB/s although `fincore` said the whole file was resident; a memcpy of 1.77 MB chunks from anonymous memory was 0.31-0.36 GB/s on node 1 and 7
+GB/s on node 0; tmpfs pages written and read on node 1: 327 MB/s read against 5.2 GB/s on node 0; a GPU DMA from imported node-1 memory 0.30 GB/s against 4.2
+GB/s from node 0 (all three cards the same). EDAC `mc1` shows 311,151 corrected errors (not rising during the test); the cause is hardware (DIMM or channel on
+socket 1), not the kernel. A third of the GGUF page cache sat on node 1, so every third expert copy ran at 0.3 GB/s (17 ms for 5.3 MB), and the staging
+memory the GPU drivers allocate for the process landed there too. The isolated benches had run with warm CPU caches. Fix without code: `fadvise(DONTNEED)` the file, re-read it
+with `numactl --membind=0`, and run the engine under `numactl --cpunodebind=0 --membind=0` (the same on the card side: the WX 5100 and RX 570 hang off node 1's root
+complex, the 6700 XT off node 0, and GPU DMA from node 0 is fine through the link between the sockets). RX 570, cache 1500: **1.61 -> 3.56 tok/s** from this alone.
+Report to the operator: c1 socket 1's memory needs a look (reseat or replace DIMMs, `edac-util`); until then nothing big should live on node 1.
+
+### 10.2 Changes, each with before/after (24B Q4_0, RX 570 cache 1500 MiB, node 0, prompt 1, 322 positions)
+
+| change | tok/s | switch |
+|---|---|---|
+| base (phase-1 binary + node 0) | 3.95 | |
+| caller-side `poll(Wait)` for read-back and sync | 4.09 | `CUBECL_WGPU_POLL_CALLER=1` |
+| upload ring (persistent mapped staging, `copy_buffer_to_buffer` in the stream's encoder, no submit before a write), 1 copy thread | 4.03 | `CUBECL_WGPU_RING_MB=64` |
+| ring + 4 copy threads | 5.34 | `+ CUBECL_WGPU_RING_THREADS=4` |
+| ring + 4 threads + caller poll | 5.38 | all three |
+| E2 router split over 64 cubes (was a single cube in the E2 layer), RX 570 | 5.09 -> 5.36 | `LB_DD_FAST=0` turns it off |
+| same router split on RDNA (plane range 32..64), 6700 XT 2 cards | 14.18 -> 16.25 | default on, `LB_ROUTER_SPLIT_ANY=0` off |
+
+Parity unchanged by every row: 322/322, max logit diff 1.764e-5 (WX 5100 / RX 570), 1.812e-5 (6700 XT), identical KLD to the digit; the RDNA router row also over 5 prompts
+(1590/1590, 2.861e-5, KLD 1.742e-12 with and without). The ring is a vendored patch of `cubecl-wgpu` 0.11.2 (`vendor/cubecl-wgpu`, `PATCH_NOTES.md`, one file) with
+everything off by default; the switches are env vars read at stream creation.
+
+What each result says. Write path: the ring removes wgpu's per-write staging allocation but the host `memcpy` is the limit: one thread copies the 1.77 MB matrices from the page cache into the
+write-combined upload memory at 1.0-2.7 GB/s (non-temporal stores did not help), 4 threads 4.0 GB/s, 8 threads 4.1 GB/s, so a miss is ~1.3 ms of copy instead of 4-5. **Not several GB/s without a
+host copy**: the copy-free path exists and was measured (`scripts/c1-vulkan/vkimp.c`): `VK_EXT_external_memory_host` import of an anonymous host allocation and a GPU `vkCmdCopyBuffer` out of it
+move 5.3 MB in 1.25 ms (4.2 GB/s, no CPU copy, same on all three cards, node-0 memory) but a **file mapping cannot be imported** (`VK_ERROR_INVALID_EXTERNAL_HANDLE`, shared or private), so it needs the
+expert bytes copied once into an anonymous arena at load (13.6 GB RAM) and a hal-level buffer import in the vendored crate: designed, not built. Read-back: the 0.35-0.5 ms is **not** thread wake-ups: caller-side poll moves
+the per-layer read from 582 to 578 us p50 (`sync_floor`); the time is the submit and fence of RADV (single launch + wait floor 0.15 ms best case). SPIR-V (`vulkan` feature) cuts the sync about a
+third (phase 1) but **the full engine segfaults inside `libvulkan_radeon` (ACO) while compiling a compute pipeline** on both RX 570 and RX 6700 XT (Mesa 26.2.6; last kernel compiled varies:
+`sum_add_rms_norm_ord`, `weighted_sum`; `MESA_SHADER_CACHE_DISABLE` and `RADV_DEBUG=nocache` no change), so WGSL stays the default; worth an upstream Mesa report.
+
+Free-card check, WX 5100, cache 3072 (phase 1 measured 0.83 here with the seat running): phase-1 binary unbound 5.35, node 0 4.99, phase-2 binary node 0 **6.97** tok/s, parity 322/322, 1.764e-5.
+
+### 10.3 Multi-adapter (what "wgpu opens one adapter per process" really was)
+
+It does not: CubeCL registers a client per `WgpuDevice`, and two `DiscreteGpu(n)` in one process work. What was missing was the engine seam. Now: `LB_WGPU_DEVICE` and the in-box placement take `name:<text>` (case-insensitive substring,
+`#K` for the Kth match), `bus:<pci id>` (`0000:21:00.0`) or `discrete:N`; `lb_ternary_gpu::list_adapters` / `resolve_discrete`, `Gpu::open_wgpu(spec)`; `inbox.rs` opens `gpu://name:...` / `gpu://bus:...` cards on
+the wgpu runtime and refuses a card that is the trunk's own adapter. The in-box design (whole MoE layers on another card, activation card to card, nothing read mid-token) is the CUDA W3e code unchanged; on wgpu the
+card-to-card copy goes **through the host** (no device transport: cubecl `to_client` = read + write, 2 per in-box layer).
+
+24B Q4_0, all experts resident, `--whole-layers`, trunk RX 6700 XT (dense + 26 layers, budget 9000 MB), layers 28-39 on the WX 5100 (3888 MiB), no cache, node 0:
+
+| cards | placement | tok/s (teacher-forced, prompt 1) | top-1 | max logit diff |
+|---|---|---|---|---|
+| 6700 XT alone, E2 cache 6500 MiB (a 7000 MiB bank passes wgpu's 2 GiB buffer limit and fails) | | 6.61 (phase-1 binary, unbound) -> **12.65** | 322/322 | 1.812e-5 |
+| 6700 XT + WX 5100 | 26 + 12 layers | 14.18 -> **16.4** (router split on RDNA) | 322/322 | 1.818e-5 |
+| 6700 XT + WX 5100 + RX 570 | 22 + 11 + 6 layers | 14.1 | 322/322 | 1.907e-5 |
+| 6700 XT 10200 MB + WX 5100 (8 layers) | 30 + 8 | 10.2 (slower: the trunk is full, VRAM pressure) | 322/322 | 1.907e-5 |
+
+Two cards, five prompts: **1590/1590 top-1, max logit diff 2.861e-5, mean KLD 1.742e-12**, 16.4-16.9 tok/s each. Server (`lemonade-burn-server`, 3 prompts x 96 greedy tokens, temperature 0): **18.3 / 19.8 / 18.6 tok/s**, and the text
+sha is identical between the two-card config, a re-run, and the single-card E2 config (10 tok/s there before the RDNA router fix). Greedy identity against CUDA follows from the teacher-forced result: every position's argmax equals the CUDA
+reference's, so a free-running greedy decode from the same prompt follows the reference token for token. Cards were picked by name and by PCI bus in separate runs (identical result). VRAM with the 2-card server: 10163 MiB on the 6700 XT, 4343 on the WX 5100.
+
+Kernel parity of the three cards against the saved P100 dump, picked by name: max |diff| 2.93e-3 (6700 XT), 3.17e-3 (WX 5100, RX 570) on the expert-FFN output of magnitude 1.4e4 (relative 2e-7), Q4 7.6e-6 on 55, route ids identical.
+
+### 10.4 Gate
+
+On c1, 24B, cache that fits (6500 MiB on the 6700 XT): **12.65 tok/s** teacher-forced (gate 10, today's 0.83 was a shared WX 5100: 15x), parity intact. Two cards all resident: 16.4 tok/s teacher-forced, **18-20 served** against the 25-40 estimate of section 7:
+the estimate was for one card holding everything with no hop; what is left is 12 layers x 2 host round trips (~0.5 ms each) and the trunk's own launches (68 ms a token before the router fix in the launch trace: 288 launches, 41 ms of device time).
+What limits it: the host hop between cards (wgpu cannot share memory across devices), RADV submit/fence latency (~0.15-0.4 ms a sync), and 2 GiB per-buffer limit on the cache bank. A contiguous layer range per card (pipeline split, the CUDA prefill-card design) would cut the hops to one pair a token.
+Not measured: the MI25 (not installed during this job).
+
+### 10.5 MI25
+
+The card was not in the box (`lspci` no 1002:6860, no operator notice on Buzz by 22:20Z). `scripts/c1-vulkan/mi25_check.sh` is updated (opens by `name:VEGA10`, binaries from `bin2`, numactl node 0) and the binaries are on c1.
+When it is in: run it, then the 2-card placement with `gpu://bus:<its bus>` as the second card and the trunk on the 6700 XT. Temperature log still every 10 s, stop above 85 C edge. Expect: Vega 10 = gfx900, subgroup 64 (router split applies), no int dot.
+
+### 10.6 What remains
+
+1. Copy-free expert upload (anonymous arena + `VK_EXT_external_memory_host`, 4.2 GB/s DMA, ~1.3 ms a miss, off the device thread). 2. Layer-range pipeline split across cards (fewer hops). 3. A Mesa/RADV bug report for the ACO crash so SPIR-V can become the default. 4. c1 socket 1 memory. 5. Q4_K/Q5_K kernels for models other than LFM2 (section 6 #7). 6. The 2 GiB buffer limit: split the slot bank into several buffers for caches above ~6.9 GB.

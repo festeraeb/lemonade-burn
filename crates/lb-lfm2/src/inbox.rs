@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// One expert card of this process.
 pub struct Card {
     pub name: String,
-    /// CUDA device index in this process.
+    /// CUDA device index in this process (the position in the placement for a Vulkan adapter).
     pub index: usize,
     pub gpu: Gpu,
     pub layers: HashMap<usize, GpuExpertLayer>,
@@ -103,15 +103,24 @@ impl InBox {
             want[first as usize].push(l);
         }
         let mut cards = Vec::new();
+        // the trunk's own wgpu adapter, to refuse a card that is the trunk
+        let trunk_wgpu = std::env::var("LB_WGPU_DEVICE").ok().and_then(|s| lb_q4_gpu::resolve_discrete(&s).ok());
         for (h, spec) in map.hosts.iter().enumerate() {
-            let index: usize = spec.addr["gpu://".len()..].trim_end_matches('/').parse().map_err(|_| format!("host {}: {} is not gpu://<index>", spec.name, spec.addr))?;
-            if Some(index) == trunk_index {
+            let target = spec.addr["gpu://".len()..].trim_end_matches('/');
+            // `gpu://N` is a CUDA device (cuda build); `gpu://name:WX 5100`, `gpu://bus:0000:21:00.0`
+            // and `gpu://discrete:N` are Vulkan adapters picked through the wgpu runtime
+            let wgpu_spec = target.starts_with("name:") || target.starts_with("bus:") || target.starts_with("discrete:");
+            let index: usize = if wgpu_spec { h } else { target.parse().map_err(|_| format!("host {}: {} is not gpu://<cuda index> or gpu://name:|bus:|discrete:<spec>", spec.name, spec.addr))? };
+            if !wgpu_spec && Some(index) == trunk_index {
                 return Err(format!("host {}: gpu://{index} is the trunk's own card", spec.name));
             }
             if want[h].is_empty() {
                 continue;
             }
-            let gpu = open_card(index)?;
+            if wgpu_spec && trunk_wgpu.is_some() && lb_q4_gpu::resolve_discrete(target).ok() == trunk_wgpu {
+                return Err(format!("host {}: {} is the trunk's own card (LB_WGPU_DEVICE)", spec.name, spec.addr));
+            }
+            let gpu = if wgpu_spec { Gpu::open_wgpu(target)? } else { open_card(index)? };
             let t = std::time::Instant::now();
             let (mut layers, mut views, mut routers, mut bytes) = (HashMap::new(), HashMap::new(), HashMap::new(), 0usize);
             for &l in &want[h] {
@@ -129,7 +138,7 @@ impl InBox {
             let weights = gpu.upload_f32(&vec![0f32; n_slots.max(1)]);
             gpu.sync()?;
             eprintln!(
-                "lb-lfm2 w2w in-box: card {} = CUDA device {index} ({}): {} whole MoE layers, {:.0} MiB, in {:.1}s; card-to-card copies {}",
+                "lb-lfm2 w2w in-box: card {} = device {target} ({}): {} whole MoE layers, {:.0} MiB, in {:.1}s; card-to-card copies {}",
                 spec.name,
                 gpu.name,
                 layers.len(),

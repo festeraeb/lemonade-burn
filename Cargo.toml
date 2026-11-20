@@ -41,3 +41,7 @@ debug = 1
 
 [profile.bench]
 inherits = "release"
+
+# Small vendored patch (see vendor/cubecl-wgpu/PATCH_NOTES.md for what to upstream).
+[patch.crates-io]
+cubecl-wgpu = { path = "vendor/cubecl-wgpu" }

@@ -57,6 +57,9 @@ pub struct Lfm2 {
     /// Matrices replaced by factorised sub-1-bit layers (`attach_littlebit`), keyed by the GGUF
     /// offset of the matrix they replace (`MatRef::start`).
     pub littlebit: std::collections::HashMap<usize, Arc<lb_littlebit::Linear>>,
+    /// Device copies of `littlebit` (`littlebit_to_device`), same keys.
+    #[cfg(feature = "gpu")]
+    pub littlebit_dev: std::collections::HashMap<usize, lb_q4_gpu::littlebit::GpuLittleBit>,
 }
 
 /// One layer of one forward pass, captured on the host path for `m` tokens at `pos0..`.
@@ -181,6 +184,8 @@ impl Lfm2 {
             capture_on: AtomicBool::new(false),
             capture: std::sync::Mutex::new(Vec::new()),
             littlebit: std::collections::HashMap::new(),
+            #[cfg(feature = "gpu")]
+            littlebit_dev: std::collections::HashMap::new(),
         })
     }
 
@@ -457,8 +462,37 @@ impl Lfm2 {
         Ok(self.littlebit.len())
     }
 
+    /// Upload every attached LittleBit layer to the GPU (`LB_CUDA_DEVICE` / `LB_WGPU_DEVICE`), opening
+    /// it if no other store has. Layers the device kernels cannot take stay on the CPU. Returns
+    /// (uploaded, bytes on the device).
+    #[cfg(feature = "gpu")]
+    pub fn littlebit_to_device(&mut self) -> Result<(usize, usize), String> {
+        if self.store.gpu.is_none() {
+            self.store.gpu = Some(crate::moe::ExpertStore::open_gpu(&self.w)?);
+        }
+        let gpu = self.store.gpu.as_ref().unwrap();
+        let mut bytes = 0;
+        for (k, l) in &self.littlebit {
+            match lb_q4_gpu::littlebit::GpuLittleBit::upload(gpu, l) {
+                Ok(d) => {
+                    bytes += d.bytes_on_device();
+                    self.littlebit_dev.insert(*k, d);
+                }
+                Err(e) => eprintln!("littlebit: [{}, {}] stays on the CPU: {e}", l.out, l.inp),
+            }
+        }
+        Ok((self.littlebit_dev.len(), bytes))
+    }
+
     /// The matmul itself, on whichever side holds the weights.
     fn linear_vec(&self, xv: &[f32], w: &MatRef, m: usize) -> Vec<f32> {
+        #[cfg(feature = "gpu")]
+        if let (Some(gpu), Some(d)) = (self.store.gpu.as_ref(), self.littlebit_dev.get(&w.start)) {
+            match d.matvec(gpu, xv, m) {
+                Ok(v) => return v,
+                Err(e) => eprintln!("littlebit on device failed for [{}, {}]: {e}; using the CPU path", w.rows, w.cols),
+            }
+        }
         if let Some(l) = self.littlebit.get(&w.start) {
             return l.forward(xv, m);
         }

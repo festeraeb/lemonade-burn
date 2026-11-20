@@ -28,6 +28,9 @@ struct Args {
     greedy_prompt: String,
     #[arg(long, default_value_t = 32)]
     greedy_n: usize,
+    /// Run the LittleBit layers on the GPU (build with --features gpu / cuda).
+    #[arg(long, default_value_t = false)]
+    gpu: bool,
 }
 
 fn rows(t: Tensor<2>) -> (usize, Vec<f32>) {
@@ -80,6 +83,17 @@ fn main() -> Result<()> {
 
     let mut lbm = Lfm2::load(&a.model, &device)?;
     let n = lbm.attach_littlebit(&a.sidecar)?;
+    let mut where_ = "CPU reference kernels";
+    if a.gpu {
+        #[cfg(feature = "gpu")]
+        {
+            let (k, b) = lbm.littlebit_to_device().map_err(|e| anyhow::anyhow!(e))?;
+            eprintln!("littlebit: {k} layers on the device ({:.1} MiB)", b as f64 / 1048576.0);
+            where_ = "littlebit layers on the GPU, the rest on the CPU";
+        }
+        #[cfg(not(feature = "gpu"))]
+        anyhow::bail!("--gpu needs the gpu feature");
+    }
     let (_, lb_lb, t_lb) = run(&lbm);
     let g_lb = greedy(&lbm, &tok, &a.greedy_prompt, a.greedy_n)?;
 
@@ -100,7 +114,7 @@ fn main() -> Result<()> {
     println!("sidecar {} ({} matrices replaced), {} tokens teacher-forced", a.sidecar.display(), n, ids.len());
     println!("perplexity: original {:.2}  littlebit {:.2}", (nll_b / p).exp(), (nll_l / p).exp());
     println!("mean KL(original || littlebit) {:.4} nats; top-1 agreement {:.1}%", kld / p, 100.0 * agree as f64 / p);
-    println!("prompt pass: original {:.2} s, littlebit {:.2} s (CPU reference kernels)", t_base, t_lb);
+    println!("prompt pass: original {:.2} s (CPU), littlebit {:.2} s ({where_})", t_base, t_lb);
     println!("greedy original : {}", g_base.replace('\n', " "));
     println!("greedy littlebit: {}", g_lb.replace('\n', " "));
     Ok(())
