@@ -339,6 +339,11 @@ pub struct ExpertStore {
     /// MoE layers; the device decode keeps the activation on the device for these.
     #[cfg(feature = "gpu")]
     pub inbox: Option<crate::inbox::InBox>,
+    /// Experts replaced by factorised sub-1-bit layers (`Lfm2::attach_littlebit`), keyed by
+    /// (layer, expert): the hybrid where cold experts are LittleBit and hot ones stay as loaded.
+    pub littlebit: HashMap<(usize, usize), LbExpert>,
+    /// Expert-token calls served by `littlebit` (each routed (token, expert) pair counts once).
+    pub littlebit_calls: std::sync::atomic::AtomicU64,
 }
 
 impl ExpertStore {
@@ -469,6 +474,38 @@ pub fn expert_layers_enabled() -> bool {
     })
 }
 
+/// One expert in the LittleBit representation, with optional device copies.
+pub struct LbExpert {
+    pub gate: std::sync::Arc<lb_littlebit::Linear>,
+    pub up: std::sync::Arc<lb_littlebit::Linear>,
+    pub down: std::sync::Arc<lb_littlebit::Linear>,
+    #[cfg(feature = "gpu")]
+    pub dev: Option<[lb_q4_gpu::littlebit::GpuLittleBit; 3]>,
+}
+
+impl LbExpert {
+    /// `down(silu(gate x) * up x)` for `m` rows of `x`, on the device when it has copies.
+    pub fn ffn(&self, store: &ExpertStore, x: &[f32], m: usize) -> Vec<f32> {
+        #[cfg(feature = "gpu")]
+        if let (Some(gpu), Some([g, u, d])) = (store.gpu.as_ref(), self.dev.as_ref()) {
+            let run = || -> Result<Vec<f32>, String> {
+                let (gv, uv) = (g.matvec(gpu, x, m)?, u.matvec(gpu, x, m)?);
+                let h: Vec<f32> = gv.iter().zip(&uv).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
+                d.matvec(gpu, &h, m)
+            };
+            match run() {
+                Ok(y) => return y,
+                Err(e) => eprintln!("littlebit expert on device failed: {e}; using the CPU path"),
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        let _ = store;
+        let (gv, uv) = (self.gate.forward(x, m), self.up.forward(x, m));
+        let h: Vec<f32> = gv.iter().zip(&uv).map(|(a, b)| a / (1.0 + (-a).exp()) * b).collect();
+        self.down.forward(&h, m)
+    }
+}
+
 /// Executes an expert FFN for a batch of tokens. One SwiGLU expert:
 /// `down(silu(gate x) * up x)`. `x` is `m` rows of `n_embd`; returns `m` rows of `n_embd`.
 pub fn expert_ffn(w: &Weights, gate: &ExpertMats, up: &ExpertMats, down: &ExpertMats, e: usize, x: &[f32], m: usize) -> Vec<f32> {
@@ -580,10 +617,24 @@ pub fn moe_ffn_with(
     // Work-to-weights: experts the placement puts on hosts are computed there. What comes back
     // is each expert's unweighted output; what a host did not answer stays in `experts` and
     // runs below as if there were no hosts. The sum at the end is over both, ascending id.
-    let remote_parts: Vec<(usize, Vec<(usize, f32)>, Vec<f32>)> = match store.remote.as_ref() {
+    let mut remote_parts: Vec<(usize, Vec<(usize, f32)>, Vec<f32>)> = match store.remote.as_ref() {
         Some(rt) => rt.serve_layer(layer, &mut experts, x, m),
         None => Vec::new(),
     };
+    // the hybrid: experts held as LittleBit layers run here, the rest below as loaded
+    if !store.littlebit.is_empty() {
+        let (lb, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut experts).into_iter().partition(|(e, _)| store.littlebit.contains_key(&(layer, *e)));
+        experts = rest;
+        for (e, toks) in lb {
+            let mut xs = Vec::with_capacity(toks.len() * n_embd);
+            for (t, _) in &toks {
+                xs.extend_from_slice(&x[t * n_embd..(t + 1) * n_embd]);
+            }
+            store.littlebit_calls.fetch_add(toks.len() as u64, Ordering::Relaxed);
+            let y = store.littlebit[&(layer, e)].ffn(store, &xs, toks.len());
+            remote_parts.push((e, toks, y));
+        }
+    }
     // ascending expert id: the sum is the same whatever served each expert
     let sum_parts = |mut parts: Vec<(usize, Vec<(usize, f32)>, Vec<f32>)>| -> Vec<f32> {
         parts.sort_by_key(|(e, _, _)| *e);

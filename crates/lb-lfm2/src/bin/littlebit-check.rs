@@ -111,7 +111,13 @@ fn main() -> Result<()> {
         agree += (ab == al) as usize;
     }
     let p = pos as f64;
-    println!("sidecar {} ({} matrices replaced), {} tokens teacher-forced", a.sidecar.display(), n, ids.len());
+    println!("sidecar {} ({} matrices replaced, {} of them in {} experts), {} tokens teacher-forced", a.sidecar.display(), n, 3 * lbm.store.littlebit.len(), lbm.store.littlebit.len(), ids.len());
+    let calls = lbm.store.littlebit_calls.load(std::sync::atomic::Ordering::Relaxed);
+    if calls > 0 {
+        let c = lbm.cfg();
+        let routed = (ids.len() as u64 + 2 * a.greedy_n as u64) * (c.n_layer - c.n_dense_lead) as u64 * c.n_expert_used as u64;
+        println!("expert-token calls served by LittleBit experts: {calls} of ~{routed} ({:.1}%)", 100.0 * calls as f64 / routed as f64);
+    }
     println!("perplexity: original {:.2}  littlebit {:.2}", (nll_b / p).exp(), (nll_l / p).exp());
     println!("mean KL(original || littlebit) {:.4} nats; top-1 agreement {:.1}%", kld / p, 100.0 * agree as f64 / p);
     println!("prompt pass: original {:.2} s (CPU), littlebit {:.2} s ({where_})", t_base, t_lb);

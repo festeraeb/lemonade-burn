@@ -453,13 +453,41 @@ impl Lfm2 {
     /// factorised layers. Returns how many were attached. Every name must exist with the same shape.
     pub fn attach_littlebit(&mut self, path: &Path) -> Result<usize> {
         let layers = lb_littlebit::sidecar::read(path)?;
-        let g = &self.w.gguf;
+        let g = self.w.gguf.clone();
+        // per-expert entries are named `<stacked tensor>#e<id>`: blk.N.ffn_{gate,up,down}_exps.weight#e17
+        let mut parts: std::collections::HashMap<(usize, usize), [Option<Arc<lb_littlebit::Linear>>; 3]> = Default::default();
         for (name, l) in layers {
+            if let Some((base, e)) = name.split_once("#e") {
+                let e: usize = e.parse().with_context(|| format!("littlebit: bad expert id in {name}"))?;
+                let t = g.tensor(base).with_context(|| format!("littlebit: {base} is not in the GGUF"))?;
+                anyhow::ensure!(t.dims.len() == 3 && t.dims[0] == l.inp && t.dims[1] == l.out && e < t.dims[2], "littlebit: {name} is [{}, {}], GGUF dims {:?}", l.out, l.inp, t.dims);
+                let layer: usize = base.strip_prefix("blk.").and_then(|r| r.split('.').next()).and_then(|v| v.parse().ok()).with_context(|| format!("littlebit: no layer in {base}"))?;
+                let slot = if base.ends_with("ffn_gate_exps.weight") { 0 } else if base.ends_with("ffn_up_exps.weight") { 1 } else if base.ends_with("ffn_down_exps.weight") { 2 } else { anyhow::bail!("littlebit: {base} is not an expert projection") };
+                parts.entry((layer, e)).or_default()[slot] = Some(Arc::new(l));
+                continue;
+            }
             let t = g.tensor(&name).with_context(|| format!("littlebit: {name} is not in the GGUF"))?;
             anyhow::ensure!(t.dims.len() == 2 && t.dims[0] == l.inp && t.dims[1] == l.out, "littlebit: {name} is [{}, {}] in the sidecar, dims {:?} in the GGUF", l.out, l.inp, t.dims);
             self.littlebit.insert(t.offset, Arc::new(l));
         }
-        Ok(self.littlebit.len())
+        for ((layer, e), [gt, up, dn]) in parts {
+            match (gt, up, dn) {
+                (Some(gate), Some(up), Some(down)) => {
+                    self.store.littlebit.insert(
+                        (layer, e),
+                        crate::moe::LbExpert {
+                            gate,
+                            up,
+                            down,
+                            #[cfg(feature = "gpu")]
+                            dev: None,
+                        },
+                    );
+                }
+                _ => anyhow::bail!("littlebit: expert {e} of layer {layer} lacks one of gate/up/down"),
+            }
+        }
+        Ok(self.littlebit.len() + 3 * self.store.littlebit.len())
     }
 
     /// Upload every attached LittleBit layer to the GPU (`LB_CUDA_DEVICE` / `LB_WGPU_DEVICE`), opening
@@ -481,7 +509,24 @@ impl Lfm2 {
                 Err(e) => eprintln!("littlebit: [{}, {}] stays on the CPU: {e}", l.out, l.inp),
             }
         }
-        Ok((self.littlebit_dev.len(), bytes))
+        let mut n = self.littlebit_dev.len();
+        let gpu = self.store.gpu.as_ref().unwrap();
+        let mut devs = Vec::new();
+        for (k, ex) in &self.store.littlebit {
+            let up = |l: &lb_littlebit::Linear| lb_q4_gpu::littlebit::GpuLittleBit::upload(gpu, l);
+            match (up(&ex.gate), up(&ex.up), up(&ex.down)) {
+                (Ok(a), Ok(b), Ok(c)) => {
+                    bytes += a.bytes_on_device() + b.bytes_on_device() + c.bytes_on_device();
+                    devs.push((*k, [a, b, c]));
+                    n += 3;
+                }
+                _ => eprintln!("littlebit: expert {k:?} stays on the CPU"),
+            }
+        }
+        for (k, d) in devs {
+            self.store.littlebit.get_mut(&k).unwrap().dev = Some(d);
+        }
+        Ok((n, bytes))
     }
 
     /// The matmul itself, on whichever side holds the weights.
