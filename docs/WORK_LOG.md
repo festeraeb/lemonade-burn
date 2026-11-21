@@ -15,6 +15,61 @@ micro-numbers on any GPU host.
 
 ---
 
+## MiMo-V2.6-Flash and DeepSeek V4.1 Flash: CPU groundwork **[2026-11-21, branch fable/engine-mimo-deepseek-2026-11-21]**
+
+CPU only on t440 (host load 60-95 on 48 cores during every run, so no timing here means anything). Facts:
+`docs/MODEL_MIMO2.md`, `docs/MODEL_DEEPSEEK4.md`; device plan and byte tables: `docs/FLEET_MODELS_NEXT.md`. Scripts,
+logs and reference dumps: `/mnt/fast/lb-models-ref/` (MiMo) and `/mnt/fast/deepseek41-port/ref_short` (DeepSeek, llama.cpp
+CPU dumps made 2026-11-12 with the same eval-callback tool).
+
+**Quant parity (gate passed).** `cargo run --release -p lb-gguf --example ggml_ref_check -- <libggml-base.so> <model> 2048 12`
+dequantises 2048 rows of 12 tensors per type with lb-gguf and with llama.cpp's own `to_float` (loaded at run time) and
+compares bit patterns: MiMo (fleet build 20261112-nautiburn-scrape-v7) F32, Q8_0, Q2_K, MXFP4; DeepSeek (llama-v8) F32,
+BF16, Q8_0, Q5_K, IQ1_M, IQ2_XS, IQ2_XXS, IQ4_NL: **0 mismatches** (`docs/models-facts/parity-*-2048.jsonl`). New type:
+MXFP4. Everything else the two files use already existed.
+
+**The finding that matters for every parity check against llama.cpp CPU:** ggml's CPU matmul rounds the f32 activation to
+the weight's `vec_dot_type` (Q8_K blocks of 256 for k/i-quants, Q8_0 blocks of 32 for Q8_0/MXFP4/IQ4_NL, BF16 for BF16)
+before the dot. With an outlier in a block the other values lose most of their bits, so an exact-f32 reference differs
+from llama.cpp by up to 48% on a MiMo MoE output (layer 3, token 2) even with identical inputs and experts.
+`lb_gguf::act::act_round` reproduces the rounding; both new crates use it by default (`LB_MIMO_ACT_EMU`, `LB_DS4_ACT_EMU`).
+
+**MiMo (`crates/lb-mimo2`, prompt "The capital of France is" = [785, 6722, 315, 9625, 374], tokenizer ids identical):**
+- Isolated sublayers (`mimo2-check --isolate`, llama.cpp's own inputs): attention + `attn_output` 5e-7..6e-5 rel L2,
+  router logits 1e-6, expert outputs 2e-7..3e-5 (layers 0, 1, 3, 5, 6).
+- Full chain (`mimo2-check --ref-dir mimo2-short`), l_out max rel L2 over tokens: L0 1.0e-4, L1 5.3e-4, L2 7.3e-4,
+  L3 1.8e-3, L4 4.6e-3, L5 5.0e-3; L6 0.117 (token 0 picks 2 different experts of 8 on a router near-tie), L7-L46
+  0.064-0.26 (worst 0.26 at L8); 77 of the 235 (token, MoE layer) expert sets differ, all from L6 on. Final logits rel L2 2.3e-2; top-1
+  identical (264 " a"), same top-5 set (order of ranks 2-4 differs; logit gaps < 0.1).
+- Why the chain grows while each sublayer matches: the Q8 activation rounding is discontinuous, so a 1e-6 input
+  difference flips a few rounding decisions and comes out 40-65x larger (L0: ffn_norm 4.5e-6 -> ffn_out 1.9e-4); a
+  router near-tie then switches experts. Rounding Q or the softmax weights to f16 made isolated attention worse
+  (2e-5 -> 5e-5..1e-3), so llama.cpp's non-flash path does not do that; K/V are rounded to f16 (cache type).
+- Greedy, 32 tokens (`mimo2-check --gen 32`): " a city of romance, art, and history. It is a city that has inspired
+  countless artists, writers, and musicians. Paris is a city that is full". llama.cpp (llama-v8 `llama-completion`,
+  `--temp 0 --top-k 1`, CPU): " a city of romance, art, and history. It is a city that has inspired writers ...".
+  **Identical for the first 16 generated tokens; token 17 differs** (" countless" vs " writers"). It is a near-tie:
+  re-reading the same 21 tokens as one prefill, our top-2 are " writers" 19.867 and " countless" 19.771 (gap 0.096
+  logits; then " many" 19.665, " artists" 19.599), i.e. our own batch-vs-step order already flips it. The fleet v7
+  llama-server could not serve the reference on CPU (read 96 GB from disk for the first prompt token, 0.01 tok/s;
+  killed); llama-completion ran at ~2-5 min a token (MADV_RANDOM page faults under `--numa distribute`) and was
+  stopped after token 18. Not exercised: sequences past the 128-token sliding window (too slow on this host).
+
+**DeepSeek V4.1 (`crates/lb-deepseek4`, [671, 6102, 294, 8760, 344]):**
+- Isolated (`ds4-check --isolate`): router logits 8e-7..1e-6, shared expert 2e-6 (7e-4 at L0), routed MoE 2e-6..3.7e-4,
+  grouped output projection from llama's `attn_derope` 1.6e-4..3.1e-4 (layers 0, 1, 3, 10, 30).
+- Full chain l_out (4-stream state) rel L2: L0 3.5e-3, L1 1.0e-2, L2 1.8e-2, L3 2.4e-2, L4 3.1e-2, L5 0.12 (first expert
+  flip), then 0.16-0.37 (108 of the 200 (token, layer) expert sets differ, all from L5 on); final logits rel 0.29; top-1 identical (11111 " Paris"), top-3 identical in order
+  (11111, 51119, 671), ranks 4-5 differ. For scale: llama.cpp CPU vs llama.cpp CUDA on this prompt give p(" Paris")
+  0.78 vs 0.575 (memory deepseek41-nauti-strata-seat), so the reference itself moves this much between backends at
+  IQ1_M/IQ2 expert precision.
+- Greedy: `ds4-check --gen 12 --expect <llama.cpp ids>` gives [11111, 16, 455, 446, 4280, 317, 36788, 344, 295, 11111,
+  16, 1] = " Paris. The Eiffel Tower is in Paris.<｜end▁of▁sentence｜>": **identical to llama.cpp's greedy ids for all 12
+  tokens** (llama.cpp stopped at EOS at 12, so 12 is all there is to compare on this prompt). ~20-45 s a token on the
+  loaded host.
+- Not implemented (refuses > 128 tokens): sliding window, lightning indexer, candidate blocks.
+
+
 ## Measure on c2, not t440 **[changed 2026-11-01 — read this first]**
 
 **Measurement moved to c2.** The operator freed it for exactly this. Everything below

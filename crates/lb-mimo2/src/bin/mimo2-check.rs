@@ -136,6 +136,12 @@ fn main() -> Result<()> {
     let first: Vec<u32> = prompt.iter().chain(&generated).cloned().collect();
     let logits = model.forward(&first, &mut cache, if a.ref_dir.is_some() && generated.is_empty() { Some(&mut taps) } else { None });
     eprintln!("prefill {} tokens: {:.1} s", first.len(), t0.elapsed().as_secs_f64());
+    {
+        let mut i: Vec<usize> = (0..logits.len()).collect();
+        i.sort_by(|&p, &q| logits[q].partial_cmp(&logits[p]).unwrap());
+        let top: Vec<(usize, f32, String)> = i[..5].iter().map(|&j| (j, logits[j], tokenizer::decode(&tk, &[j as u32]).unwrap_or_default())).collect();
+        println!("next-token top5 after prefill {top:?}");
+    }
 
     if let (Some(dir), true) = (&a.ref_dir, generated.is_empty()) {
         let m = prompt.len();
