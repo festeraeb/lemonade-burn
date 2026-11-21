@@ -1749,8 +1749,9 @@ impl GpuNativeExperts {
         let d_dn = gpu.const_u32(&[self.embd as u32, self.ff as u32]);
         // row-batched kernels need plane ops, a 32-lane plane, and (for the down pass) lane groups that divide the plane
         let rb = gpu.use_plane && gpu.plane_size.1 == 32 && std::env::var("LB_QW_ROWS1").is_err();
-        let gu_r: usize = std::env::var("LB_QW_GU_R").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
-        let dn_r: usize = std::env::var("LB_QW_DN_R").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        // env first (read at launch, so a sweep can change it in-process), else the card profile's value read at open, else 2 / 1
+        let gu_r: usize = std::env::var("LB_QW_GU_R").ok().and_then(|v| v.parse().ok()).unwrap_or(gpu.kq.gu_r);
+        let dn_r: usize = std::env::var("LB_QW_DN_R").ok().and_then(|v| v.parse().ok()).unwrap_or(gpu.kq.dn_r);
         unsafe {
             match &self.gu {
                 NativeGateUp::Q5 { gw, uw, n } if rb && self.ff % 4 == 0 && std::env::var("LB_QW_NOGU").is_err() => q5n_routed_gate_up_rows4_kernel::launch(

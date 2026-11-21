@@ -128,12 +128,23 @@ pub struct KqTune {
     pub attn_split: bool,
     /// `LB_QW_ATTN_CUBES`: 256-unit cubes of the split scores kernel (rounded up to a multiple of the KV heads).
     pub attn_cubes: usize,
+    /// `LB_QW_GU_R`: rows (of gate and of up) a plane takes in the routed gate+up Q5_K kernel (default 2).
+    pub gu_r: usize,
+    /// `LB_QW_DN_R`: rows a lane group takes in the routed down kernels (Q5_K / Q6_K), sharing its activation loads (default 1). Each row's
+    /// arithmetic does not depend on it, so any value gives the same bits.
+    pub dn_r: usize,
 }
 
 impl KqTune {
     pub fn from_profile(p: &lb_card_profile::Resolved) -> Self {
         let on = |name: &str, default: bool| p.var(name).map(|v| { let v = v.trim(); !(v.is_empty() || v == "0" || v == "off") }).unwrap_or(default);
-        KqTune { q6_lg: on("LB_QW_Q6_LG", false), attn_split: on("LB_QW_ATTN_SPLIT", false), attn_cubes: p.parse("LB_QW_ATTN_CUBES").unwrap_or(112) }
+        KqTune {
+            q6_lg: on("LB_QW_Q6_LG", false),
+            attn_split: on("LB_QW_ATTN_SPLIT", false),
+            attn_cubes: p.parse("LB_QW_ATTN_CUBES").unwrap_or(112),
+            gu_r: p.parse::<usize>("LB_QW_GU_R").filter(|r| matches!(r, 1 | 2 | 4)).unwrap_or(2),
+            dn_r: p.parse::<usize>("LB_QW_DN_R").filter(|r| matches!(r, 1 | 2 | 4 | 8)).unwrap_or(1),
+        }
     }
 }
 
