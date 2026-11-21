@@ -1200,3 +1200,23 @@ Branch fable/engine-qwen35-mtp-2026-11-16 (1ee9df5 CPU loop, 339e92b device loop
 - New crate `lb-card-profile` + `docs/CARD_PROFILES.md`: per-card-family JSON profiles (match on CUDA cc / PCI id range / adapter name), env > profile > default, `lb-card-profile` bin and `lemonade-burn-server --print-card-profile`. The hard-coded Vega 10 128-row cap in `card_facts.rs::family_limits` is now the profile value `LB_PREFILL_MAX_ROWS`.
 - Found by running the report on c2: the name fragment "P100" matches "Quadro P1000"; the P100 profile now matches "Tesla P100" (unit test added).
 - Not benched: every card on t440, c4 and c2's T10 had a seat; c1's RX 570 and c2's P1000 were idle but have no measured profile values, and every profile value except one equals the code default. The exception is P100 `LB_QW_PREFILL_CHUNK=256` (the two c4 seats already set it by env, so their behaviour is unchanged; a P100 qwen35 run that set nothing now chunks at 256 instead of auto, which is slower on prompts when VRAM is not tight: 3.5 s vs 4.7 s for 1931 tokens in the c4 note). Override with `LB_QW_PREFILL_CHUNK=0`.
+
+## 2026-11-21: P100 kernel tuning of the qwen35 path (claude-t440-env1-p100)
+
+Branch `fable/engine-p100-kernels-2026-11-21`; write-up `docs/P100_KERNEL_TUNING.md`. c4 P100 3B + 86 (RTX 2060 3C for checks),
+Qwen3.6-35B-A3B Q5_K_M, `qwen35-dev-check bench2` (prefill + 256 greedy tokens, argmax on the device, token sha).
+* Where a token went (baseline): output head Q6_K 1675 us at 249 GB/s (half of each plane idle at 2048 columns), routed experts 87 us a
+  layer at 212 GB/s, and at ~4k context the one-token attention 818 us a layer (16 cubes for 56 SMs, every head re-reading its KV
+  head's K/V, serial output loop): decode 69.9 tok/s short, 44.6 at ~4.2k.
+* `LB_QW_ATTN_SPLIT` (three launches, same arithmetic, bit-identical): ~4.2k decode 44.6 -> 61.7 / 43.7 -> 61.8 tok/s.
+  `LB_QW_Q6_LG` (Q6_K lane groups, bit-identical): head 1675 -> 1093 us, short 69.8 -> 71.4. Both on in nvidia-p100.json and
+  nvidia-turing-sm75.json (RTX 2060: attention n=4096 532 -> 98 us, attn_q not slower); code defaults off.
+* Prefill chunk: the P100 profile's 256 predates the Q8 dedup; auto (1024 at 4k prompts) is 589/599 vs 417/434 tok/s and does not OOM
+  with Tiel Q5_K_XL on 2xP100 (the 11-16 failure case). Profile value dropped.
+* Not adopted: `LB_QW_DN_R=4` (microbench -16 %, end to end -4 %), `LB_QW_GU_R`, `LB_QW_R`, `LB_QW_SH_FUSE` (bit-identical fused shared
+  expert, no measurable gain). The "3.4 ms" between the parts sum and a token is in the graphs (untimed glue kernels, cold L2), host
+  hand-over is 0.5 ms.
+* GPU suites before/after identical (one pre-existing 1-ulp failure in prefill_kernels_match_decode in both); new
+  `tests/p100_variants_bitwise.rs` passes on the P100 and the RTX 2060. Bundle `/mnt/raid0/engines/lemonade-burn/20261121-qwen35-p100-d63c182/`;
+  the seat command on it (3C+3B+86, MTP on): same text as 4ab5e29 in 12/12 requests, decode 78.4 -> 83.0 code / 64.4 -> 70.4 prose / ~4k
+  +10-15 % (MTP verify uses the unchanged prefill attention), prompt 504-529 vs 370-384 tok/s once the seat drops its chunk=256 env.

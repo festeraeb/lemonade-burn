@@ -97,6 +97,25 @@ the Q8 dedup (b96fa22). Re-run of that case here (Tiel, P100 3B+86, split 19,21,
 longer sets the chunk (auto: 64..1024 by prompt length). A seat whose weights fill its cards more than Tiel on two P100s can still set
 `LB_QW_PREFILL_CHUNK=256` in its manifest command.
 
+## The server, the seat's way (bundle 20261121-qwen35-p100-d63c182 vs 20261118-qwen35-mtp-4ab5e29)
+
+The qwen36-lb-c4 seat's command (cards 3C + 3B + 86, `QWEN_SPLIT=6,17,17`, `--ctx 32768`, `LB_MTP=1`, `LB_QW_PREFILL_CHUNK=256`) on port
+8190, no scrape dir; `srvclient.py`: 3 rounds x (code, prose, ~4.1k code, ~4.4k prose), temperature 0, 256 / 128 tokens, a round prefix
+so the prompt cache cannot serve a later round. Rounds 1-2:
+
+| prompt | old decode tok/s | new decode tok/s | new, chunk unset (auto) | old prompt tok/s | new | new auto chunk |
+|---|---|---|---|---|---|---|
+| code 30 tok | 78.4 / 78.5 | 83.1 / 82.9 | 82.6 / 83.1 | - | - | - |
+| prose 29 tok | 64.1 / 64.8 | 70.3 / 70.6 | 70.3 / 70.4 | - | - | - |
+| code 4148 tok | 45.3 / 50.8 | 52.4 / 56.0 | 52.3 / 55.8 | 374 / 370 | 367 / 362 | **504 / 510** |
+| prose 4378 tok | 47.5 / 51.5 | 52.1 / 56.4 | 48.4 / 56.2 | 383 / 379 | 376 / 384 | **529 / 529** |
+
+Text identical to the old server in all 12 requests of every arm (sha of reasoning + content). Peak memory 3C / 3B / 86: old 4.5 / 11.5 /
+14.0 GB, new 4.5 / 12.1 / 14.0, auto chunk 5.2 / 12.2 / 14.7 (the 2060 has 6 GB); max 63 C. With MTP on, the ~4k gain is smaller than
+plain decode's (+10-15 % against +40 %): the MTP verify runs the prefill attention (`qp_attention`, 2 rows), which this work did not
+change; it is the next kernel to look at for long contexts. The seat command itself still sets `LB_QW_PREFILL_CHUNK=256` (env wins
+over the profile); dropping it from the manifest gives the auto-chunk column (a seat decision, not made here).
+
 ## Measured and not adopted
 
 | variant | parts / microbench | end to end (2xP100) | why not |
