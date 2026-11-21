@@ -177,12 +177,84 @@ fn main() -> Result<()> {
                 }
             }
         }
-        "parts" => {
-            // time the parts of one delta-net layer (0) and one attention layer (3) on stage 0
-            for il in [0usize, 3] {
-                for (name, us) in pipe.bench_parts(il, 300) {
-                    eprintln!("layer {il}: {name:<24} {us:8.1} us");
+        "bench2" => {
+            // bench2 <model> <ids> <n_new> [chunk] [rounds]: the server's path for every prompt line: prefill (prompts of 32+ tokens; chunk 0 =
+            // auto) then `n_new` greedy tokens with the argmax on the device. One JSON line per prompt and round: prefill and decode tok/s, a sha
+            // of the generated ids (token identity across builds and knobs).
+            let n: usize = a[4].parse()?;
+            let chunk: usize = a.get(5).and_then(|v| v.parse().ok()).unwrap_or(0);
+            let rounds: usize = a.get(6).and_then(|v| v.parse().ok()).unwrap_or(2);
+            pipe.warm_decode(prompts[0][0])?;
+            for round in 0..rounds {
+                for (pi, p) in prompts.iter().enumerate() {
+                    pipe.reset();
+                    let t0 = std::time::Instant::now();
+                    let mut tok = if p.len() >= 32 {
+                        argmax(&pipe.prefill(p, 0, chunk)?) as u32
+                    } else {
+                        let mut l = None;
+                        for (i, &t) in p.iter().enumerate() {
+                            l = pipe.step(t, i, i + 1 == p.len())?;
+                        }
+                        argmax(&l.unwrap()) as u32
+                    };
+                    let pre = t0.elapsed().as_secs_f64();
+                    let mut gen = vec![tok];
+                    let t1 = std::time::Instant::now();
+                    for s in 1..n {
+                        tok = pipe.step_argmax(tok, p.len() + s - 1)?;
+                        gen.push(tok);
+                    }
+                    let dt = t1.elapsed().as_secs_f64();
+                    let mut h: u64 = 0xcbf29ce484222325;
+                    for &t in &gen {
+                        for b in t.to_le_bytes() {
+                            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+                        }
+                    }
+                    println!(
+                        "{{\"round\":{round},\"prompt\":{pi},\"len\":{},\"chunk\":{chunk},\"prefill_s\":{pre:.4},\"prefill_tps\":{:.1},\"n\":{n},\"decode_tps\":{:.2},\"sha\":\"{h:016x}\",\"head\":{:?}}}",
+                        p.len(),
+                        p.len() as f64 / pre,
+                        (n - 1) as f64 / dt,
+                        &gen[..gen.len().min(12)]
+                    );
                 }
+            }
+            // the stage graphs replayed alone (state is scratch by now: timing only)
+            let g = pipe.bench_stage_graphs(50);
+            println!("{{\"stage_graph_ms\":{:?}}}", g);
+        }
+        "sweep" => {
+            // sweep <model> <ids>: LB_SWEEP="A=1,B=2;A=2,B=2;..." -- per configuration set those env vars in this process (the launch-time knobs of the
+            // K-quant kernels) and time the parts of the LB_PARTS_LAYERS layers; one model load for the whole grid
+            let layers: Vec<usize> = std::env::var("LB_PARTS_LAYERS").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or(vec![0, 3]);
+            let grid = std::env::var("LB_SWEEP").unwrap_or_default();
+            for cfg in grid.split(';').filter(|c| !c.is_empty()) {
+                for kv in cfg.split(',') {
+                    let (k, v) = kv.split_once('=').expect("A=B");
+                    unsafe { std::env::set_var(k, v) };
+                }
+                for &il in &layers {
+                    for (name, us) in pipe.bench_parts(il, 300) {
+                        println!("{{\"cfg\":\"{cfg}\",\"layer\":{il},\"part\":\"{name}\",\"us\":{us:.2}}}");
+                    }
+                }
+            }
+        }
+        "parts" => {
+            // time the parts of one delta-net layer (0) and one attention layer (3) on stage 0 (LB_PARTS_LAYERS=a,b,.. for others), then the head
+            let layers: Vec<usize> = std::env::var("LB_PARTS_LAYERS").ok().map(|v| v.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or(vec![0, 3]);
+            for il in layers {
+                let mut tot = 0.0;
+                for (name, us) in pipe.bench_parts(il, 300) {
+                    eprintln!("layer {il}: {name:<26} {us:8.1} us");
+                    tot += us;
+                }
+                eprintln!("layer {il}: {:<26} {tot:8.1} us", "SUM");
+            }
+            for (name, us) in pipe.bench_head(100) {
+                eprintln!("head: {name:<26} {us:8.1} us");
             }
         }
         _ => eprintln!("unknown mode"),

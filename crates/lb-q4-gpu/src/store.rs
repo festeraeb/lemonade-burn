@@ -111,6 +111,30 @@ pub struct Gpu {
     pub compute_capability: Option<(u32, u32)>,
     /// Diagnostic launch trace (`trace.rs`), off unless a caller starts it.
     pub trace: crate::trace::Trace,
+    /// K-quant (qwen35) kernel choices, read once at open through the card profile (env on top). See [`KqTune`].
+    pub kq: KqTune,
+}
+
+/// Kernel variants of the K-quant decode path (`kquant.rs`, used by lb-qwen35), each a named knob (env > card profile > default). The
+/// defaults are what the engine ran before the P100 tuning of 2026-11-21 unless a variant measured faster on the P100 and not slower on the
+/// RTX 2060 with token-identical output (docs/P100_KERNEL_TUNING.md).
+#[derive(Clone, Debug)]
+pub struct KqTune {
+    /// `LB_QW_Q6_LG`: Q6_K matrices with fewer than 32 half blocks a row (2048 columns: output head, `attn_q`) run lane groups so no lane of
+    /// the plane idles (`q6_k_native_rows_lg_kernel`); bit-identical to the rows4 kernel.
+    pub q6_lg: bool,
+    /// `LB_QW_ATTN_SPLIT`: the one-token attention (`qw_attention`, hd 256) as three launches over many cubes (scores per position, softmax per
+    /// head, output per head x dim chunk x chain) instead of one cube per query head; bit-identical to the wide kernel.
+    pub attn_split: bool,
+    /// `LB_QW_ATTN_CUBES`: 256-unit cubes of the split scores kernel (rounded up to a multiple of the KV heads).
+    pub attn_cubes: usize,
+}
+
+impl KqTune {
+    pub fn from_profile(p: &lb_card_profile::Resolved) -> Self {
+        let on = |name: &str, default: bool| p.var(name).map(|v| { let v = v.trim(); !(v.is_empty() || v == "0" || v == "off") }).unwrap_or(default);
+        KqTune { q6_lg: on("LB_QW_Q6_LG", false), attn_split: on("LB_QW_ATTN_SPLIT", false), attn_cubes: p.parse("LB_QW_ATTN_CUBES").unwrap_or(112) }
+    }
 }
 
 /// `LB_Q4_ROWS`: 4 (default), 8, or 1 for the one-row kernels; anything else is the default.
@@ -350,6 +374,7 @@ impl Gpu {
         };
         let profile_rows = profile.var("LB_Q4_ROWS");
         let fp16_pipe = !tensor_cores && compute_capability == Some((6, 0)) && profile.var("LB_H2").is_some_and(|v| !v.is_empty() && v != "0");
+        let kq = KqTune::from_profile(&profile);
         Ok(Self {
             fp16_pipe,
             tensor_cores,
@@ -383,6 +408,7 @@ impl Gpu {
             q4_math: AtomicU32::new(q4_math.code()),
             compute_capability,
             trace: Default::default(),
+            kq,
         })
     }
 

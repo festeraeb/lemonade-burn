@@ -123,6 +123,32 @@ pub fn ptime_report() -> Vec<(&'static str, f64)> {
     std::mem::take(&mut *PTIME.lock().unwrap())
 }
 
+/// Device time of `f` in microseconds a call: `reps` calls recorded as one CUDA graph and replayed three times, so host launch cost is not in
+/// the number (the kernels' own time plus the in-graph launch gaps).
+pub fn graph_time_us(gpu: &Gpu, reps: usize, f: &dyn Fn() -> Handle) -> f64 {
+    gpu.client.graph_prepare().expect("graph_prepare");
+    let mut h0 = f();
+    for _ in 1..reps {
+        h0 = f(); // fill the scratch pool with as many buffers as the capture will take
+    }
+    gpu.read_all(vec![(h0, 1)]).unwrap();
+    gpu.client.start_capture().expect("start_capture");
+    let mut last = None;
+    for _ in 0..reps {
+        last = Some(f());
+    }
+    let graph = gpu.client.stop_capture().expect("stop_capture");
+    let held = gpu.take_in_flight();
+    let t0 = std::time::Instant::now();
+    for _ in 0..3 {
+        unsafe { graph.replay() }.expect("replay");
+    }
+    gpu.read_all(vec![(last.unwrap(), 1)]).unwrap();
+    let us = t0.elapsed().as_secs_f64() / 3.0 / reps as f64 * 1e6;
+    drop(held);
+    us
+}
+
 /// One layer's host copy of its recurrent state / KV prefix (see [`DevModel::snapshot`]).
 #[derive(Default, Clone)]
 pub struct LayerSnap {
@@ -262,30 +288,7 @@ impl DevModel {
         let c = &self.cfg;
         let l = &self.layers[i];
         let x = gpu.upload_f32(&vec![0.1f32; c.n_embd]);
-        // device time: record `reps` calls as one CUDA graph and replay it, so host launch cost is not in the number
-        let time = |name: &'static str, f: &dyn Fn() -> Handle| -> (&'static str, f64) {
-            gpu.client.graph_prepare().expect("graph_prepare");
-            let mut h0 = f();
-            for _ in 1..reps {
-                h0 = f(); // fill the scratch pool with as many buffers as the capture will take
-            }
-            gpu.read_all(vec![(h0, 1)]).unwrap();
-            gpu.client.start_capture().expect("start_capture");
-            let mut last = None;
-            for _ in 0..reps {
-                last = Some(f());
-            }
-            let graph = gpu.client.stop_capture().expect("stop_capture");
-            let held = gpu.take_in_flight();
-            let t0 = std::time::Instant::now();
-            for _ in 0..3 {
-                unsafe { graph.replay() }.expect("replay");
-            }
-            gpu.read_all(vec![(last.unwrap(), 1)]).unwrap();
-            let us = t0.elapsed().as_secs_f64() / 3.0 / reps as f64 * 1e6;
-            drop(held);
-            (name, us)
-        };
+        let time = |name: &'static str, f: &dyn Fn() -> Handle| -> (&'static str, f64) { (name, graph_time_us(gpu, reps, f)) };
         let mut v = Vec::new();
         v.push(time("rms", &|| gpu.qw_rms(&x, &l.attn_norm, 1, c.n_embd, c.eps).0));
         if let Some(d) = &l.lin {

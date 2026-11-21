@@ -298,6 +298,44 @@ impl<'m, 'a> Pipeline<'m, 'a> {
         s.dev.bench_parts(&s.gpu, il - s.first, reps)
     }
 
+    /// Milliseconds a replay of each stage's recorded decode graph takes on its own (`reps` replays queued, one sync): the device time of a
+    /// token's stage with the in-graph launch gaps, without the host hand-over between stages. Empty for a stage with no recorded graph.
+    pub fn bench_stage_graphs(&self, reps: usize) -> Vec<Option<f64>> {
+        self.stages
+            .iter()
+            .map(|s| {
+                if let GraphState::Ready { graph, out, .. } = &*s.graph.borrow() {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..reps {
+                        unsafe { graph.replay() }.ok()?;
+                    }
+                    s.gpu.read_all(vec![(out.clone(), 1)]).ok()?;
+                    Some(t0.elapsed().as_secs_f64() * 1e3 / reps as f64)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Device time of the final norm, the output head and the argmax (last stage), microseconds a token.
+    pub fn bench_head(&self, reps: usize) -> Vec<(&'static str, f64)> {
+        let c = &self.model.cfg;
+        let s = self.stages.last().unwrap();
+        let h = s.head.as_ref().unwrap();
+        let x = s.gpu.upload_f32(&vec![0.1f32; c.n_embd]);
+        let nrm = s.gpu.qw_rms(&x, &h.norm, 1, c.n_embd, c.eps).0;
+        let head = || match &h.out {
+            HeadMat::Q6(m) => m.launch(&s.gpu, &nrm, 1),
+            HeadMat::Q8(m) => m.launch(&s.gpu, &nrm, 1),
+        };
+        let logits = head();
+        vec![
+            ("output head matvec", crate::device::graph_time_us(&s.gpu, reps, &head)),
+            ("argmax", crate::device::graph_time_us(&s.gpu, reps, &|| s.gpu.qw_argmax(&logits, c.vocab))),
+        ]
+    }
+
     /// Final norm + head on one hidden row (outside the stage graphs): the logits.
     fn head_logits(&self, xrow: &[f32]) -> Result<Vec<f32>> {
         let c = &self.model.cfg;

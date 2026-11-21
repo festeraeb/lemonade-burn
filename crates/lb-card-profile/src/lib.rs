@@ -38,6 +38,9 @@ pub const KNOBS: &[KnobDef] = &[
     KnobDef { name: "LB_QW_GRAPH", default: "1", profile: true, about: "CUDA graphs for the qwen35 decode stages (0 off)" },
     KnobDef { name: "LB_QW_FLUSH", default: "1", profile: true, about: "qwen35 stage flush interval" },
     KnobDef { name: "LB_MTP_DEPTH", default: "1", profile: true, about: "tokens the qwen35 nextn head drafts per verify (1..7); needs LB_MTP=1" },
+    KnobDef { name: "LB_QW_Q6_LG", default: "0", profile: true, about: "Q6_K rows under 32 half blocks (2048 columns: head, attn_q) run lane groups, no idle lanes; bit-identical (1 on)" },
+    KnobDef { name: "LB_QW_ATTN_SPLIT", default: "0", profile: true, about: "qwen35 one-token attention as three launches over many cubes instead of one cube a head; bit-identical (1 on)" },
+    KnobDef { name: "LB_QW_ATTN_CUBES", default: "112", profile: true, about: "cubes of the split attention scores kernel (with LB_QW_ATTN_SPLIT=1)" },
     // env-only: documented so the inventory is complete, not read through a profile yet
     KnobDef { name: "QWEN_SPLIT", default: "even over CUDA_VISIBLE_DEVICES", profile: false, about: "qwen35 layers per stage; depends on model + card set, so it is seat placement, not a card property" },
     KnobDef { name: "LB_MTP", default: "off", profile: false, about: "turn the qwen35 MTP draft on (an operator decision per seat)" },

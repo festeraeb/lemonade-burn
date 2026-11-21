@@ -603,6 +603,158 @@ fn qw_attn_decode_wide_kernel(
     out[h * hd + u] = (o0 + o1 + o2 + o3) * sigmoid_f(gate[h * hd + u]);
 }
 
+// ---- `LB_QW_ATTN_SPLIT`: the wide kernel's arithmetic in three launches that fill the card (P100 tuning, 2026-11-21).
+// The wide kernel runs one cube per query head (16 cubes: 16 of a P100's 56 SMs), every head re-reads its KV head's whole K and V, and the
+// output loop walks all positions serially; at 4k context it costs ~0.8 ms a layer. Every value below is computed with exactly the
+// operations, operands and order of the wide kernel (per-position scores with the same lane split and `plane_sum`; the max/exp/total code
+// unchanged; the four output chains o0..o3, split by position mod 4 with the tail folded into o0, as separate threads, combined as
+// ((o0 + o1) + o2) + o3), so the output is bit-identical; only the work is spread over many more cubes.
+
+/// Scores of one token for all query heads: a plane takes one position of one KV head and serves the `nh / nkv` query heads that share it
+/// (K read once). `hd` = 256 (8 values a lane). Grid: any number of 256-unit cubes, a multiple of `nkv` planes.
+#[cube(launch)]
+fn qw_attn_scores_split_kernel(q: &[f32], kc: &[f32], scores: &mut [f32], pp: &[u32], #[comptime] nh: usize, #[comptime] nkv: usize, #[comptime] hd: usize, #[comptime] cap: usize) {
+    let g = nh / nkv;
+    let lane = UNIT_POS_PLANE as usize;
+    let ppc = (CUBE_DIM_X / PLANE_DIM) as usize;
+    let planes = CUBE_COUNT as usize * ppc;
+    let per_kv = planes / nkv;
+    let p = CUBE_POS as usize * ppc + (UNIT_POS / PLANE_DIM) as usize;
+    let kvh = p / per_kv;
+    let n = pp[0] as usize + 1usize;
+    let scale = 1.0f32 / Sqrt::sqrt(hd as f32);
+    if kvh < nkv {
+        let mut qr = Array::<f32>::new(64usize);
+        #[unroll]
+        for j in 0..g {
+            #[unroll]
+            for m in 0..8usize {
+                qr[j * 8usize + m] = q[(kvh * g + j) * hd + lane + 32usize * m];
+            }
+        }
+        let mut t = p % per_kv;
+        while t < n {
+            let kb = (t * nkv + kvh) * hd;
+            let mut kr = Array::<f32>::new(8usize);
+            #[unroll]
+            for m in 0..8usize {
+                kr[m] = kc[kb + lane + 32usize * m];
+            }
+            #[unroll]
+            for j in 0..g {
+                let mut part = 0.0f32;
+                #[unroll]
+                for m in 0..8usize {
+                    part += qr[j * 8usize + m] * kr[m];
+                }
+                let s = plane_sum(part) * scale;
+                if lane == 0usize {
+                    scores[(kvh * g + j) * cap + t] = s;
+                }
+            }
+            t += per_kv;
+        }
+    }
+}
+
+/// Softmax of the scores in place (`p = exp(s - max) / sum`), one cube of 256 units per query head: the wide kernel's code verbatim.
+#[cube(launch)]
+fn qw_attn_softmax_split_kernel(scores: &mut [f32], pp: &[u32], #[comptime] cap: usize) {
+    let h = CUBE_POS as usize;
+    let u = UNIT_POS as usize;
+    let n = pp[0] as usize + 1usize;
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let mut mx = scores[0usize] * 0.0f32 - 3.0e38f32;
+    let mut t = u;
+    while t < n {
+        let sv = scores[h * cap + t];
+        if sv > mx {
+            mx = sv;
+        }
+        t += CUBE_DIM_X as usize;
+    }
+    sm[u] = mx;
+    sync_cube();
+    let mut st = CUBE_DIM_X / 2u32;
+    while st > 0u32 {
+        if UNIT_POS < st {
+            let o2 = sm[u + st as usize];
+            if o2 > sm[u] {
+                sm[u] = o2;
+            }
+        }
+        sync_cube();
+        st = st / 2u32;
+    }
+    let m = sm[0usize];
+    sync_cube();
+    let mut sum = 0.0f32;
+    let mut t = u;
+    while t < n {
+        let e = Exp::exp(scores[h * cap + t] - m);
+        scores[h * cap + t] = e;
+        sum += e;
+        t += CUBE_DIM_X as usize;
+    }
+    let total = lane_sum(&mut sm, sum, false);
+    let mut t = u;
+    while t < n {
+        scores[h * cap + t] = scores[h * cap + t] / total;
+        t += CUBE_DIM_X as usize;
+    }
+}
+
+/// Output of one token: cube `(dim chunk of 64, query head)`, 256 units = 4 chains x 64 dimensions; chain `r` sums positions `t = r mod 4`
+/// below `4 * floor(n / 4)` (chain 0 also takes the tail), as the wide kernel's o0..o3. Loads of four chain steps are issued before their
+/// FMAs (the sums keep their order). Heads sharing a KV head are adjacent cubes, so their V reads meet in the cache.
+#[cube(launch)]
+fn qw_attn_out_split_kernel(p: &[f32], vc: &[f32], gate: &[f32], out: &mut [f32], pp: &[u32], #[comptime] nh: usize, #[comptime] nkv: usize, #[comptime] hd: usize, #[comptime] cap: usize) {
+    let h = CUBE_POS as usize % nh;
+    let chunk = CUBE_POS as usize / nh;
+    let u = UNIT_POS as usize;
+    let r = u / 64usize;
+    let d = chunk * 64usize + u % 64usize;
+    let n = pp[0] as usize + 1usize;
+    let n4 = (n / 4usize) * 4usize;
+    let kvh = h / (nh / nkv);
+    let mut sm = Shared::<[f32]>::new_slice(256usize);
+    let pb = h * cap;
+    let mut o = 0.0f32;
+    let mut t = r;
+    while t + 12usize < n4 {
+        let p0 = p[pb + t];
+        let v0 = vc[(t * nkv + kvh) * hd + d];
+        let p1 = p[pb + t + 4usize];
+        let v1 = vc[((t + 4usize) * nkv + kvh) * hd + d];
+        let p2 = p[pb + t + 8usize];
+        let v2 = vc[((t + 8usize) * nkv + kvh) * hd + d];
+        let p3 = p[pb + t + 12usize];
+        let v3 = vc[((t + 12usize) * nkv + kvh) * hd + d];
+        o += p0 * v0;
+        o += p1 * v1;
+        o += p2 * v2;
+        o += p3 * v3;
+        t += 16usize;
+    }
+    while t < n4 {
+        o += p[pb + t] * vc[(t * nkv + kvh) * hd + d];
+        t += 4usize;
+    }
+    if r == 0usize {
+        let mut t = n4;
+        while t < n {
+            o += p[pb + t] * vc[(t * nkv + kvh) * hd + d];
+            t += 1usize;
+        }
+    }
+    sm[u] = o;
+    sync_cube();
+    if r == 0usize {
+        let dl = u % 64usize;
+        out[h * hd + d] = (o + sm[64usize + dl] + sm[128usize + dl] + sm[192usize + dl]) * sigmoid_f(gate[h * hd + d]);
+    }
+}
+
 /// Index of the largest of `n` values (ties: the lowest index), one cube of 256 units; the index is written as the bits of a u32 in `out[0]`.
 #[cube(launch)]
 fn qw_argmax_kernel(x: &[f32], out: &mut [f32], #[comptime] n: usize) {
@@ -877,7 +1029,26 @@ impl Gpu {
                 BufferArg::from_raw_parts(kc.clone(), cap * nkv * hd), BufferArg::from_raw_parts(vc.clone(), cap * nkv * hd),
                 BufferArg::from_raw_parts(pos_h.clone(), 1), BufferArg::from_raw_parts(pf, 2), nh, nkv, hd, half,
             );
-            if self.use_plane && self.plane_size.1 == 32 && hd == 256 && std::env::var("LB_QW_ATTN_OLD").is_err() {
+            let wide = self.use_plane && self.plane_size.1 == 32 && hd == 256 && std::env::var("LB_QW_ATTN_OLD").is_err();
+            if wide && self.kq.attn_split && nh % nkv == 0 && nh / nkv <= 8 {
+                let cubes = self.kq.attn_cubes.div_ceil(nkv).max(1) * nkv;
+                qw_attn_scores_split_kernel::launch(
+                    &self.client, CubeCount::Static(cubes as u32, 1, 1), CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(qo, nh * hd), BufferArg::from_raw_parts(kc.clone(), cap * nkv * hd), BufferArg::from_raw_parts(scores.clone(), nh * cap),
+                    BufferArg::from_raw_parts(pos_h.clone(), 1), nh, nkv, hd, cap,
+                );
+                qw_attn_softmax_split_kernel::launch(
+                    &self.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(scores.clone(), nh * cap), BufferArg::from_raw_parts(pos_h.clone(), 1), cap,
+                );
+                qw_attn_out_split_kernel::launch(
+                    &self.client, CubeCount::Static((nh * hd / 64) as u32, 1, 1), CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(scores, nh * cap), BufferArg::from_raw_parts(vc.clone(), cap * nkv * hd), BufferArg::from_raw_parts(gate, nh * hd),
+                    BufferArg::from_raw_parts(out.clone(), nh * hd), BufferArg::from_raw_parts(pos_h.clone(), 1), nh, nkv, hd, cap,
+                );
+                return out;
+            }
+            if wide {
                 qw_attn_decode_wide_kernel::launch(
                     &self.client, CubeCount::Static(nh as u32, 1, 1), CubeDim::new_1d(256),
                     BufferArg::from_raw_parts(qo, nh * hd), BufferArg::from_raw_parts(kc.clone(), cap * nkv * hd), BufferArg::from_raw_parts(vc.clone(), cap * nkv * hd),

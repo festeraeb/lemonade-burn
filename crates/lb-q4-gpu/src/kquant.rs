@@ -939,6 +939,51 @@ fn q6_k_native_rows4_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], dims:
     }
 }
 
+/// [`q6_k_native_rows4_kernel`] for rows with fewer half blocks than a plane has lanes (`ipr` = half blocks a row, dividing 32: 16 at
+/// 2048 columns, the output head and `attn_q`): the plane is `32 / ipr` lane groups, each with its own `rr` rows, so no lane idles (the
+/// rows4 kernel leaves lanes `ipr..32` without work). Every lane does exactly the arithmetic it does in the rows4 kernel (one half block),
+/// and the group sum takes the xor offsets 1, 2, .., `ipr / 2` in the order `plane_sum` does; the rows4 kernel's remaining offsets only add
+/// the idle lanes' zeros, so the outputs are bit-identical.
+#[cube(launch)]
+fn q6_k_native_rows_lg_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] rr: usize, #[comptime] ipr: usize) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 256usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let ppc = CUBE_DIM_X as usize / 32usize;
+    let gpp = 32usize / ipr;
+    let lg = lane / ipr;
+    let li = lane % ipr;
+    let step = CUBE_COUNT as usize * ppc * gpp;
+    let groups = out.len() / rr;
+    let mut g = (CUBE_POS as usize * ppc + plane_id) * gpp + lg;
+    while g < groups {
+        let o0 = g * rr;
+        let t = o0 / rows;
+        let r0 = o0 % rows;
+        let mut acc = Array::<f32>::new(rr);
+        #[unroll]
+        for i in 0..rr {
+            acc[i] = 0.0f32;
+        }
+        q6n_rows(qq, sc, dd, x, r0 * bpr, t * cols / 4usize, bpr, li, ipr, &mut acc, rr);
+        #[unroll]
+        for i in 0..rr {
+            let mut v = acc[i];
+            let mut s = 1u32;
+            while s < ipr as u32 {
+                v += plane_shuffle_xor(v, s);
+                s *= 2u32;
+            }
+            if li == 0usize {
+                out[o0 + i] = v;
+            }
+        }
+        g += step;
+    }
+}
+
 /// Q6_K lane = one 128-value half block. `dims` = [rows, cols].
 #[cube(launch)]
 fn q6_k_native_matvec_kernel(qq: &[V4U], sc: &[V4U], dd: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] use_plane: bool) {
@@ -1071,6 +1116,26 @@ impl GpuQ6KNative {
         let n_out = m * self.rows;
         let out = gpu.scratch(n_out * 4);
         let rr: usize = std::env::var("LB_QW_R").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let ipr = self.cols / 256 * 2;
+        if gpu.use_plane && gpu.plane_size.1 == 32 && self.rows % rr == 0 && std::env::var("LB_QW_ROWS1").is_err() && gpu.kq.q6_lg && ipr < 32 && 32 % ipr == 0 {
+            let groups = n_out / rr;
+            unsafe {
+                q6_k_native_rows_lg_kernel::launch(
+                    &gpu.client,
+                    cube_count(groups.div_ceil(32 / ipr), gpu.per_cube()),
+                    CubeDim::new_1d(gpu.cube_dim as u32),
+                    BufferArg::from_raw_parts(self.qq.clone(), self.n.0 / 4),
+                    BufferArg::from_raw_parts(self.sc.clone(), self.n.1 / 4),
+                    BufferArg::from_raw_parts(self.dd.clone(), self.n.2),
+                    BufferArg::from_raw_parts(xp.clone(), m * self.cols / 4),
+                    BufferArg::from_raw_parts(self.dims.clone(), 2),
+                    BufferArg::from_raw_parts(out.clone(), n_out),
+                    rr,
+                    ipr,
+                );
+            }
+            return out;
+        }
         if gpu.use_plane && gpu.plane_size.1 == 32 && self.rows % rr == 0 && std::env::var("LB_QW_ROWS1").is_err() {
             unsafe {
                 q6_k_native_rows4_kernel::launch(
