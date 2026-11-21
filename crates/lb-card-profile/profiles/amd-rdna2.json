@@ -1,0 +1,30 @@
+{
+  "schema": "lb-card-profile-v1",
+  "id": "amd-rdna2",
+  "family": "AMD RDNA2 (gfx1030/1031/1032): RX 6700 XT",
+  "match": {
+    "pci": [
+      {
+        "vendor": "0x1002",
+        "device": [
+          "0x73a0",
+          "0x73ff"
+        ]
+      }
+    ]
+  },
+  "knobs": {
+    "LB_ROUTER_SPLIT_ANY": {
+      "value": 1,
+      "source": "docs/ENGINE_VULKAN.md section 10.2 (commit 126f07b): E2 router split over the plane range 32..64, 6700 XT 2 cards 14.18 -> 16.25 tok/s, parity 1590/1590 bit-identical. Same as the code default."
+    }
+  },
+  "notes": [
+    "wave32 (plane range 32..64): kernels read the plane size at run time, nothing is assumed (c1-gemini-lessons lesson 6).",
+    "no f16 / int-dot Q4 math yet on Vulkan (docs/ENGINE_VULKAN.md ranked item 10, estimate only)."
+  ],
+  "not_measured": [
+    "LB_Q4_ROWS / LB_PREFILL_UBATCH on RDNA2",
+    "LB_PREFILL_MAX_ROWS (no known limit)"
+  ]
+}

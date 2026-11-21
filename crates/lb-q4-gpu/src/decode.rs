@@ -955,7 +955,7 @@ impl Gpu {
         // Also on cards that report a plane-size range (RDNA: 32..64) unless `LB_ROUTER_SPLIT_ANY=0`. The 64 router
         // dots are then reduced at whatever wave size the driver picks, so the f32 sums can differ from the
         // single-cube kernel in the last bit; measured bit-identical on c1 (RX 6700 XT, 1590 positions), see docs/ENGINE_VULKAN.md.
-        self.use_plane && !seq && self.plane_size.1 > 0 && (self.plane_size.0 == self.plane_size.1 || std::env::var_os("LB_ROUTER_SPLIT_ANY").is_none_or(|v| v != "0"))
+        self.use_plane && !seq && self.plane_size.1 > 0 && (self.plane_size.0 == self.plane_size.1 || self.knob("LB_ROUTER_SPLIT_ANY").is_none_or(|v| v != "0"))
     }
 
     /// [`Gpu::sum_add_rms_norm`] with the slot order computed once per cube

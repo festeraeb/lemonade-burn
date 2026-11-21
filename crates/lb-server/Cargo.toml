@@ -25,6 +25,7 @@ lb-lfm2.workspace = true
 lb-ternary.workspace = true
 lb-qwen35 = { path = "../lb-qwen35", optional = true }
 lb-gguf = { workspace = true, optional = true }
+lb-card-profile.workspace = true
 burn.workspace = true
 anyhow.workspace = true
 clap.workspace = true

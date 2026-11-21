@@ -1,0 +1,49 @@
+{
+  "schema": "lb-card-profile-v1",
+  "id": "nvidia-p100",
+  "family": "NVIDIA Pascal GP100, Tesla P100 16 GB (sm_60)",
+  "match": [
+    {
+      "cuda_cc": [
+        "6.0"
+      ]
+    },
+    {
+      "name_contains": [
+        "Tesla P100"
+      ]
+    }
+  ],
+  "knobs": {
+    "LB_QW_PREFILL_CHUNK": {
+      "value": 256,
+      "source": "lb-qwen35-c4-tuning-2026-11-16.md Step 0 table: 2xP100 (AF+D8), Tiel Q5_K_XL 26.6 GB, split 19,21: auto chunk OOMs on the 2nd long prompt (AF 16267 of 16384 MiB), chunk 256 stable at 410 tok/s prompt, decode 76 tok/s. Measured before the Q8 dedup (b96fa22, 0.2-0.75 GB per card back); not re-measured without it. Matters only when weights nearly fill the card."
+    },
+    "LB_QW_GRAPH": {
+      "value": 1,
+      "source": "lb-qwen35-c4-tuning-2026-11-16.md (76 tok/s decode with graphs) and c1-gemini-lessons-for-engine-2026-11-18.md section 1 (graphed verify 25.1 -> 21.5 ms). Same as the code default."
+    },
+    "LB_MTP_DEPTH": {
+      "value": 1,
+      "source": "c1-gemini-lessons-for-engine-2026-11-18.md section 1 (commit 4ab5e29): P100 AF+D8, Qwen3.6 Q5_K_M, depth 1 +16 % mean, depths 2-3 lose (verify of 2 rows 21.5 ms vs 15 ms a token). Only used when LB_MTP=1; whether MTP is on stays a per-seat decision."
+    },
+    "LB_Q4_ROWS": {
+      "value": 4,
+      "source": "docs/WORK_LOG.md (2026-11-07): 1.29x end to end in the device decode on a P100 (rows 4 vs 1). Same as the code default."
+    },
+    "LB_PREFILL_UBATCH": {
+      "value": 2048,
+      "source": "docs/PREFILL_SPLIT.md: 2048 rows 780 tok/s vs 594 at 512, P100 in c2's Gen3 x4 slot, LFM2.5-24B Q4_0. Same as the code default."
+    }
+  },
+  "notes": [
+    "pinned staging pool and cuMemHostRegister of the GGUF mmap are on by default for CUDA: miss path 0.28 ms vs 1.1 ms, 1.40x (memory gpu-zero-copy-miss-path, eec4500). Env-only switches LB_NO_PINNED / LB_NO_REGISTER.",
+    "LB_Q4_MATH stays f32: X7a f16 on sm_60 gave 1.03x and failed the accuracy gate (docs/WORK_TO_WEIGHTS.md X7a results).",
+    "LB_H2=1 (fp16 half2 prefill GEMM) is faster (930 vs 780 tok/s at 2k) but fails G1 (top-1 211/215): not adopted (docs/PREFILL_SPLIT.md).",
+    "QWEN_SPLIT (19,21 for the Tiel pair, 6,17,17 for the 2060+2xP100 seat) depends on model and card set: seat placement, kept in the manifest, not here."
+  ],
+  "not_measured": [
+    "LB_Q4_CUBE (measured flat 32..256 in the commit message, no gain)",
+    "power-cap sensitivity of decode"
+  ]
+}

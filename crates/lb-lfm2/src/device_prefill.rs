@@ -80,6 +80,15 @@ pub fn ubatch_for(card_max: Option<usize>) -> usize {
     card_max.map_or(ubatch(), |c| ubatch().min(c.max(1)))
 }
 
+/// [`ubatch_for`] for a card: the env var wins; else the card profile's `LB_PREFILL_UBATCH` (default 2048), capped by the card's `max_batch_rows`.
+pub fn ubatch_for_gpu(gpu: &Gpu) -> usize {
+    if std::env::var("LB_PREFILL_UBATCH").ok().and_then(|v| v.parse::<usize>().ok()).is_some_and(|v| v > 0) {
+        return ubatch();
+    }
+    let base = gpu.knob("LB_PREFILL_UBATCH").and_then(|v| v.trim().parse::<usize>().ok()).filter(|v| *v > 0).unwrap_or(2048);
+    gpu.max_batch_rows.map_or(base, |c| base.min(c.max(1)))
+}
+
 /// `LB_PREFILL_TIMING=1`: sync after every kind of step and total the wall time per kind
 /// ([`TIMING`]). Slower (hundreds of extra syncs a chunk); for finding where a chunk's time goes.
 pub fn timing_on() -> bool {
@@ -446,7 +455,7 @@ pub fn prefill(m: &Lfm2, tokens: &[u32], cache: &mut Cache, all_logits: bool) ->
         (d.k.clone(), d.v.clone(), d.conv.clone())
     };
 
-    let ub = ubatch_for(gpu.max_batch_rows).min(n);
+    let ub = ubatch_for_gpu(gpu).min(n);
     // one routes/weights pair for the chunk, reused by every MoE layer
     let routes = gpu.upload_u32(vec![0u32; 2 * ub * k_used]);
     let weights = gpu.upload_f32(&vec![0f32; ub * k_used]);

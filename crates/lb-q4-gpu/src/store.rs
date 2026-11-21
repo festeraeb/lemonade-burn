@@ -44,7 +44,10 @@ pub struct Gpu {
     pub client: Client,
     pub name: String,
     /// Largest prefill chunk (rows) this card's family is known to run safely (Vega 10: 128); `None` = no known limit.
+    /// From the card profile's `LB_PREFILL_MAX_ROWS` (env overrides).
     pub max_batch_rows: Option<usize>,
+    /// The card's tuning knobs: the matching profile (`lb-card-profile`, JSON per family) with env vars on top. Read a knob with [`Gpu::knob`].
+    pub profile: lb_card_profile::Resolved,
     /// sysfs facts about the card (wgpu adapters with a PCI bus), read at open
     pub card: Option<lb_ternary_gpu::card_facts::CardFacts>,
     /// Units per cube for the matvec kernels (`LB_Q4_CUBE` overrides).
@@ -113,8 +116,8 @@ pub struct Gpu {
 /// `LB_Q4_ROWS`: 4 (default), 8, or 1 for the one-row kernels; anything else is the default.
 /// Measured 2026-11-07 (docs/WORK_LOG.md): 1.29x end to end in the device decode on a P100,
 /// 1.16x / 1.31x on the GTX 1070's distinct-expert stream (wgpu / cuda).
-fn q4_rows_from_env() -> usize {
-    match std::env::var("LB_Q4_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+fn q4_rows_from(v: Option<String>) -> usize {
+    match v.and_then(|v| v.trim().parse::<usize>().ok()) {
         Some(r @ (1 | 4 | 8)) => r,
         _ => 4,
     }
@@ -208,15 +211,28 @@ impl Q4Math {
     /// `LB_Q4_MATH`: unset or `f32` -> the reference (the default: every published sha was made
     /// with it); `auto` -> [`Q4Math::for_card`]; or `f32m`, `f16`, `dp4a` by name.
     pub fn pick(cc: Option<(u32, u32)>) -> Self {
-        match std::env::var("LB_Q4_MATH") {
-            Ok(v) if v.trim().eq_ignore_ascii_case("auto") => Self::for_card(cc),
-            Ok(v) => Self::parse(&v).unwrap_or_else(|| {
+        Self::pick_from(cc, std::env::var("LB_Q4_MATH").ok())
+    }
+
+    /// [`Q4Math::pick`] with the setting given (env or card profile).
+    pub fn pick_from(cc: Option<(u32, u32)>, setting: Option<String>) -> Self {
+        match setting {
+            Some(v) if v.trim().eq_ignore_ascii_case("auto") => Self::for_card(cc),
+            Some(v) => Self::parse(&v).unwrap_or_else(|| {
                 eprintln!("lb-q4-gpu: LB_Q4_MATH={v:?} not understood (f32|f32m|f16|dp4a|auto), using f32");
                 Q4Math::F32
             }),
-            Err(_) => Q4Math::F32,
+            None => Q4Math::F32,
         }
     }
+}
+
+/// Name of CUDA device `index` (driver order), from the driver.
+#[cfg(feature = "cuda")]
+pub fn cuda_device_name(index: usize) -> Option<String> {
+    use cudarc::driver::result;
+    result::init().ok()?;
+    result::device::get_name(result::device::get(index as i32).ok()?).ok()
 }
 
 /// Compute capability of CUDA device `index` (driver order), from the driver.
@@ -233,29 +249,29 @@ fn cuda_compute_capability(index: usize) -> Option<(u32, u32)> {
     }
 }
 
-impl Gpu {
-    /// Open the device named by `LB_CUDA_DEVICE` or `LB_WGPU_DEVICE` (see `pick_cube_device`).
-    pub fn open() -> Result<Self, String> {
-        let mut g = Self::open_device(pick_cube_device()?)?;
-        if std::env::var("LB_CUDA_DEVICE").is_err() {
-            g.note_card(&std::env::var("LB_WGPU_DEVICE").unwrap_or_default());
+/// The card key and sysfs facts of the wgpu adapter `spec` names (`default` and unmatched specs give an unnamed key).
+fn wgpu_card(spec: &str) -> (lb_card_profile::CardKey, Option<lb_ternary_gpu::card_facts::CardFacts>) {
+    match lb_ternary_gpu::card_for_spec(spec) {
+        Some((row, facts)) => {
+            let key = lb_card_profile::CardKey { label: if row.bus.is_empty() { spec.to_string() } else { row.bus.clone() }, name: row.name.clone(), cuda_cc: None, pci: facts.as_ref().map(|f| (f.vendor, f.device)) };
+            (key, facts)
         }
-        Ok(g)
+        None => (lb_card_profile::CardKey { label: spec.to_string(), name: "wgpu default adapter".into(), ..Default::default() }, None),
+    }
+}
+
+impl Gpu {
+    /// The value of a card-profile knob for this card: the environment variable of that name, else the matched profile's value, else `None`
+    /// (the caller's code default applies). Only knobs marked profile-capable in `lb_card_profile::KNOBS` come from a profile.
+    pub fn knob(&self, name: &str) -> Option<String> {
+        self.profile.var(name)
     }
 
-    /// Read the card's family, BAR, power cap and link from sysfs (wgpu adapters; read-only), log them once, and take the family's limits
-    /// (Vega 10: prefill chunks of at most 128 rows). Falls back to the adapter name when the bus is not readable.
-    fn note_card(&mut self, spec: &str) {
-        let Some((row, facts)) = lb_ternary_gpu::card_for_spec(spec) else { return };
-        let limits = match &facts {
-            Some(f) => {
-                eprintln!("lb-q4-gpu: {} {}", row.name, f.summary());
-                f.limits()
-            }
-            None => lb_ternary_gpu::card_facts::family_limits_by_name(&row.name),
-        };
-        self.max_batch_rows = limits.max_batch_rows;
-        self.card = facts;
+    /// Open the device named by `LB_CUDA_DEVICE` or `LB_WGPU_DEVICE` (see `pick_cube_device`).
+    pub fn open() -> Result<Self, String> {
+        let dev = pick_cube_device()?;
+        let hint = std::env::var("LB_CUDA_DEVICE").is_err().then(|| wgpu_card(&std::env::var("LB_WGPU_DEVICE").unwrap_or_default()));
+        Self::open_device(dev, hint)
     }
 
     /// Open CUDA device `index` (driver order inside `CUDA_VISIBLE_DEVICES`), whatever
@@ -264,28 +280,50 @@ impl Gpu {
     #[cfg(feature = "cuda")]
     pub fn open_cuda(index: usize) -> Result<Self, String> {
         let dev = cubecl::Device::cuda(index).map_err(|e| format!("CUDA device {index}: {e}"))?;
-        Self::open_device(dev)
+        Self::open_device(dev, None)
     }
 
     /// Open a wgpu adapter by spec (`discrete:N`, `name:<text>`, `bus:<pci id>`; see
     /// `lb_ternary_gpu::pick_device_spec`) whatever `LB_WGPU_DEVICE` says: a further card in the
     /// same process (in-box expert cards, a prefill card) on the Vulkan runtime.
     pub fn open_wgpu(spec: &str) -> Result<Self, String> {
-        let mut g = Self::open_device(cubecl::Device::Wgpu(lb_ternary_gpu::pick_device_spec(spec)?))?;
-        g.note_card(spec);
-        Ok(g)
+        let dev = cubecl::Device::Wgpu(lb_ternary_gpu::pick_device_spec(spec)?);
+        Self::open_device(dev, Some(wgpu_card(spec)))
     }
 
-    fn open_device(dev: cubecl::Device) -> Result<Self, String> {
+    /// `hint`: for a wgpu adapter, its key (name, PCI id) and sysfs facts; a CUDA card is keyed here from the driver (compute capability, name).
+    fn open_device(dev: cubecl::Device, hint: Option<(lb_card_profile::CardKey, Option<lb_ternary_gpu::card_facts::CardFacts>)>) -> Result<Self, String> {
         let client = std::panic::catch_unwind(|| dev.client()).map_err(|_| format!("{dev:?}: no client (adapter missing, or its runtime failed to initialise)"))?;
         let props = client.properties();
+        #[cfg(feature = "cuda")]
+        let compute_capability = match &dev {
+            cubecl::Device::Cuda(d) => cuda_compute_capability(d.index),
+            _ => None,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let compute_capability: Option<(u32, u32)> = None;
+        let (mut key, card) = match hint {
+            Some((k, f)) => (k, f),
+            None => (lb_card_profile::CardKey { label: format!("{dev:?}"), name: format!("{dev:?}"), ..Default::default() }, None),
+        };
+        #[cfg(feature = "cuda")]
+        if let cubecl::Device::Cuda(d) = &dev {
+            key.label = format!("cuda:{}", d.index);
+            key.name = cuda_device_name(d.index).unwrap_or_else(|| key.name.clone());
+        }
+        key.cuda_cc = compute_capability;
+        if let Some(f) = &card {
+            eprintln!("lb-q4-gpu: {} {}", key.name, f.summary());
+        }
+        let profile = lb_card_profile::resolve(&key);
+        let max_batch_rows = profile.parse::<usize>("LB_PREFILL_MAX_ROWS").filter(|r| *r > 0);
         let (pmin, pmax) = (props.hardware.plane_size_min, props.hardware.plane_size_max);
         let has_ops = props.features.plane.contains(cubecl::ir::features::Plane::Ops);
         let use_plane = has_ops && pmax > 0 && std::env::var("LB_NO_PLANE").is_err();
         // Default: two planes per cube, from the plane size the driver reports (wave32 NVIDIA/RDNA:
         // 64 units, wave64 Polaris/GCN: 128). Measured flat from 32 to 256 on a P100 (see
         // the commit message), so this only needs to be a whole number of planes.
-        let mut cube_dim = std::env::var("LB_Q4_CUBE").ok().and_then(|v| v.parse().ok()).unwrap_or(if use_plane { 2 * pmax as usize } else { THREADS });
+        let mut cube_dim = profile.var("LB_Q4_CUBE").and_then(|v| v.parse().ok()).unwrap_or(if use_plane { 2 * pmax as usize } else { THREADS });
         if use_plane {
             // a whole number of planes, or `PLANE_DIM`-sized groups would straddle the cube
             let p = pmax as usize;
@@ -303,28 +341,23 @@ impl Gpu {
             },
             _ => None,
         };
-        #[cfg(feature = "cuda")]
-        let compute_capability = match &dev {
-            cubecl::Device::Cuda(d) => cuda_compute_capability(d.index),
-            _ => None,
-        };
-        #[cfg(not(feature = "cuda"))]
-        let compute_capability: Option<(u32, u32)> = None;
-        let q4_math = Q4Math::pick(compute_capability);
+        let q4_math = Q4Math::pick_from(compute_capability, profile.var("LB_Q4_MATH"));
         let tensor_cores = {
             use cubecl::ir::{ElemType, FloatKind};
             let f16 = ElemType::Float(FloatKind::F16);
             let want = cubecl::ir::features::MmaConfig { a_type: f16, b_type: f16, cd_type: ElemType::Float(FloatKind::F32), m: 16, n: 16, k: 16 };
-            props.features.matmul.cmma.contains(&want) && pmax == 32 && pmin == 32 && std::env::var("LB_NO_TC").map(|v| v.is_empty() || v == "0").unwrap_or(true)
+            props.features.matmul.cmma.contains(&want) && pmax == 32 && pmin == 32 && profile.var("LB_NO_TC").map(|v| v.is_empty() || v == "0").unwrap_or(true)
         };
-        let fp16_pipe = !tensor_cores && compute_capability == Some((6, 0)) && std::env::var("LB_H2").is_ok_and(|v| !v.is_empty() && v != "0");
+        let profile_rows = profile.var("LB_Q4_ROWS");
+        let fp16_pipe = !tensor_cores && compute_capability == Some((6, 0)) && profile.var("LB_H2").is_some_and(|v| !v.is_empty() && v != "0");
         Ok(Self {
             fp16_pipe,
             tensor_cores,
             client,
             name: format!("{dev:?}"),
-            max_batch_rows: None,
-            card: None,
+            max_batch_rows,
+            profile,
+            card,
             cube_dim,
             use_plane,
             plane_size: (pmin, pmax),
@@ -344,7 +377,7 @@ impl Gpu {
             host_repack: AtomicBool::new(std::env::var_os("LB_HOST_REPACK").is_some()),
             batch_miss: AtomicBool::new(std::env::var_os("LB_NO_BATCH_MISS").is_none()),
             consts: Mutex::new(HashMap::new()),
-            q4_rows: AtomicUsize::new(q4_rows_from_env()),
+            q4_rows: AtomicUsize::new(q4_rows_from(profile_rows)),
             q4_xshared: AtomicBool::new(std::env::var("LB_Q4_XSHARED").map(|v| v == "1").unwrap_or(false)),
             xshared_max_cols: std::env::var("LB_Q4_XSHARED_MAX_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
             q4_math: AtomicU32::new(q4_math.code()),
@@ -2214,4 +2247,78 @@ impl ExpertSlots {
             }
         }
     }
+}
+
+/// The CUDA cards this process can see (the driver's order inside `CUDA_VISIBLE_DEVICES`), keyed for card-profile matching. Queries the
+/// driver only; no context is created, so it is safe next to a running seat.
+#[cfg(feature = "cuda")]
+pub fn probe_cuda_cards() -> Vec<lb_card_profile::CardKey> {
+    use cudarc::driver::result;
+    // dynamic loading panics, rather than errors, on a box with no libcuda (an AMD node)
+    if !matches!(std::panic::catch_unwind(|| result::init().is_ok()), Ok(true)) {
+        return Vec::new();
+    }
+    let n = result::device::get_count().unwrap_or(0).max(0) as usize;
+    (0..n)
+        .map(|i| lb_card_profile::CardKey { label: format!("cuda:{i}"), name: cuda_device_name(i).unwrap_or_default(), cuda_cc: cuda_compute_capability(i), pci: None })
+        .collect()
+}
+
+/// The Vulkan adapters of this machine (discrete and others), keyed for card-profile matching, with the kernel's facts where the PCI bus is
+/// known. Enumeration only; no device is created.
+pub fn probe_vulkan_cards() -> Vec<(lb_card_profile::CardKey, Option<lb_ternary_gpu::card_facts::CardFacts>)> {
+    lb_ternary_gpu::list_adapters()
+        .into_iter()
+        .map(|row| {
+            let facts = (!row.bus.is_empty()).then(|| lb_ternary_gpu::card_facts::read_card_facts(&row.bus)).flatten();
+            let idx = row.discrete_index.map(|i| format!("discrete:{i}")).unwrap_or_else(|| row.device_type.clone());
+            let key = lb_card_profile::CardKey { label: if row.bus.is_empty() { idx } else { format!("{} {idx}", row.bus) }, name: row.name, cuda_cc: None, pci: facts.as_ref().map(|f| (f.vendor, f.device)) };
+            (key, facts)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod card_profile_tests {
+    use super::*;
+
+    #[test]
+    fn gpu_less_probe_paths_do_not_panic() {
+        // enumeration only; on a box with no Vulkan adapter this is an empty list
+        let _ = probe_vulkan_cards();
+        #[cfg(feature = "cuda")]
+        let _ = probe_cuda_cards();
+    }
+}
+
+/// What `--print-card-profile` shows: for every visible card (CUDA when built with the `cuda` feature, plus every Vulkan adapter) which
+/// profile matched and each knob's value with its source (default / profile / env). Probes only; no device is opened.
+pub fn card_profile_report() -> String {
+    card_profile_report_opts(false)
+}
+
+/// [`card_profile_report`]; `full` keeps the whole source text of each profile value.
+pub fn card_profile_report_opts(full: bool) -> String {
+    let mut out = String::new();
+    let set = lb_card_profile::ProfileSet::global();
+    out += &format!("{} profiles loaded{}\n", set.profiles.len(), std::env::var("LB_CARD_PROFILE_DIR").map(|d| format!(" (built-in + {d})")).unwrap_or_else(|_| " (built-in)".into()));
+    #[allow(unused_mut)]
+    let mut n = 0;
+    #[cfg(feature = "cuda")]
+    for key in probe_cuda_cards() {
+        n += 1;
+        out += &lb_card_profile::format_report_opts(&lb_card_profile::resolve_quiet(&key), full);
+    }
+    for (key, facts) in probe_vulkan_cards() {
+        n += 1;
+        let r = lb_card_profile::resolve_quiet(&key);
+        out += &lb_card_profile::format_report_opts(&r, full);
+        if let Some(f) = facts {
+            out += &format!("  card facts: {}\n", f.summary());
+        }
+    }
+    if n == 0 {
+        out += "no CUDA or Vulkan card visible\n";
+    }
+    out
 }

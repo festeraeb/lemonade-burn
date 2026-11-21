@@ -122,9 +122,23 @@ impl<'m, 'a> Pipeline<'m, 'a> {
             stages.push(Stage { graph: RefCell::new(GraphState::None), x_in, gpu, dev, first, head, vx_in, vgraph });
             first += cnt;
         }
-        let flush = std::env::var("LB_QW_FLUSH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-        let graph_on = std::env::var("LB_QW_GRAPH").map(|v| v != "0").unwrap_or(true);
+        // env > card profiles (the most constrained stage card decides) > default
+        let cards: Vec<_> = stages.iter().map(|s| s.gpu.profile.clone()).collect();
+        let flush = lb_card_profile::min_knob(&cards, "LB_QW_FLUSH").and_then(|v| v.parse().ok()).unwrap_or(1);
+        let graph_on = lb_card_profile::min_knob(&cards, "LB_QW_GRAPH").map(|v| v != "0").unwrap_or(true);
         Ok(Pipeline { model, mtp: None, stages, flush, graph_on, timing: std::env::var("LB_QW_TIMING").is_ok(), vm: spec_m, vwarm: std::cell::Cell::new(false) })
+    }
+
+    /// A card-profile knob over this pipeline's stage cards: env, else the smallest value any stage card's profile gives, else `None`.
+    pub fn knob_min(&self, name: &str) -> Option<String> {
+        let cards: Vec<_> = self.stages.iter().map(|s| s.gpu.profile.clone()).collect();
+        lb_card_profile::min_knob(&cards, name)
+    }
+
+    /// The card profiles of the first `n` CUDA cards (stage order), probed from the driver without opening them: for settings needed
+    /// before the pipeline exists (the MTP draft depth sizes its buffers).
+    pub fn probe_stage_profiles(n: usize) -> Vec<lb_card_profile::Resolved> {
+        lb_q4_gpu::store::probe_cuda_cards().iter().take(n).map(lb_card_profile::resolve_quiet).collect()
     }
 
     /// Run three single-token steps (plain, capture, replay) and reset: the CUDA graphs of every stage exist before any prefill runs (a capture started after

@@ -20,3 +20,9 @@ pub mod weights;
 pub use config::Config;
 pub use knobs::Knobs;
 pub use model::{Cache, CapturedLayer, Lfm2};
+
+/// The per-card profile report (`lemonade-burn-server --print-card-profile`): see `lb_q4_gpu::store::card_profile_report`.
+#[cfg(feature = "gpu")]
+pub fn card_profile_report() -> String {
+    lb_q4_gpu::store::card_profile_report()
+}

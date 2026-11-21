@@ -1,0 +1,31 @@
+{
+  "schema": "lb-card-profile-v1",
+  "id": "nvidia-turing-sm75",
+  "family": "NVIDIA Turing (sm_75): RTX 2060, RTX 2060 SUPER, Tesla T10",
+  "match": [
+    {
+      "cuda_cc": [
+        "7.5"
+      ]
+    },
+    {
+      "name_contains": [
+        "RTX 2060",
+        "Tesla T10"
+      ]
+    }
+  ],
+  "knobs": {},
+  "notes": [
+    "f16 tensor-core prefill GEMM (cmma 16x16x16, f32 accumulate) is chosen by probing the runtime (Gpu::tensor_cores), not by profile. T10 prefill 1352 / 1736 / 1598 tok/s at 512 / 2048 / 8192 (docs/PREFILL_SPLIT.md G4 re-run); LB_NO_TC=1 is the A/B switch.",
+    "tiled (online-softmax) prefill attention is code, on for every card: lb-q4-gpu bb0f1cf (LFM2, 17-20x the per-query kernel on a P100), lb-qwen35 3771e5f (any prompt length up to ctx).",
+    "tensor-core stage width: one block per stage (default) 8584 / 10168 GFLOP/s vs LB_TC_STAGE2=1 7338 / 8775 on the T10 (docs/PREFILL_SPLIT.md).",
+    "LB_Q4_MATH stays f32: f16 and dp4a changed nothing measurable on RTX 2060 / 2060 SUPER (docs/WORK_TO_WEIGHTS.md X7a speed table)."
+  ],
+  "not_measured": [
+    "LB_Q4_ROWS on sm_75",
+    "LB_PREFILL_UBATCH on the T10 with the qwen35 path",
+    "LB_QW_PREFILL_CHUNK (the 2060 holds 6 layers of the Qwen3.6 seat; the chunk there was set by the P100s)",
+    "P1000 / T10 / 2060 qwen35 MTP depth"
+  ]
+}

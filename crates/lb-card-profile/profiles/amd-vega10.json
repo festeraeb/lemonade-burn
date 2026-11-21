@@ -1,0 +1,38 @@
+{
+  "schema": "lb-card-profile-v1",
+  "id": "amd-vega10",
+  "family": "AMD Vega 10 (gfx900): Instinct MI25, Radeon Pro WX 9100",
+  "match": [
+    {
+      "pci": [
+        {
+          "vendor": "0x1002",
+          "device": [
+            "0x6860",
+            "0x687f"
+          ]
+        }
+      ]
+    },
+    {
+      "name_contains": [
+        "VEGA10"
+      ]
+    }
+  ],
+  "knobs": {
+    "LB_PREFILL_MAX_ROWS": {
+      "value": 128,
+      "source": "crates/lb-ternary-gpu/src/card_facts.rs header + c1-gemini-lessons-for-engine-2026-11-18.md finding F and section 2 (commit 86abbc4): chunks above 128 rows hung the compute ring under llama.cpp Vulkan ('ring comp timeout', device lost, card wedged until reboot); -b 128 -ub 128 is stable. Operator + claude-t440-env1, 2026-11-16. Our own prefill on the MI25 was not run (reproducing the wedge costs a c1 reboot)."
+    }
+  },
+  "notes": [
+    "no integer dot product (dp4a-like) instruction on gfx8/gfx9 (docs/ENGINE_VULKAN.md capability table); the Vulkan path has no compute capability, so LB_Q4_MATH stays f32.",
+    "power cap moves decode: MI25 LFM2-2.6B Q4_K_M tg128 107 / 124 / 129 tok/s at 110 / 140 / 170 W (antigravity-t440, c1-gemini-lessons finding E). The engine logs the cap at open (card_facts) and does not schedule on it.",
+    "wave64: kernels read the plane size at run time (docs/ENGINE_VULKAN.md). No ReBAR (BAR0 256 MiB of 16 GiB); the engine reports it and does not depend on it."
+  ],
+  "not_measured": [
+    "decode / prefill speed of our engine on the MI25 (tiel-c1 holds it)",
+    "LB_Q4_ROWS on Vega 10"
+  ]
+}

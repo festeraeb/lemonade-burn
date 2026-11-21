@@ -900,6 +900,13 @@ fn main() -> Result<()> {
             std::env::set_var("CUDA_PATH", p);
         }
     }
+    if std::env::args().any(|a| a == "--print-card-profile") {
+        #[cfg(feature = "gpu")]
+        print!("{}", lb_lfm2::card_profile_report());
+        #[cfg(not(feature = "gpu"))]
+        println!("--print-card-profile needs a build with the gpu feature");
+        return Ok(());
+    }
     let args = Args::parse();
     if let Some(t) = args.threads {
         rayon::ThreadPoolBuilder::new().num_threads(t).build_global()?;

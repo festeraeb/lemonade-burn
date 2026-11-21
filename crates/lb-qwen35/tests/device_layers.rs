@@ -52,7 +52,7 @@ fn device_layers_match_cpu_decoder() {
     }
     eprintln!("cpu pass done: {} tokens", ids.len());
     let gpu = lb_q4_gpu::Gpu::open().unwrap();
-    let dev = DevModel::upload(&gpu, &m, from..from + nl, 64).unwrap();
+    let dev = DevModel::upload(&gpu, &m, from..from + nl, 64, 0).unwrap();
     eprintln!("uploaded {nl} layers");
     let kind = |l: usize| if m.cfg.is_recurrent(from + l) { "delta-net" } else { "attention" };
     let n = m.cfg.n_embd;

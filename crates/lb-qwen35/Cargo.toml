@@ -14,6 +14,7 @@ cuda = ["gpu", "lb-q4-gpu/cuda"]
 [dependencies]
 lb-q4-gpu = { workspace = true, optional = true }
 lb-gguf.workspace = true
+lb-card-profile.workspace = true
 rayon.workspace = true
 half = "2"
 anyhow.workspace = true

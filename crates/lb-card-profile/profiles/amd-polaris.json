@@ -1,0 +1,39 @@
+{
+  "schema": "lb-card-profile-v1",
+  "id": "amd-polaris",
+  "family": "AMD Polaris (gfx803): RX 570 / RX 580, Radeon Pro WX 5100",
+  "match": {
+    "pci": [
+      {
+        "vendor": "0x1002",
+        "device": [
+          "0x67c0",
+          "0x67ff"
+        ]
+      },
+      {
+        "vendor": "0x1002",
+        "device": [
+          "0x6980",
+          "0x699f"
+        ]
+      },
+      {
+        "vendor": "0x1002",
+        "device": [
+          "0x6fdf"
+        ]
+      }
+    ]
+  },
+  "knobs": {},
+  "notes": [
+    "wave64; no subgroup surprises found. 24B Q4_0 on the RX 570: E2 router split over 64 cubes 5.09 -> 5.36 tok/s (LB_DD_FAST=0 turns it off), docs/ENGINE_VULKAN.md 10.2 table.",
+    "the upload ring is a vendored cubecl-wgpu patch switched by CUBECL_WGPU_RING_MB / _RING_THREADS / _POLL_CALLER (RX 570: 3.95 -> 5.38 tok/s); those are read by the vendored crate at stream creation, outside this layer.",
+    "the RX 570 had a 4 GiB BAR (ReBAR) once and then failed amdgpu init; the engine reports BAR and does not depend on it."
+  ],
+  "not_measured": [
+    "any LB_* knob on Polaris beyond the router split",
+    "WX 5100 (8 GB, x8 slot): parity runs only"
+  ]
+}

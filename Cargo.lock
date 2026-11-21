@@ -3883,6 +3883,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-card-profile"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lb-convert"
 version = "0.1.0"
 dependencies = [
@@ -4001,6 +4009,7 @@ dependencies = [
  "cubecl-environment",
  "cudarc",
  "half",
+ "lb-card-profile",
  "lb-gguf",
  "lb-littlebit",
  "lb-ternary-gpu",
@@ -4016,6 +4025,7 @@ dependencies = [
  "anyhow",
  "clap",
  "half",
+ "lb-card-profile",
  "lb-gguf",
  "lb-q4-gpu",
  "rayon",
@@ -4032,6 +4042,7 @@ dependencies = [
  "clap",
  "futures-util",
  "http-body-util",
+ "lb-card-profile",
  "lb-gguf",
  "lb-lfm2",
  "lb-model",

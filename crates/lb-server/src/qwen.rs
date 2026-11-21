@@ -49,8 +49,9 @@ fn prefill_min() -> usize {
 }
 
 /// Rows per prefill chunk (`LB_QW_PREFILL_CHUNK`; 0 = automatic 64..1024). A smaller chunk lowers the device temporaries, which matters when the weights nearly fill the cards.
-fn prefill_chunk() -> usize {
-    std::env::var("LB_QW_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+/// Env, else the smallest `LB_QW_PREFILL_CHUNK` any stage card's profile gives (P100: 256, measured 2026-11-16), else 0.
+fn prefill_chunk(pipe: &Pipeline) -> usize {
+    pipe.knob_min("LB_QW_PREFILL_CHUNK").and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 pub fn is_qwen(p: &Path) -> bool {
@@ -74,7 +75,8 @@ pub fn load(path: &Path, ctx: usize) -> Result<(QwenDev, Arc<TextCodec>, usize)>
     // with LB_MTP_ADAPT=1: then each round picks 0..=LB_MTP_DEPTH by measured acceptance and round time). Measured 2026-11-18 on 2 P100s,
     // Qwen3.6-35B-A3B Q5_K_M, server greedy: depth 1 fixed +14/-2/+15/+16 % (code/prose/primes/4k) vs off; adaptive max 2 +11/-4/+12/+9 %.
     let mtp_on = nextn && std::env::var("LB_MTP").map(|v| v == "1" || v == "on").unwrap_or(false);
-    let depth: usize = std::env::var("LB_MTP_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 7);
+    let stage_profiles = Pipeline::probe_stage_profiles(split.len());
+    let depth: usize = lb_card_profile::min_knob(&stage_profiles, "LB_MTP_DEPTH").and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 7);
     let adapt = std::env::var("LB_MTP_ADAPT").map(|v| v == "1").unwrap_or(false);
     let mut pipe = Pipeline::new_spec(model, &split, cap, if mtp_on { depth + 1 } else { 0 })?;
     if mtp_on {
@@ -107,7 +109,7 @@ impl QwenDev {
             (*g.last().unwrap(), hs)
         } else {
             let rows = std::sync::Mutex::new(Vec::new());
-            let l = self.pipe.prefill_h(tokens, cache.len, prefill_chunk(), Some(&rows)).expect("device prefill");
+            let l = self.pipe.prefill_h(tokens, cache.len, prefill_chunk(&self.pipe), Some(&rows)).expect("device prefill");
             let am = l.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
             (am, rows.into_inner().unwrap())
         };
@@ -180,7 +182,7 @@ impl Decoder for QwenDev {
         let pm = prefill_min();
         if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= self.cap {
             let t0 = std::time::Instant::now();
-            let l = self.pipe.prefill(tokens, cache.len, prefill_chunk()).expect("device prefill");
+            let l = self.pipe.prefill(tokens, cache.len, prefill_chunk(&self.pipe)).expect("device prefill");
             if trace() {
                 eprintln!("qwen: prefill of {} tokens at {} took {:.0} ms", tokens.len(), cache.len, t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -212,7 +214,7 @@ impl Decoder for QwenDev {
         let pm = prefill_min();
         if pm > 0 && tokens.len() >= pm && cache.len + tokens.len() <= self.cap {
             let t0 = std::time::Instant::now();
-            let l = self.pipe.prefill(tokens, cache.len, prefill_chunk()).expect("device prefill");
+            let l = self.pipe.prefill(tokens, cache.len, prefill_chunk(&self.pipe)).expect("device prefill");
             if trace() {
                 eprintln!("qwen: prefill of {} tokens at {} took {:.0} ms", tokens.len(), cache.len, t0.elapsed().as_secs_f64() * 1e3);
             }
