@@ -1,0 +1,16 @@
+[package]
+name = "lb-deepseek4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "deepseek41 (DeepSeek V4.1 Flash: 4-stream hyper-connections, MQA with compressed KV rows, Engram, sqrt-softplus MoE) CPU reference forward and per-layer parity check against llama.cpp"
+
+[dependencies]
+lb-gguf.workspace = true
+rayon.workspace = true
+half = "2"
+anyhow.workspace = true
+clap.workspace = true
+tokenizers.workspace = true
+ahash = "0.8"
