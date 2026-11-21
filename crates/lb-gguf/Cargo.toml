@@ -10,3 +10,7 @@ description = "GGUF reader (mmap) with block dequantization and CPU matvec for F
 memmap2.workspace = true
 rayon.workspace = true
 half = "2"
+
+[dev-dependencies]
+# ggml_ref_check: loads llama.cpp's libggml-base.so at run time to compare dequantisers (reference only).
+libloading = "0.8"

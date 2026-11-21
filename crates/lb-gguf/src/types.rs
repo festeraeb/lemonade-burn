@@ -29,6 +29,10 @@ pub enum GgmlType {
     IQ3S,
     IQ1S,
     IQ1M,
+    /// OCP microscaling FP4 (GGML type id 39): 32 values in 17 bytes, one E8M0 exponent byte `e` then
+    /// 16 nibble bytes of E2M1 codes (low nibble = value j, high = value j + 16). Value =
+    /// `MXFP4_LEVELS[code] * 2^(e - 128)` (the levels are E2M1 doubled, the scale halved).
+    MXFP4,
     /// Any other type id: readable as raw bytes, not dequantizable here.
     Other(u32),
 }
@@ -55,6 +59,7 @@ impl GgmlType {
             23 => GgmlType::IQ4XS,
             29 => GgmlType::IQ1M,
             30 => GgmlType::BF16,
+            39 => GgmlType::MXFP4,
             other => GgmlType::Other(other),
         }
     }
@@ -80,6 +85,7 @@ impl GgmlType {
             GgmlType::IQ3S => "IQ3_S".into(),
             GgmlType::IQ1S => "IQ1_S".into(),
             GgmlType::IQ1M => "IQ1_M".into(),
+            GgmlType::MXFP4 => "MXFP4".into(),
             GgmlType::Other(id) => format!("type#{id}"),
         }
     }
@@ -115,6 +121,7 @@ impl GgmlType {
             GgmlType::IQ1S => (256, 50),
             // qs[32] | qh[16] | scales[8] (the f16 scale is spread over the top nibbles of `scales`)
             GgmlType::IQ1M => (256, 56),
+            GgmlType::MXFP4 => (32, 17),
             GgmlType::Other(_) => return None,
         })
     }
@@ -206,6 +213,11 @@ impl GgmlType {
                         GgmlType::IQ1S => dequant_iq1_s_block(b, o),
                         _ => dequant_iq1_m_block(b, o),
                     }
+                }
+            }
+            GgmlType::MXFP4 => {
+                for (o, b) in dst.chunks_exact_mut(32).zip(src.chunks_exact(17)) {
+                    dequant_mxfp4_block(b, o);
                 }
             }
             GgmlType::Other(id) => panic!("cannot dequantize ggml type {id}"),
@@ -611,6 +623,39 @@ mod kquant_tests {
             assert!(out.iter().all(|v| v.is_finite()), "{} produced a non-finite value", ty.name());
         }
     }
+
+    /// E8M0 decode: 2^(e-128) exactly, including the two subnormal codes and the top code.
+    #[test]
+    fn e8m0_half_scale() {
+        assert_eq!(e8m0_half(128), 1.0);
+        assert_eq!(e8m0_half(127), 0.5);
+        assert_eq!(e8m0_half(130), 4.0);
+        assert_eq!(e8m0_half(2), 2f32.powi(-126)); // smallest normal
+        assert_eq!(e8m0_half(1), 2f32.powi(-127)); // subnormal
+        assert_eq!(e8m0_half(0), 2f32.powi(-128)); // subnormal
+        assert_eq!(e8m0_half(254), 2f32.powi(126));
+        assert_eq!(e8m0_half(255), 2f32.powi(127));
+    }
+
+    /// MXFP4 block: nibble placement (low = j, high = j + 16), sign codes, and the scale.
+    #[test]
+    fn mxfp4_block_layout() {
+        let mut b = [0u8; 17];
+        b[0] = 129; // OCP scale 2^(129-127) = 4
+        for j in 0..16 {
+            b[1 + j] = (j as u8) | (((15 - j) as u8) << 4);
+        }
+        let mut out = [f32::NAN; 32];
+        GgmlType::MXFP4.dequant_row(&b, &mut out);
+        let e2m1 = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        for j in 0..16 {
+            let v = |code: usize| if code < 8 { e2m1[code] } else { -e2m1[code - 8] };
+            assert_eq!(out[j], 4.0 * v(j), "low nibble {j}");
+            assert_eq!(out[j + 16], 4.0 * v(15 - j), "high nibble {j}");
+        }
+        assert_eq!(GgmlType::from_id(39), GgmlType::MXFP4);
+        assert_eq!(GgmlType::MXFP4.row_bytes(4096), Some(4096 / 32 * 17));
+    }
 }
 
 /// The 16 levels of the IQ4 formats (IQ4_NL, IQ4_XS), part of the GGUF format definition: a
@@ -644,6 +689,35 @@ pub fn dequant_iq4_xs_block(b: &[u8], out: &mut [f32]) {
             o[j] = dl * IQ4_LEVELS[(q[j] & 15) as usize] as f32;
             o[j + 16] = dl * IQ4_LEVELS[(q[j] >> 4) as usize] as f32;
         }
+    }
+}
+
+// ---- MXFP4 (OCP Microscaling Formats v1.0: E2M1 elements, one E8M0 scale per 32) ----
+//
+// The GGUF block keeps the E2M1 code as a signed integer level twice the element's value
+// (`MXFP4_LEVELS`), and folds the matching factor 1/2 into the scale: `2^(e-127) / 2 = 2^(e-128)`.
+// Semantics checked against llama.cpp `dequantize_row_mxfp4` (ggml-quants.c, MIT), which computes
+// `level * scale` in f32: both factors are exact (small integer, power of two), so every product is
+// exact and the result is bit-identical whatever the order.
+
+/// E2M1 code -> 2 x value: codes 0..7 are +{0, 0.5, 1, 1.5, 2, 3, 4, 6}, codes 8..15 the negatives.
+pub const MXFP4_LEVELS: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// `2^(e - 128)` as f32, exactly, for an E8M0 byte (e = 0 and 1 land in the f32 subnormals).
+/// e = 255 (the E8M0 NaN) decodes as 2^127, as the reference does (it does not handle NaN).
+#[inline]
+pub fn e8m0_half(e: u8) -> f32 {
+    let bits = if e < 2 { 0x0020_0000u32 << e } else { ((e as u32) - 1) << 23 };
+    f32::from_bits(bits)
+}
+
+/// MXFP4 block (17 bytes, 32 values): E8M0 `e`, then 16 bytes; byte j's low nibble is value j and
+/// its high nibble value j + 16.
+pub fn dequant_mxfp4_block(b: &[u8], out: &mut [f32]) {
+    let d = e8m0_half(b[0]);
+    for j in 0..16 {
+        out[j] = MXFP4_LEVELS[(b[1 + j] & 15) as usize] as f32 * d;
+        out[j + 16] = MXFP4_LEVELS[(b[1 + j] >> 4) as usize] as f32 * d;
     }
 }
 

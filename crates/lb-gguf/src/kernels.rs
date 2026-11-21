@@ -46,6 +46,7 @@ impl<'a> QuantMat<'a> {
         match self.ty {
             GgmlType::Q4_0 => dot_q4_0(row, x),
             GgmlType::Q8_0 => dot_q8_0(row, x),
+            GgmlType::MXFP4 => dot_mxfp4(row, x),
             _ => {
                 let mut buf = vec![0f32; self.cols];
                 self.ty.dequant_row(row, &mut buf);
@@ -83,6 +84,23 @@ pub fn dot_q8_0(row: &[u8], x: &[f32]) -> f32 {
             s += (b[2 + j] as i8) as f32 * xs[j];
         }
         acc += d * s;
+    }
+    acc
+}
+
+/// MXFP4 row dot product: per 32-value block, the integer levels (E2M1 doubled) dotted with `x`, then
+/// times the block's power-of-two scale. Same sum as dequantise-then-dot up to f32 summation order.
+pub fn dot_mxfp4(row: &[u8], x: &[f32]) -> f32 {
+    use crate::types::{e8m0_half, MXFP4_LEVELS};
+    debug_assert_eq!(row.len() / 17 * 32, x.len());
+    let mut acc = 0f32;
+    for (b, xs) in row.chunks_exact(17).zip(x.chunks_exact(32)) {
+        let mut s = 0f32;
+        for j in 0..16 {
+            s += MXFP4_LEVELS[(b[1 + j] & 15) as usize] as f32 * xs[j];
+            s += MXFP4_LEVELS[(b[1 + j] >> 4) as usize] as f32 * xs[j + 16];
+        }
+        acc += e8m0_half(b[0]) * s;
     }
     acc
 }
@@ -135,6 +153,25 @@ mod tests {
     fn lcg(seed: &mut u64) -> f32 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((*seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+
+    #[test]
+    fn mxfp4_dot_matches_dequantized_f32() {
+        let (rows, cols) = (5, 128);
+        let mut s = 9u64;
+        // random bytes are valid MXFP4 blocks; keep the exponent near 127 so values are moderate
+        let bytes: Vec<u8> = (0..rows * cols / 32 * 17)
+            .map(|i| { let v = (lcg(&mut s) * 127.0 + 128.0) as u8; if i % 17 == 0 { 120 + v % 12 } else { v } })
+            .collect();
+        let x: Vec<f32> = (0..cols).map(|_| lcg(&mut s)).collect();
+        let qm = QuantMat::new(GgmlType::MXFP4, rows, cols, &bytes);
+        let mut buf = vec![0f32; cols];
+        for r in 0..rows {
+            qm.dequant_row(r, &mut buf);
+            let want: f32 = buf.iter().zip(&x).map(|(a, b)| a * b).sum();
+            let got = qm.dot(r, &x);
+            assert!((got - want).abs() <= 1e-4 * (1.0 + want.abs()), "r{r}: {got} vs {want}");
+        }
     }
 
     #[test]
