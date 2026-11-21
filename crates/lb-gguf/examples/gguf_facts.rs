@@ -76,6 +76,28 @@ fn main() {
             println!("T {}\t{}\t{:?}\t{}", t.name, t.ty.name(), t.dims, nb);
         }
     }
+    if a.iter().any(|x| x == "--layers") {
+        // bytes per layer, split into experts (`*_exps`) and the rest, for placement tables
+        let mut per: BTreeMap<usize, (usize, usize, usize)> = BTreeMap::new();
+        let mut other = 0usize;
+        for (_, t) in set.tensors() {
+            let nb = t.n_bytes().unwrap_or(0);
+            let p: Vec<&str> = t.name.split('.').collect();
+            match (p.first(), p.get(1).and_then(|x| x.parse::<usize>().ok())) {
+                (Some(&"blk"), Some(il)) => {
+                    let e = per.entry(il).or_default();
+                    if t.name.contains("_exps") { e.0 += nb } else { e.1 += nb }
+                    e.2 += 1;
+                }
+                _ => other += nb,
+            }
+        }
+        println!("\n## per layer: layer | expert bytes | non-expert bytes | total | tensors");
+        for (il, (ex, ne, n)) in &per {
+            println!("{il} | {ex} | {ne} | {} | {n}", ex + ne);
+        }
+        println!("outside layers (embeddings, head, tables): {other}");
+    }
     println!("\n## quant types: type | tensors | bytes | GiB | elements | bits/weight");
     for (ty, (n, b, e)) in &by_ty {
         println!("{ty} | {n} | {b} | {:.3} | {e} | {:.3}", *b as f64 / (1u64 << 30) as f64, 8.0 * *b as f64 / *e as f64);
