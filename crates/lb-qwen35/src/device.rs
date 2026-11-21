@@ -611,9 +611,15 @@ impl DevModel {
         let shout = if skip("shared") {
             self.zeros.clone()
         } else {
-            let g = l.sh_gate.launch(gpu, &h2);
-            let u = l.sh_up.launch(gpu, &h2);
-            let sh = gpu.qw_silu_mul(&g, &u, c.ff_shexp);
+            let fused = match (&l.sh_gate, &l.sh_up) {
+                (DMat::Q8(g), DMat::Q8(u)) if gpu.kq.sh_fuse => lb_q4_gpu::GpuQ8Mat::gate_up_silu(gpu, g, u, &h2),
+                _ => None,
+            };
+            let sh = fused.unwrap_or_else(|| {
+                let g = l.sh_gate.launch(gpu, &h2);
+                let u = l.sh_up.launch(gpu, &h2);
+                gpu.qw_silu_mul(&g, &u, c.ff_shexp)
+            });
             l.sh_down.launch(gpu, &sh)
         };
         let out = gpu.qw_moe_combine(&x1, &down, &weights, &shout, &logits, c.n_expert + 1, c.n_expert, c.n_embd, c.n_used);

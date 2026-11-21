@@ -43,6 +43,7 @@ pub const KNOBS: &[KnobDef] = &[
     KnobDef { name: "LB_QW_ATTN_CUBES", default: "112", profile: true, about: "cubes of the split attention scores kernel (with LB_QW_ATTN_SPLIT=1)" },
     KnobDef { name: "LB_QW_GU_R", default: "2", profile: true, about: "rows a plane takes in the qwen35 routed gate+up kernel (1, 2, 4)" },
     KnobDef { name: "LB_QW_DN_R", default: "1", profile: true, about: "rows a lane group takes in the qwen35 routed down kernel (1, 2, 4, 8); bit-identical for any value" },
+    KnobDef { name: "LB_QW_SH_FUSE", default: "0", profile: true, about: "qwen35 shared expert gate+up+SiLU (Q8_0) in one launch instead of three; bit-identical (1 on)" },
     // env-only: documented so the inventory is complete, not read through a profile yet
     KnobDef { name: "QWEN_SPLIT", default: "even over CUDA_VISIBLE_DEVICES", profile: false, about: "qwen35 layers per stage; depends on model + card set, so it is seat placement, not a card property" },
     KnobDef { name: "LB_MTP", default: "off", profile: false, about: "turn the qwen35 MTP draft on (an operator decision per seat)" },

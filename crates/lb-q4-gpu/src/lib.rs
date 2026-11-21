@@ -1436,6 +1436,89 @@ fn q8_0_matvec_rows_mt_kernel(qs: &[V4U], sc: &[u32], x: &[V4F], dims: &[u32], o
     }
 }
 
+/// `LB_QW_SH_FUSE` (P100 tuning 2026-11-21): `out = silu(gate . x) * (up . x)` for two Q8_0 matrices of the same shape (the qwen35 shared
+/// expert), one launch instead of three (gate matvec, up matvec, `qw_silu_mul`). Each row's gate and up sums are computed with exactly the
+/// code of [`q8_0_matvec_rows_kernel`] and the product with `qw_silu_mul`'s expression, so the result is bit-identical. One token row.
+#[cube(launch)]
+fn q8_0_gate_up_silu_rows_kernel(gq: &[V4U], gs: &[u32], uq: &[V4U], us: &[u32], x: &[V4F], dims: &[u32], out: &mut [f32], #[comptime] r: usize) {
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let bpr = cols / 32usize;
+    let width = PLANE_DIM as usize;
+    let plane_id = (UNIT_POS / PLANE_DIM) as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let ppc = CUBE_DIM_X as usize / width;
+    let step = CUBE_COUNT as usize * ppc;
+    let groups = out.len() / r;
+    let mut g = CUBE_POS as usize * ppc + plane_id;
+    let mut acc = Array::<f32>::new(r);
+    let mut acu = Array::<f32>::new(r);
+    while g < groups {
+        let o0 = g * r;
+        let r0 = o0 % rows;
+        let mut accv = Array::<V4F>::new(r);
+        let mut accu = Array::<V4F>::new(r);
+        #[unroll]
+        for i in 0..r {
+            accv[i] = V4F::new(0.0f32);
+            accu[i] = V4F::new(0.0f32);
+        }
+        let mut b = lane;
+        while b < bpr {
+            let mut xv = Array::<V4F>::new(8usize);
+            #[unroll]
+            for j in 0..8usize {
+                xv[j] = x[b * 8usize + j];
+            }
+            #[unroll]
+            for i in 0..r {
+                let gb = (r0 + i) * bpr + b;
+                let dg = f16_to_f32((gs[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+                let du = f16_to_f32((us[gb / 2usize] >> (((gb % 2usize) * 16usize) as u32)) & 65535u32);
+                let mut sg = V4F::new(0.0f32);
+                let mut su = V4F::new(0.0f32);
+                #[unroll]
+                for h in 0..2usize {
+                    let wg = gq[2usize * gb + h];
+                    let wu = uq[2usize * gb + h];
+                    #[unroll]
+                    for bb in 0..4u32 {
+                        let byg = (wg >> V4U::new(8u32 * bb)) & V4U::new(255u32);
+                        let fg = V4F::cast_from(V4I::cast_from(byg ^ V4U::new(128u32)) - V4I::new(128i32));
+                        sg += fg * xv[4usize * h + bb as usize];
+                        let byu = (wu >> V4U::new(8u32 * bb)) & V4U::new(255u32);
+                        let fu = V4F::cast_from(V4I::cast_from(byu ^ V4U::new(128u32)) - V4I::new(128i32));
+                        su += fu * xv[4usize * h + bb as usize];
+                    }
+                }
+                accv[i] += V4F::new(dg) * sg;
+                accu[i] += V4F::new(du) * su;
+            }
+            b += width;
+        }
+        #[unroll]
+        for i in 0..r {
+            let a = accv[i];
+            acc[i] = a.extract(0usize) + a.extract(1usize) + a.extract(2usize) + a.extract(3usize);
+            let u = accu[i];
+            acu[i] = u.extract(0usize) + u.extract(1usize) + u.extract(2usize) + u.extract(3usize);
+        }
+        #[unroll]
+        for c in 0..r / 4 {
+            let v = plane_sum4(&acc, c);
+            let w = plane_sum4(&acu, c);
+            if lane == 0usize {
+                #[unroll]
+                for k in 0..4usize {
+                    let gv = v.extract(k);
+                    out[o0 + 4 * c + k] = gv / (1.0f32 + Exp::exp(-gv)) * w.extract(k);
+                }
+            }
+        }
+        g += step;
+    }
+}
+
 /// Q8_0 matvec, `r` rows per plane (needs plane ops; `rows % r == 0`, `r % 4 == 0`). `dims` =
 /// [rows, cols]; output `o = t * rows + row`.
 #[cube(launch)]

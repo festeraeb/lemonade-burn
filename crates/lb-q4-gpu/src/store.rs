@@ -133,6 +133,9 @@ pub struct KqTune {
     /// `LB_QW_DN_R`: rows a lane group takes in the routed down kernels (Q5_K / Q6_K), sharing its activation loads (default 1). Each row's
     /// arithmetic does not depend on it, so any value gives the same bits.
     pub dn_r: usize,
+    /// `LB_QW_SH_FUSE`: the qwen35 shared expert's gate, up and SiLU product in one launch when both are Q8_0 (`GpuQ8Mat::gate_up_silu`);
+    /// bit-identical.
+    pub sh_fuse: bool,
 }
 
 impl KqTune {
@@ -144,6 +147,7 @@ impl KqTune {
             attn_cubes: p.parse("LB_QW_ATTN_CUBES").unwrap_or(112),
             gu_r: p.parse::<usize>("LB_QW_GU_R").filter(|r| matches!(r, 1 | 2 | 4)).unwrap_or(2),
             dn_r: p.parse::<usize>("LB_QW_DN_R").filter(|r| matches!(r, 1 | 2 | 4 | 8)).unwrap_or(1),
+            sh_fuse: on("LB_QW_SH_FUSE", false),
         }
     }
 }
@@ -1127,6 +1131,31 @@ impl GpuQ8Mat {
         let out = self.launch(gpu, &xh, m);
         let padded = gpu.read_all(vec![(out, m * self.rows_pad)])?.remove(0);
         Ok(padded.chunks_exact(self.rows_pad).flat_map(|r| r[..self.rows].iter().copied()).collect())
+    }
+
+    /// `silu(gate . x) * (up . x)` for one token row in one launch (`q8_0_gate_up_silu_rows_kernel`; `LB_QW_SH_FUSE`), bit-identical to
+    /// `gate.launch`, `up.launch` and `qw_silu_mul`. `None` when the two matrices differ in shape. Output `[rows_pad]`.
+    pub fn gate_up_silu(gpu: &Gpu, gate: &GpuQ8Mat, up: &GpuQ8Mat, x: &Handle) -> Option<Handle> {
+        if gate.rows_pad != up.rows_pad || gate.cols != up.cols || gate.rows_pad % 4 != 0 {
+            return None;
+        }
+        let out = gpu.scratch(gate.rows_pad * 4);
+        unsafe {
+            crate::q8_0_gate_up_silu_rows_kernel::launch(
+                &gpu.client,
+                cube_count(gate.rows_pad / 4, gpu.per_cube()),
+                CubeDim::new_1d(gpu.cube_dim as u32),
+                BufferArg::from_raw_parts(gate.qs.clone(), gate.n_qs / 4),
+                BufferArg::from_raw_parts(gate.sc.clone(), gate.n_sc),
+                BufferArg::from_raw_parts(up.qs.clone(), up.n_qs / 4),
+                BufferArg::from_raw_parts(up.sc.clone(), up.n_sc),
+                BufferArg::from_raw_parts(x.clone(), gate.cols / 4),
+                BufferArg::from_raw_parts(gate.dims.clone(), 2),
+                BufferArg::from_raw_parts(out.clone(), gate.rows_pad),
+                4usize,
+            );
+        }
+        Some(out)
     }
 }
 

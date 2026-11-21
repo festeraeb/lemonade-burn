@@ -4,7 +4,44 @@
 mod common;
 use common::Rng;
 use lb_gguf::{GgmlType, QuantMat};
-use lb_q4_gpu::{Gpu, GpuQ6KNative};
+use lb_q4_gpu::{Gpu, GpuQ6KNative, GpuQ8Mat};
+
+fn q8_rows(rng: &mut Rng, rows: usize, cols: usize) -> Vec<u8> {
+    let mut v: Vec<u8> = (0..rows * cols / 32 * 34).map(|_| rng.byte()).collect();
+    for blk in v.chunks_exact_mut(34) {
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.001 + 0.03 * (rng.unit() * 0.5 + 0.5)).to_le_bytes());
+    }
+    v
+}
+
+#[test]
+fn fused_shared_gate_up_silu_matches_three_launches() {
+    let gpu = Gpu::open().unwrap();
+    let mut cases: Vec<(String, usize, usize, Vec<u8>, Vec<u8>)> = Vec::new();
+    for (rows, cols, seed) in [(512usize, 2048usize, 31u64), (64, 512, 32), (1000, 1024, 33)] {
+        let mut rng = Rng(seed);
+        cases.push((format!("random {rows}x{cols}"), rows, cols, q8_rows(&mut rng, rows, cols), q8_rows(&mut rng, rows, cols)));
+    }
+    let path = std::path::Path::new("/mnt/raid0/models/Qwen3.6-35B-A3B-Q5_K_M.gguf");
+    if path.exists() {
+        let g = lb_gguf::Gguf::open(path).unwrap();
+        for blk in [0usize, 3, 39] {
+            let (tg, tu) = (g.tensor(&format!("blk.{blk}.ffn_gate_shexp.weight")).unwrap(), g.tensor(&format!("blk.{blk}.ffn_up_shexp.weight")).unwrap());
+            cases.push((format!("real blk.{blk} shared gate/up"), tg.dims[1], tg.dims[0], g.tensor_bytes(tg).to_vec(), g.tensor_bytes(tu).to_vec()));
+        }
+    }
+    for (label, rows, cols, gb, ub) in &cases {
+        let gm = GpuQ8Mat::upload(&gpu, QuantMat::new(GgmlType::Q8_0, *rows, *cols, gb)).unwrap();
+        let um = GpuQ8Mat::upload(&gpu, QuantMat::new(GgmlType::Q8_0, *rows, *cols, ub)).unwrap();
+        let mut rng = Rng(5);
+        let x = gpu.upload_f32(&(0..*cols).map(|_| rng.unit() * 2.0).collect::<Vec<_>>());
+        let (g, u) = (gm.launch(&gpu, &x, 1), um.launch(&gpu, &x, 1));
+        let three = gpu.qw_silu_mul(&g, &u, *rows);
+        let one = GpuQ8Mat::gate_up_silu(&gpu, &gm, &um, &x).expect("same shape");
+        let r = gpu.read_all(vec![(three, *rows), (one, *rows)]).unwrap();
+        same(&r[0], &r[1], &format!("fused shared gate+up+SiLU, {label}"));
+    }
+}
 
 fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
