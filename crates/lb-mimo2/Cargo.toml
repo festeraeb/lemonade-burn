@@ -1,0 +1,16 @@
+[package]
+name = "lb-mimo2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "mimo2 (Xiaomi MiMo-V2 Flash MoE: hybrid full / sliding-window attention with sinks, sigmoid-routed 256-expert MoE) CPU reference decoder and per-layer parity check"
+
+[dependencies]
+lb-gguf.workspace = true
+rayon.workspace = true
+half = "2"
+anyhow.workspace = true
+clap.workspace = true
+tokenizers.workspace = true
+ahash = "0.8"

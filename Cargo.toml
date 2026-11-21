@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/lb-ternary", "crates/lb-convert", "crates/lb-model", "crates/lb-server", "crates/lb-gguf", "crates/lb-lfm2", "crates/lb-ternary-gpu", "crates/lb-q4-gpu", "crates/lb-calibrate", "crates/lb-addmodel", "crates/lb-expert-predict", "crates/lb-expert-host", "crates/lb-qwen35", "crates/lb-littlebit"]
+members = ["crates/lb-ternary", "crates/lb-convert", "crates/lb-model", "crates/lb-server", "crates/lb-gguf", "crates/lb-lfm2", "crates/lb-ternary-gpu", "crates/lb-q4-gpu", "crates/lb-calibrate", "crates/lb-addmodel", "crates/lb-expert-predict", "crates/lb-expert-host", "crates/lb-qwen35", "crates/lb-littlebit", "crates/lb-mimo2", "crates/lb-deepseek4"]
 # `cargo build` at the root stays CPU-only; the GPU crates (wgpu) build with -p or the `gpu` features.
-default-members = ["crates/lb-ternary", "crates/lb-convert", "crates/lb-model", "crates/lb-server", "crates/lb-gguf", "crates/lb-lfm2", "crates/lb-calibrate", "crates/lb-expert-predict", "crates/lb-expert-host", "crates/lb-qwen35", "crates/lb-littlebit"]
+default-members = ["crates/lb-ternary", "crates/lb-convert", "crates/lb-model", "crates/lb-server", "crates/lb-gguf", "crates/lb-lfm2", "crates/lb-calibrate", "crates/lb-expert-predict", "crates/lb-expert-host", "crates/lb-qwen35", "crates/lb-littlebit", "crates/lb-mimo2", "crates/lb-deepseek4"]
 
 [workspace.package]
 version = "0.1.0"

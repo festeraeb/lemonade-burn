@@ -3898,6 +3898,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-deepseek4"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "clap",
+ "half",
+ "lb-gguf",
+ "rayon",
+ "tokenizers",
+]
+
+[[package]]
 name = "lb-expert-host"
 version = "0.1.0"
 dependencies = [
@@ -3935,6 +3948,7 @@ name = "lb-gguf"
 version = "0.1.0"
 dependencies = [
  "half",
+ "libloading 0.8.9",
  "memmap2",
  "rayon",
 ]
@@ -3973,6 +3987,19 @@ dependencies = [
  "safetensors 0.8.0",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "lb-mimo2"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "clap",
+ "half",
+ "lb-gguf",
+ "rayon",
+ "tokenizers",
 ]
 
 [[package]]
