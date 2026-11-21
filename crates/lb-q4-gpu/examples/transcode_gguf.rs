@@ -17,6 +17,7 @@ fn type_id(ty: GgmlType) -> u32 {
     match ty {
         GgmlType::F32 => 0,
         GgmlType::F16 => 1,
+        GgmlType::BF16 => 30,
         GgmlType::Q4_0 => 2,
         GgmlType::Q8_0 => 8,
         GgmlType::Q2K => 10,
