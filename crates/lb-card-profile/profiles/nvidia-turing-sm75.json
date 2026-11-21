@@ -15,7 +15,16 @@
       ]
     }
   ],
-  "knobs": {},
+  "knobs": {
+    "LB_QW_ATTN_SPLIT": {
+      "value": 1,
+      "source": "docs/P100_KERNEL_TUNING.md (2026-11-21, c4 RTX 2060 3C as stage 0 of the 6,17,17 Qwen3.6 seat layout): attention core at n=4096 532 -> 98 us, n=64 14.4 -> 11.5 us; bit-identical (tests/p100_variants_bitwise.rs passes on the 2060). Measured on the RTX 2060 only, not on the 2060 SUPER or T10."
+    },
+    "LB_QW_Q6_LG": {
+      "value": 1,
+      "source": "docs/P100_KERNEL_TUNING.md (2026-11-21, same setup): attn_q Q6_K 8192x2048 96.6 -> 94.2 us (inside run-to-run noise: not slower); bit-identical on the 2060. Measured on the RTX 2060 only."
+    }
+  },
   "notes": [
     "f16 tensor-core prefill GEMM (cmma 16x16x16, f32 accumulate) is chosen by probing the runtime (Gpu::tensor_cores), not by profile. T10 prefill 1352 / 1736 / 1598 tok/s at 512 / 2048 / 8192 (docs/PREFILL_SPLIT.md G4 re-run); LB_NO_TC=1 is the A/B switch.",
     "tiled (online-softmax) prefill attention is code, on for every card: lb-q4-gpu bb0f1cf (LFM2, 17-20x the per-query kernel on a P100), lb-qwen35 3771e5f (any prompt length up to ctx).",

@@ -34,6 +34,14 @@
     "LB_PREFILL_UBATCH": {
       "value": 2048,
       "source": "docs/PREFILL_SPLIT.md: 2048 rows 780 tok/s vs 594 at 512, P100 in c2's Gen3 x4 slot, LFM2.5-24B Q4_0. Same as the code default."
+    },
+    "LB_QW_ATTN_SPLIT": {
+      "value": 1,
+      "source": "docs/P100_KERNEL_TUNING.md (2026-11-21, c4 P100 3B+86, Qwen3.6-35B-A3B Q5_K_M, split 21,19): decode at ~4.2k context 44.6 -> 61.7 (code) / 43.7 -> 61.8 (prose) tok/s, short context 69.9 -> 69.8; attention core at n=4096 818 -> 194 us a layer. Bit-identical (tests/p100_variants_bitwise.rs; 4/4 greedy shas equal)."
+    },
+    "LB_QW_Q6_LG": {
+      "value": 1,
+      "source": "docs/P100_KERNEL_TUNING.md (2026-11-21, same setup): output head 1675 -> 1093 us, attn_q 64.9 -> 49.5 us; decode short 69.8 -> 71.4, ~4.2k context 61.7 -> 63.6 tok/s on top of LB_QW_ATTN_SPLIT. Bit-identical (tests/p100_variants_bitwise.rs; 4/4 greedy shas equal)."
     }
   },
   "notes": [

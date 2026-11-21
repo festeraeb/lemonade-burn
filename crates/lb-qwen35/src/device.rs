@@ -306,6 +306,15 @@ impl DevModel {
             v.push(time("k matvec", &|| a.k.launch(gpu, &x)));
             let oin = gpu.upload_f32(&vec![0.1f32; c.n_head * c.head_dim]);
             v.push(time("o matvec", &|| a.o.launch(gpu, &oin)));
+            // the one-token attention (norms, rope, cache append, softmax attention) at two context lengths (writes cache entry n-1: timing only)
+            let qf = gpu.upload_f32(&(0..c.n_head * 2 * c.head_dim).map(|i| (i as f32 * 0.013).sin()).collect::<Vec<_>>());
+            let kr = gpu.upload_f32(&(0..c.n_head_kv * c.head_dim).map(|i| (i as f32 * 0.029).cos()).collect::<Vec<_>>());
+            for (n, name) in [(64usize, "attention core n=64"), (4096, "attention core n=4096")] {
+                if n <= self.cap {
+                    let ph = gpu.upload_u32(vec![(n - 1) as u32]);
+                    v.push(time(name, &|| gpu.qw_attention(&qf, &kr, &kr, &a.qn, &a.kn, &a.kc, &a.vc, &ph, (c.n_head, c.n_head_kv, c.head_dim, c.n_rot / 2, self.cap), c.eps, self.theta_scale)));
+                }
+            }
         }
         let logits = gpu.upload_f32(&(0..c.n_expert).map(|i| (i as f32 * 0.37).sin()).collect::<Vec<_>>());
         v.push(time("router+shared-gate matvec", &|| gpu.qw_f32_matvec(&l.router_sg, &x, c.n_expert + 1, c.n_embd)));
