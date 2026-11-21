@@ -15,10 +15,6 @@
     }
   ],
   "knobs": {
-    "LB_QW_PREFILL_CHUNK": {
-      "value": 256,
-      "source": "lb-qwen35-c4-tuning-2026-11-16.md Step 0 table: 2xP100 (AF+D8), Tiel Q5_K_XL 26.6 GB, split 19,21: auto chunk OOMs on the 2nd long prompt (AF 16267 of 16384 MiB), chunk 256 stable at 410 tok/s prompt, decode 76 tok/s. Measured before the Q8 dedup (b96fa22, 0.2-0.75 GB per card back); not re-measured without it. Matters only when weights nearly fill the card."
-    },
     "LB_QW_GRAPH": {
       "value": 1,
       "source": "lb-qwen35-c4-tuning-2026-11-16.md (76 tok/s decode with graphs) and c1-gemini-lessons-for-engine-2026-11-18.md section 1 (graphed verify 25.1 -> 21.5 ms). Same as the code default."
@@ -48,7 +44,8 @@
     "pinned staging pool and cuMemHostRegister of the GGUF mmap are on by default for CUDA: miss path 0.28 ms vs 1.1 ms, 1.40x (memory gpu-zero-copy-miss-path, eec4500). Env-only switches LB_NO_PINNED / LB_NO_REGISTER.",
     "LB_Q4_MATH stays f32: X7a f16 on sm_60 gave 1.03x and failed the accuracy gate (docs/WORK_TO_WEIGHTS.md X7a results).",
     "LB_H2=1 (fp16 half2 prefill GEMM) is faster (930 vs 780 tok/s at 2k) but fails G1 (top-1 211/215): not adopted (docs/PREFILL_SPLIT.md).",
-    "QWEN_SPLIT (19,21 for the Tiel pair, 6,17,17 for the 2060+2xP100 seat) depends on model and card set: seat placement, kept in the manifest, not here."
+    "QWEN_SPLIT (19,21 for the Tiel pair, 6,17,17 for the 2060+2xP100 seat) depends on model and card set: seat placement, kept in the manifest, not here.",
+    "LB_QW_PREFILL_CHUNK is not set (code default: auto, 64..1024 by prompt length). The 256 set on 2026-11-16 (Tiel Q5_K_XL on 2xP100 OOMed on a second long prompt with auto chunk) predates the Q8 dedup (b96fa22). Re-measured 2026-11-21 (docs/P100_KERNEL_TUNING.md, c4 P100 3B+86): Tiel split 19,21 ctx 8192, two 4.1-4.4k-token prompts x 3 rounds, auto chunk: no OOM (peak 15.7 / 15.5 GB), prefill 595-603 tok/s vs 402-418 at 256; Qwen3.6 21,19: 589/599 vs 417/434. Same greedy shas at every chunk. Set LB_QW_PREFILL_CHUNK=256 on a seat whose weights fill the cards more than these."
   ],
   "not_measured": [
     "LB_Q4_CUBE (measured flat 32..256 in the commit message, no gain)",

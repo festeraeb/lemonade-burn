@@ -20,7 +20,7 @@ Branch `fable/engine-fleet-2026-11-21`. Crate `crates/lb-card-profile`, profiles
 
 | Knob | Card families | Value | Read at | Profile | Source of the measurement |
 |---|---|---|---|---|---|
-| `LB_QW_PREFILL_CHUNK` | P100 (sm_60) | 256 (default auto 64..1024) | lb-server `qwen.rs::prefill_chunk`, via `Pipeline::knob_min` | yes | `~/agentnotes/lb-qwen35-c4-tuning-2026-11-16.md` Step 0: 2xP100 + Tiel Q5_K_XL, auto chunk OOMs on the second long prompt, 256 stable, 410 tok/s prompt. Measured before the Q8 dedup (b96fa22); the need is VRAM headroom, so it matters only when weights nearly fill the card |
+| `LB_QW_PREFILL_CHUNK` | P100 (sm_60) | not set since 2026-11-21 (default auto 64..1024; was 256) | lb-server `qwen.rs::prefill_chunk`, via `Pipeline::knob_min` | yes | `docs/P100_KERNEL_TUNING.md`: after the Q8 dedup (b96fa22) auto chunk no longer OOMs with Tiel Q5_K_XL on 2xP100 (two long prompts x 3, peak 15.7 GB) and is 1.4x faster (595-603 vs 402-418 tok/s; Qwen3.6 589/599 vs 417/434). Earlier 256: `~/agentnotes/lb-qwen35-c4-tuning-2026-11-16.md` Step 0 |
 | `LB_QW_GRAPH` | P100 | 1 (= default) | lb-qwen35 `pipeline.rs` | yes | c4 tuning note (76 tok/s decode with graphs); `c1-gemini-lessons-for-engine-2026-11-18.md` s1 (graphed verify 25.1 -> 21.5 ms) |
 | `LB_QW_FLUSH` | none set | 1 | lb-qwen35 `pipeline.rs` | yes | not measured |
 | `LB_MTP_DEPTH` | P100 | 1 (= default) | lb-server `qwen.rs::load`, via `Pipeline::probe_stage_profiles` | yes | `c1-gemini-lessons...` s1, commit 4ab5e29: depth 1 +16 %, depths 2-3 lose (verify of 2 rows 21.5 ms vs 15 ms a token). Used only when `LB_MTP=1` |
