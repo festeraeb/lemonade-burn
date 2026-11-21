@@ -55,7 +55,8 @@ Everything model-specific: hyper-connections + Sinkhorn, q/kv LoRA MQA with 512-
 offset and yarn, de-rope, KV compression (ratio 1 and 2 with softmax gate), cross-layer KV/top-k sharing, the lightning
 indexer and candidate blocks (needed past 512 tokens), grouped output LoRA, Engram hashing and lazy row reads from a
 110 GB table, sqrt-softplus routing, SwiGLU clamp, the `joyai-llm` pre-tokenizer. The quant formats are the only part
-that already exists (all eight types, CPU). No CPU reference forward was written in this branch (see WORK_LOG: step 4).
+that already exists (all eight types, CPU). This branch adds a short-context CPU reference, `crates/lb-deepseek4`
+(prompt + generation <= 128 tokens; no indexer, no window); its parity numbers are in WORK_LOG (2026-11-21).
 
 Shared crate or not: MiMo and DeepSeek V4.1 share only the generic pieces (RMS norm, top-k MoE with SiLU experts, sinks
 in a softmax). Attention (GQA 192/128 + SWA vs MQA 512 + compression + indexer), the residual stream (plain vs 4-stream

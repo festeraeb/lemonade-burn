@@ -810,7 +810,14 @@ impl Model<'_> {
         out.par_chunks_mut(hd).enumerate().for_each(|(th, oh)| rope.apply(oh, &back[th / nh]));
         tap(taps, "attn_derope", ii, &out);
 
-        // grouped output projection (D41:757-763)
+        self.out_proj(il, &out, m)
+    }
+
+    /// Grouped output projection (D41:757-763): de-roped attention output `[m][n_head * 512]` -> `[m][n_embd]`.
+    pub fn out_proj(&self, il: usize, out: &[f32], m: usize) -> Vec<f32> {
+        let c = &self.cfg;
+        let l = &self.layers[il];
+        let (nh, hd) = (c.n_head, c.head_dim);
         let hpg = nh / c.o_groups;
         let mut oa = vec![0f32; m * c.o_groups * c.o_lora];
         for g in 0..c.o_groups {
@@ -825,7 +832,7 @@ impl Model<'_> {
     }
 
     /// Routed MoE (`build_moe_ffn`, GR:2300-2520) + the shared expert (`build_ffn`), returns `moe + shared`.
-    fn ffn(&self, il: usize, x: &[f32], m: usize, taps: &mut Option<&mut Taps>) -> Vec<f32> {
+    pub fn ffn(&self, il: usize, x: &[f32], m: usize, taps: &mut Option<&mut Taps>) -> Vec<f32> {
         let c = &self.cfg;
         let l = &self.layers[il];
         let ii = il as i32;

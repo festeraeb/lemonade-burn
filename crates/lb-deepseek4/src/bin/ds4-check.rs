@@ -41,6 +41,10 @@ struct Args {
     /// load the model and tokenizer, print the config and the prompt ids, and stop (no tensor data beyond small F32 ones)
     #[arg(long, default_value_t = false)]
     load_only: bool,
+    /// comma-separated layers: run the output projection on llama.cpp's attn_derope-L and the FFN on its ffn_norm-L,
+    /// compare with attn_out-L / ffn_moe_out-L / ffn_shexp-L, then stop (needs --ref-dir)
+    #[arg(long)]
+    isolate: Option<String>,
 }
 
 fn read_f32(p: &std::path::Path) -> Option<Vec<f32>> {
@@ -144,6 +148,36 @@ fn main() -> Result<()> {
                 eprintln!("resume: {} tokens already generated", generated.len());
             }
         }
+    }
+    if let (Some(dir), Some(layers)) = (&a.ref_dir, &a.isolate) {
+        let d = c.n_embd;
+        for il in ids(layers).into_iter().map(|v| v as usize) {
+            if let (Some(x), Some(r)) = (read_f32(&dir.join(format!("attn_derope-{il}.bin"))), read_f32(&dir.join(format!("attn_out-{il}.bin")))) {
+                let m = x.len() / (c.n_head * c.head_dim);
+                let o = model.out_proj(il, &x, m);
+                let o: &[f32] = if r.len() == d { &o[(m - 1) * d..] } else { &o };
+                let (rel, mx) = errs(o, &r, d);
+                println!("isolated {il} | attn_out from ref attn_derope | {rel:.3e} | {mx:.3e}");
+            }
+            if let Some(x) = read_f32(&dir.join(format!("ffn_norm-{il}.bin"))) {
+                let m = x.len() / d;
+                let mut t = Taps::new();
+                let _ = model.ffn(il, &x, m, &mut Some(&mut t));
+                for name in ["ffn_moe_logits", "ffn_moe_out", "ffn_shexp"] {
+                    let key = format!("{name}-{il}");
+                    if let (Some(mine), Some(r)) = (t.get(&key), read_f32(&dir.join(format!("{key}.bin")))) {
+                        if mine.len() == r.len() {
+                            let w = if name == "ffn_moe_logits" { c.n_expert } else { d };
+                            let (rel, mx) = errs(mine, &r, w);
+                            println!("isolated {il} | {name} from ref ffn_norm | {rel:.3e} | {mx:.3e}");
+                        } else {
+                            println!("isolated {il} | {name} size {} vs ref {}", mine.len(), r.len());
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(());
     }
     let mut cache = Cache::new(c.n_layer);
     let mut taps = Taps::new();
