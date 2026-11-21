@@ -1,0 +1,1180 @@
+# shards: 6
+#   /mnt/raid0/models/deepseek41-coder/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00001-of-00006.gguf : 0 tensors, GGUF v3
+#   /mnt/raid0/models/deepseek41-coder/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00002-of-00006.gguf : 307 tensors, GGUF v3
+#   /mnt/raid0/models/deepseek41-coder/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00003-of-00006.gguf : 294 tensors, GGUF v3
+#   /mnt/raid0/models/deepseek41-coder/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00004-of-00006.gguf : 277 tensors, GGUF v3
+#   /mnt/raid0/models/deepseek41-coder/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00005-of-00006.gguf : 164 tensors, GGUF v3
+#   /mnt/raid0/models/deepseek41-coder/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00006-of-00006.gguf : 1 tensors, GGUF v3
+
+## metadata (shard 1)
+general.architecture = "deepseek41"
+general.type = "model"
+general.size_label = "192x212B"
+deepseek41.block_count = U32(40)
+deepseek41.context_length = U32(1048576)
+deepseek41.embedding_length = U32(5120)
+deepseek41.attention.head_count = U32(64)
+deepseek41.attention.head_count_kv = U32(1)
+deepseek41.rope.scaling.type = "yarn"
+deepseek41.rope.scaling.factor = F32(16.0)
+deepseek41.rope.scaling.original_context_length = U32(65536)
+deepseek41.rope.scaling.yarn_beta_fast = F32(32.0)
+deepseek41.rope.scaling.yarn_beta_slow = F32(1.0)
+deepseek41.rope.freq_base = F32(10000.0)
+deepseek41.attention.layer_norm_rms_epsilon = F32(1e-20)
+deepseek41.expert_count = U32(192)
+deepseek41.expert_used_count = U32(6)
+deepseek41.expert_gating_func = U32(4)
+deepseek41.attention.key_length = U32(512)
+deepseek41.attention.value_length = U32(512)
+deepseek41.rope.dimension_count = U32(64)
+deepseek41.attention.q_lora_rank = U32(1280)
+deepseek41.attention.sliding_window = U32(128)
+deepseek41.expert_feed_forward_length = U32(2304)
+deepseek41.expert_shared_count = U32(1)
+deepseek41.expert_weights_scale = F32(1.5)
+deepseek41.expert_weights_norm = Bool(true)
+deepseek41.swiglu_clamp_exp = [F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0)] (len 40)
+deepseek41.swiglu_clamp_shexp = [F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0), F32(10.0)] (len 40)
+deepseek41.attention.indexer.head_count = U32(32)
+deepseek41.attention.indexer.key_length = U32(128)
+deepseek41.attention.indexer.top_k = U32(512)
+deepseek41.attention.output_group_count = U32(8)
+deepseek41.attention.output_lora_rank = U32(1024)
+deepseek41.attention.compress_ratios = [I32(0), I32(0), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(2), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(0), I32(0)] (len 43)
+deepseek41.attention.compress_rope_freq_base = F32(160000.0)
+deepseek41.hyper_connection.count = U32(4)
+deepseek41.hyper_connection.sinkhorn_iterations = U32(20)
+deepseek41.hyper_connection.epsilon = F32(1e-6)
+deepseek41.hash_layer_count = U32(0)
+deepseek41.attention.kv_source_layers = [U32(2), U32(8), U32(14), U32(20)] (len 4)
+deepseek41.attention.indexer.source_layers = [U32(2), U32(8), U32(14), U32(20), U32(24), U32(28), U32(32), U32(36)] (len 8)
+deepseek41.attention.indexer.candidate_source_layer = I32(20)
+deepseek41.attention.indexer.candidate_top_k_blocks = U32(2048)
+deepseek41.attention.indexer.candidate_block_size = U32(8)
+deepseek41.ple.layers = [U32(1), U32(14)] (len 2)
+deepseek41.ple.ngram_size = U32(4)
+deepseek41.ple.heads_per_ngram = U32(8)
+deepseek41.embedding_length_per_layer_input = U32(256)
+deepseek41.ple.layer_multipliers = [U64(76632096046245), U64(4839876093313), U64(35959672319349), U64(73987337458391), U64(67716810739261), U64(51510806800915), U64(30921347202721), U64(82619226485591)] (len 8)
+deepseek41.ple.head_offsets = [U64(0), U64(16000057), U64(32000136), U64(48000217), U64(64000314), U64(80000435), U64(96000564), U64(112000697), U64(128000880), U64(144001069), U64(160001276), U64(176001487), U64(192001740), U64(208002017), U64(224002306), U64(240002613), U64(256002934), U64(272003273), U64(288003654), U64(304004047), U64(320004446), U64(336004849), U64(352005258), U64(368005705), U64(384006168), U64(400006645), U64(416007132), U64(432007631), U64(448008138), U64(464008649), U64(480009222), U64(496009831), U64(512010458), U64(528011125), U64(544011794), U64(560012487), U64(576013184), U64(592013895), U64(608014624), U64(624015383), U64(640016152), U64(656016933), U64(672017732), U64(688018545), U64(704019364), U64(720020205), U64(736021082), U64(752021961)] (len 48)
+deepseek41.ple.head_vocab_sizes = [U64(16000057), U64(16000079), U64(16000081), U64(16000097), U64(16000121), U64(16000129), U64(16000133), U64(16000183), U64(16000189), U64(16000207), U64(16000211), U64(16000253), U64(16000277), U64(16000289), U64(16000307), U64(16000321), U64(16000339), U64(16000381), U64(16000393), U64(16000399), U64(16000403), U64(16000409), U64(16000447), U64(16000463), U64(16000477), U64(16000487), U64(16000499), U64(16000507), U64(16000511), U64(16000573), U64(16000609), U64(16000627), U64(16000667), U64(16000669), U64(16000693), U64(16000697), U64(16000711), U64(16000729), U64(16000759), U64(16000769), U64(16000781), U64(16000799), U64(16000813), U64(16000819), U64(16000841), U64(16000877), U64(16000879), U64(16000889)] (len 48)
+deepseek41.engram.pad_token_id = U32(2)
+deepseek41.engram.token_map = [I32(0), I32(1), I32(2), I32(3), I32(4), I32(5), I32(6), I32(7), ...] (len 129280)
+tokenizer.ggml.model = "gpt2"
+tokenizer.ggml.pre = "joyai-llm"
+tokenizer.ggml.tokens = ["<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜▁pad▁｜>", "!", "\"", "#", "$", "%", ...] (len 129280)
+tokenizer.ggml.token_type = [I32(3), I32(3), I32(3), I32(1), I32(1), I32(1), I32(1), I32(1), ...] (len 129280)
+tokenizer.ggml.merges = ["Ġ t", "Ġ a", "i n", "Ġ Ġ", "h e", "e r", "o n", "r e", ...] (len 127741)
+tokenizer.ggml.bos_token_id = U32(0)
+tokenizer.ggml.eos_token_id = U32(1)
+tokenizer.ggml.padding_token_id = U32(1)
+tokenizer.ggml.add_bos_token = Bool(false)
+tokenizer.ggml.add_eos_token = Bool(false)
+quantize.imatrix.entries_count = U32(585)
+quantize.imatrix.chunks_count = U32(1000)
+general.name = "DeepSeek-V4.1-Flash-1017 GSQ-RCO Coder"
+general.basename = "DeepSeek-V4.1-Flash-1017"
+general.license = "mit"
+general.quantized_by = "ISTA DASLab"
+general.tags = ["gsq-rco", "ista-daslab", "text-generation"] (len 3)
+general.file_type = U32(19)
+general.quantization_version = U32(2)
+tokenizer.chat_template = "{#- Based on Unsloth's DeepSeek-V4.1 template, extracted from\n    unsloth/DeepSeek-V4.1-Flash-1017-GGUF at revision\n    60ad3651641b5c97679c807e064ab1d7a3ca1455.\n    Adaptations: use DeepSeek's native"... (18509 bytes)
+split.no = U16(0)
+split.count = U16(6)
+split.tensors.count = I32(1043)
+T output.weight	Q5_K	[5120, 129280]	455065600
+T output_norm.weight	F32	[5120]	20480
+T token_embd.weight	Q5_K	[5120, 129280]	455065600
+T blk.0.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.0.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.0.attn_norm.weight	F32	[5120]	20480
+T blk.0.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.0.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.0.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.0.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.0.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.0.attn_sinks.weight	F32	[64]	256
+T blk.0.exp_probs_b.bias	F32	[192]	768
+T blk.0.exp_probs_b_vl.bias	F32	[192]	768
+T blk.0.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.0.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.0.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.0.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.0.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.0.ffn_norm.weight	F32	[5120]	20480
+T blk.0.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.0.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.0.hc_attn_base.weight	F32	[24]	96
+T blk.0.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.0.hc_attn_scale.weight	F32	[3]	12
+T blk.0.hc_ffn_base.weight	F32	[24]	96
+T blk.0.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.0.hc_ffn_scale.weight	F32	[3]	12
+T blk.1.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.1.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.1.attn_norm.weight	F32	[5120]	20480
+T blk.1.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.1.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.1.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.1.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.1.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.1.attn_sinks.weight	F32	[64]	256
+T blk.1.engram_gate.weight	F32	[5120, 4]	81920
+T blk.1.engram_kv.weight	Q5_K	[6144, 25600]	108134400
+T blk.1.exp_probs_b.bias	F32	[192]	768
+T blk.1.exp_probs_b_vl.bias	F32	[192]	768
+T blk.1.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.1.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.1.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.1.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.1.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.1.ffn_norm.weight	F32	[5120]	20480
+T blk.1.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.1.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.1.hc_attn_base.weight	F32	[24]	96
+T blk.1.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.1.hc_attn_scale.weight	F32	[3]	12
+T blk.1.hc_ffn_base.weight	F32	[24]	96
+T blk.1.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.1.hc_ffn_scale.weight	F32	[3]	12
+T blk.2.attn_compressor_gate.weight	BF16	[5120, 512]	5242880
+T blk.2.attn_compressor_kv.weight	BF16	[5120, 512]	5242880
+T blk.2.attn_compressor_norm.weight	F32	[512]	2048
+T blk.2.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.2.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.2.attn_norm.weight	F32	[5120]	20480
+T blk.2.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.2.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.2.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.2.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.2.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.2.attn_sinks.weight	F32	[64]	256
+T blk.2.exp_probs_b.bias	F32	[192]	768
+T blk.2.exp_probs_b_vl.bias	F32	[192]	768
+T blk.2.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.2.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.2.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.2.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.2.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.2.ffn_norm.weight	F32	[5120]	20480
+T blk.2.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.2.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.2.hc_attn_base.weight	F32	[24]	96
+T blk.2.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.2.hc_attn_scale.weight	F32	[3]	12
+T blk.2.hc_ffn_base.weight	F32	[24]	96
+T blk.2.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.2.hc_ffn_scale.weight	F32	[3]	12
+T blk.2.indexer.attn_k.weight	BF16	[512, 128]	131072
+T blk.2.indexer.attn_q_b.weight	BF16	[1280, 4096]	10485760
+T blk.2.indexer.k_norm.weight	F32	[128]	512
+T blk.2.indexer.proj.weight	BF16	[5120, 32]	327680
+T blk.3.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.3.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.3.attn_norm.weight	F32	[5120]	20480
+T blk.3.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.3.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.3.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.3.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.3.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.3.attn_sinks.weight	F32	[64]	256
+T blk.3.exp_probs_b.bias	F32	[192]	768
+T blk.3.exp_probs_b_vl.bias	F32	[192]	768
+T blk.3.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.3.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.3.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.3.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.3.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.3.ffn_norm.weight	F32	[5120]	20480
+T blk.3.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.3.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.3.hc_attn_base.weight	F32	[24]	96
+T blk.3.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.3.hc_attn_scale.weight	F32	[3]	12
+T blk.3.hc_ffn_base.weight	F32	[24]	96
+T blk.3.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.3.hc_ffn_scale.weight	F32	[3]	12
+T blk.4.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.4.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.4.attn_norm.weight	F32	[5120]	20480
+T blk.4.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.4.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.4.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.4.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.4.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.4.attn_sinks.weight	F32	[64]	256
+T blk.4.exp_probs_b.bias	F32	[192]	768
+T blk.4.exp_probs_b_vl.bias	F32	[192]	768
+T blk.4.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.4.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.4.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.4.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.4.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.4.ffn_norm.weight	F32	[5120]	20480
+T blk.4.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.4.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.4.hc_attn_base.weight	F32	[24]	96
+T blk.4.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.4.hc_attn_scale.weight	F32	[3]	12
+T blk.4.hc_ffn_base.weight	F32	[24]	96
+T blk.4.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.4.hc_ffn_scale.weight	F32	[3]	12
+T blk.5.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.5.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.5.attn_norm.weight	F32	[5120]	20480
+T blk.5.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.5.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.5.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.5.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.5.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.5.attn_sinks.weight	F32	[64]	256
+T blk.5.exp_probs_b.bias	F32	[192]	768
+T blk.5.exp_probs_b_vl.bias	F32	[192]	768
+T blk.5.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.5.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.5.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.5.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.5.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.5.ffn_norm.weight	F32	[5120]	20480
+T blk.5.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.5.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.5.hc_attn_base.weight	F32	[24]	96
+T blk.5.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.5.hc_attn_scale.weight	F32	[3]	12
+T blk.5.hc_ffn_base.weight	F32	[24]	96
+T blk.5.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.5.hc_ffn_scale.weight	F32	[3]	12
+T blk.6.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.6.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.6.attn_norm.weight	F32	[5120]	20480
+T blk.6.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.6.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.6.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.6.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.6.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.6.attn_sinks.weight	F32	[64]	256
+T blk.6.exp_probs_b.bias	F32	[192]	768
+T blk.6.exp_probs_b_vl.bias	F32	[192]	768
+T blk.6.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.6.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.6.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.6.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.6.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.6.ffn_norm.weight	F32	[5120]	20480
+T blk.6.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.6.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.6.hc_attn_base.weight	F32	[24]	96
+T blk.6.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.6.hc_attn_scale.weight	F32	[3]	12
+T blk.6.hc_ffn_base.weight	F32	[24]	96
+T blk.6.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.6.hc_ffn_scale.weight	F32	[3]	12
+T blk.7.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.7.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.7.attn_norm.weight	F32	[5120]	20480
+T blk.7.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.7.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.7.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.7.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.7.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.7.attn_sinks.weight	F32	[64]	256
+T blk.7.exp_probs_b.bias	F32	[192]	768
+T blk.7.exp_probs_b_vl.bias	F32	[192]	768
+T blk.7.ffn_down_exps.weight	IQ2_XXS	[2304, 5120, 192]	583925760
+T blk.7.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.7.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.7.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.7.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.7.ffn_norm.weight	F32	[5120]	20480
+T blk.7.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.7.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.7.hc_attn_base.weight	F32	[24]	96
+T blk.7.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.7.hc_attn_scale.weight	F32	[3]	12
+T blk.7.hc_ffn_base.weight	F32	[24]	96
+T blk.7.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.7.hc_ffn_scale.weight	F32	[3]	12
+T blk.8.attn_compressor_gate.weight	BF16	[5120, 512]	5242880
+T blk.8.attn_compressor_kv.weight	BF16	[5120, 512]	5242880
+T blk.8.attn_compressor_norm.weight	F32	[512]	2048
+T blk.8.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.8.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.8.attn_norm.weight	F32	[5120]	20480
+T blk.8.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.8.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.8.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.8.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.8.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.8.attn_sinks.weight	F32	[64]	256
+T blk.8.exp_probs_b.bias	F32	[192]	768
+T blk.8.exp_probs_b_vl.bias	F32	[192]	768
+T blk.8.ffn_down_exps.weight	IQ2_XXS	[2304, 5120, 192]	583925760
+T blk.8.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.8.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.8.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.8.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.8.ffn_norm.weight	F32	[5120]	20480
+T blk.8.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.8.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.8.hc_attn_base.weight	F32	[24]	96
+T blk.8.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.8.hc_attn_scale.weight	F32	[3]	12
+T blk.8.hc_ffn_base.weight	F32	[24]	96
+T blk.8.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.8.hc_ffn_scale.weight	F32	[3]	12
+T blk.8.indexer.attn_k.weight	BF16	[512, 128]	131072
+T blk.8.indexer.attn_q_b.weight	BF16	[1280, 4096]	10485760
+T blk.8.indexer.k_norm.weight	F32	[128]	512
+T blk.8.indexer.proj.weight	BF16	[5120, 32]	327680
+T blk.9.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.9.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.9.attn_norm.weight	F32	[5120]	20480
+T blk.9.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.9.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.9.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.9.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.9.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.9.attn_sinks.weight	F32	[64]	256
+T blk.9.exp_probs_b.bias	F32	[192]	768
+T blk.9.exp_probs_b_vl.bias	F32	[192]	768
+T blk.9.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.9.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.9.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.9.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.9.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.9.ffn_norm.weight	F32	[5120]	20480
+T blk.9.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.9.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.9.hc_attn_base.weight	F32	[24]	96
+T blk.9.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.9.hc_attn_scale.weight	F32	[3]	12
+T blk.9.hc_ffn_base.weight	F32	[24]	96
+T blk.9.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.9.hc_ffn_scale.weight	F32	[3]	12
+T blk.10.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.10.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.10.attn_norm.weight	F32	[5120]	20480
+T blk.10.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.10.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.10.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.10.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.10.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.10.attn_sinks.weight	F32	[64]	256
+T blk.10.exp_probs_b.bias	F32	[192]	768
+T blk.10.exp_probs_b_vl.bias	F32	[192]	768
+T blk.10.ffn_down_exps.weight	IQ2_XXS	[2304, 5120, 192]	583925760
+T blk.10.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.10.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.10.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.10.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.10.ffn_norm.weight	F32	[5120]	20480
+T blk.10.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.10.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.10.hc_attn_base.weight	F32	[24]	96
+T blk.10.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.10.hc_attn_scale.weight	F32	[3]	12
+T blk.10.hc_ffn_base.weight	F32	[24]	96
+T blk.10.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.10.hc_ffn_scale.weight	F32	[3]	12
+T blk.11.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.11.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.11.attn_norm.weight	F32	[5120]	20480
+T blk.11.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.11.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.11.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.11.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.11.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.11.attn_sinks.weight	F32	[64]	256
+T blk.11.exp_probs_b.bias	F32	[192]	768
+T blk.11.exp_probs_b_vl.bias	F32	[192]	768
+T blk.11.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.11.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.11.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.11.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.11.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.11.ffn_norm.weight	F32	[5120]	20480
+T blk.11.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.11.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.11.hc_attn_base.weight	F32	[24]	96
+T blk.11.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.11.hc_attn_scale.weight	F32	[3]	12
+T blk.11.hc_ffn_base.weight	F32	[24]	96
+T blk.11.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.11.hc_ffn_scale.weight	F32	[3]	12
+T blk.12.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.12.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.12.attn_norm.weight	F32	[5120]	20480
+T blk.12.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.12.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.12.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.12.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.12.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.12.attn_sinks.weight	F32	[64]	256
+T blk.12.exp_probs_b.bias	F32	[192]	768
+T blk.12.exp_probs_b_vl.bias	F32	[192]	768
+T blk.12.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.12.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.12.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.12.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.12.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.12.ffn_norm.weight	F32	[5120]	20480
+T blk.12.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.12.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.12.hc_attn_base.weight	F32	[24]	96
+T blk.12.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.12.hc_attn_scale.weight	F32	[3]	12
+T blk.12.hc_ffn_base.weight	F32	[24]	96
+T blk.12.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.12.hc_ffn_scale.weight	F32	[3]	12
+T blk.13.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.13.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.13.attn_norm.weight	F32	[5120]	20480
+T blk.13.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.13.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.13.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.13.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.13.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.13.attn_sinks.weight	F32	[64]	256
+T blk.13.exp_probs_b.bias	F32	[192]	768
+T blk.13.exp_probs_b_vl.bias	F32	[192]	768
+T blk.13.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.13.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.13.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.13.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.13.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.13.ffn_norm.weight	F32	[5120]	20480
+T blk.13.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.13.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.13.hc_attn_base.weight	F32	[24]	96
+T blk.13.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.13.hc_attn_scale.weight	F32	[3]	12
+T blk.13.hc_ffn_base.weight	F32	[24]	96
+T blk.13.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.13.hc_ffn_scale.weight	F32	[3]	12
+T blk.14.attn_compressor_gate.weight	BF16	[5120, 512]	5242880
+T blk.14.attn_compressor_kv.weight	BF16	[5120, 512]	5242880
+T blk.14.attn_compressor_norm.weight	F32	[512]	2048
+T blk.14.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.14.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.14.attn_norm.weight	F32	[5120]	20480
+T blk.14.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.14.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.14.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.14.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.14.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.14.attn_sinks.weight	F32	[64]	256
+T blk.14.engram_gate.weight	F32	[5120, 4]	81920
+T blk.14.engram_kv.weight	Q5_K	[6144, 25600]	108134400
+T blk.14.exp_probs_b.bias	F32	[192]	768
+T blk.14.exp_probs_b_vl.bias	F32	[192]	768
+T blk.14.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.14.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.14.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.14.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.14.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.14.ffn_norm.weight	F32	[5120]	20480
+T blk.14.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.14.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.14.hc_attn_base.weight	F32	[24]	96
+T blk.14.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.14.hc_attn_scale.weight	F32	[3]	12
+T blk.14.hc_ffn_base.weight	F32	[24]	96
+T blk.14.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.14.hc_ffn_scale.weight	F32	[3]	12
+T blk.14.indexer.attn_k.weight	BF16	[512, 128]	131072
+T blk.14.indexer.attn_q_b.weight	BF16	[1280, 4096]	10485760
+T blk.14.indexer.k_norm.weight	F32	[128]	512
+T blk.14.indexer.proj.weight	BF16	[5120, 32]	327680
+T blk.15.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.15.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.15.attn_norm.weight	F32	[5120]	20480
+T blk.15.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.15.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.15.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.15.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.15.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.15.attn_sinks.weight	F32	[64]	256
+T blk.15.exp_probs_b.bias	F32	[192]	768
+T blk.15.exp_probs_b_vl.bias	F32	[192]	768
+T blk.15.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.15.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.15.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.15.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.15.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.15.ffn_norm.weight	F32	[5120]	20480
+T blk.15.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.15.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.15.hc_attn_base.weight	F32	[24]	96
+T blk.15.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.15.hc_attn_scale.weight	F32	[3]	12
+T blk.15.hc_ffn_base.weight	F32	[24]	96
+T blk.15.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.15.hc_ffn_scale.weight	F32	[3]	12
+T blk.16.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.16.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.16.attn_norm.weight	F32	[5120]	20480
+T blk.16.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.16.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.16.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.16.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.16.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.16.attn_sinks.weight	F32	[64]	256
+T blk.16.exp_probs_b.bias	F32	[192]	768
+T blk.16.exp_probs_b_vl.bias	F32	[192]	768
+T blk.16.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.16.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.16.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.16.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.16.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.16.ffn_norm.weight	F32	[5120]	20480
+T blk.16.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.16.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.16.hc_attn_base.weight	F32	[24]	96
+T blk.16.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.16.hc_attn_scale.weight	F32	[3]	12
+T blk.16.hc_ffn_base.weight	F32	[24]	96
+T blk.16.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.16.hc_ffn_scale.weight	F32	[3]	12
+T blk.17.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.17.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.17.attn_norm.weight	F32	[5120]	20480
+T blk.17.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.17.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.17.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.17.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.17.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.17.attn_sinks.weight	F32	[64]	256
+T blk.17.exp_probs_b.bias	F32	[192]	768
+T blk.17.exp_probs_b_vl.bias	F32	[192]	768
+T blk.17.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.17.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.17.ffn_gate_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.17.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.17.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.17.ffn_norm.weight	F32	[5120]	20480
+T blk.17.ffn_up_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.17.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.17.hc_attn_base.weight	F32	[24]	96
+T blk.17.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.17.hc_attn_scale.weight	F32	[3]	12
+T blk.17.hc_ffn_base.weight	F32	[24]	96
+T blk.17.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.17.hc_ffn_scale.weight	F32	[3]	12
+T blk.18.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.18.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.18.attn_norm.weight	F32	[5120]	20480
+T blk.18.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.18.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.18.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.18.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.18.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.18.attn_sinks.weight	F32	[64]	256
+T blk.18.exp_probs_b.bias	F32	[192]	768
+T blk.18.exp_probs_b_vl.bias	F32	[192]	768
+T blk.18.ffn_down_exps.weight	IQ2_XXS	[2304, 5120, 192]	583925760
+T blk.18.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.18.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.18.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.18.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.18.ffn_norm.weight	F32	[5120]	20480
+T blk.18.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.18.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.18.hc_attn_base.weight	F32	[24]	96
+T blk.18.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.18.hc_attn_scale.weight	F32	[3]	12
+T blk.18.hc_ffn_base.weight	F32	[24]	96
+T blk.18.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.18.hc_ffn_scale.weight	F32	[3]	12
+T blk.19.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.19.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.19.attn_norm.weight	F32	[5120]	20480
+T blk.19.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.19.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.19.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.19.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.19.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.19.attn_sinks.weight	F32	[64]	256
+T blk.19.exp_probs_b.bias	F32	[192]	768
+T blk.19.exp_probs_b_vl.bias	F32	[192]	768
+T blk.19.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.19.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.19.ffn_gate_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.19.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.19.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.19.ffn_norm.weight	F32	[5120]	20480
+T blk.19.ffn_up_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.19.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.19.hc_attn_base.weight	F32	[24]	96
+T blk.19.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.19.hc_attn_scale.weight	F32	[3]	12
+T blk.19.hc_ffn_base.weight	F32	[24]	96
+T blk.19.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.19.hc_ffn_scale.weight	F32	[3]	12
+T blk.20.attn_compressor_kv.weight	BF16	[5120, 512]	5242880
+T blk.20.attn_compressor_norm.weight	F32	[512]	2048
+T blk.20.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.20.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.20.attn_norm.weight	F32	[5120]	20480
+T blk.20.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.20.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.20.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.20.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.20.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.20.attn_sinks.weight	F32	[64]	256
+T blk.20.exp_probs_b.bias	F32	[192]	768
+T blk.20.exp_probs_b_vl.bias	F32	[192]	768
+T blk.20.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.20.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.20.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.20.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.20.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.20.ffn_norm.weight	F32	[5120]	20480
+T blk.20.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.20.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.20.hc_attn_base.weight	F32	[24]	96
+T blk.20.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.20.hc_attn_scale.weight	F32	[3]	12
+T blk.20.hc_ffn_base.weight	F32	[24]	96
+T blk.20.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.20.hc_ffn_scale.weight	F32	[3]	12
+T blk.20.indexer.attn_k.weight	BF16	[512, 128]	131072
+T blk.20.indexer.attn_q_b.weight	BF16	[1280, 4096]	10485760
+T blk.20.indexer.k_norm.weight	F32	[128]	512
+T blk.20.indexer.proj.weight	BF16	[5120, 32]	327680
+T blk.21.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.21.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.21.attn_norm.weight	F32	[5120]	20480
+T blk.21.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.21.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.21.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.21.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.21.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.21.attn_sinks.weight	F32	[64]	256
+T blk.21.exp_probs_b.bias	F32	[192]	768
+T blk.21.exp_probs_b_vl.bias	F32	[192]	768
+T blk.21.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.21.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.21.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.21.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.21.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.21.ffn_norm.weight	F32	[5120]	20480
+T blk.21.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.21.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.21.hc_attn_base.weight	F32	[24]	96
+T blk.21.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.21.hc_attn_scale.weight	F32	[3]	12
+T blk.21.hc_ffn_base.weight	F32	[24]	96
+T blk.21.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.21.hc_ffn_scale.weight	F32	[3]	12
+T blk.22.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.22.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.22.attn_norm.weight	F32	[5120]	20480
+T blk.22.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.22.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.22.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.22.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.22.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.22.attn_sinks.weight	F32	[64]	256
+T blk.22.exp_probs_b.bias	F32	[192]	768
+T blk.22.exp_probs_b_vl.bias	F32	[192]	768
+T blk.22.ffn_down_exps.weight	IQ2_XXS	[2304, 5120, 192]	583925760
+T blk.22.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.22.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.22.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.22.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.22.ffn_norm.weight	F32	[5120]	20480
+T blk.22.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.22.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.22.hc_attn_base.weight	F32	[24]	96
+T blk.22.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.22.hc_attn_scale.weight	F32	[3]	12
+T blk.22.hc_ffn_base.weight	F32	[24]	96
+T blk.22.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.22.hc_ffn_scale.weight	F32	[3]	12
+T blk.23.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.23.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.23.attn_norm.weight	F32	[5120]	20480
+T blk.23.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.23.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.23.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.23.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.23.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.23.attn_sinks.weight	F32	[64]	256
+T blk.23.exp_probs_b.bias	F32	[192]	768
+T blk.23.exp_probs_b_vl.bias	F32	[192]	768
+T blk.23.ffn_down_exps.weight	IQ2_XS	[2304, 5120, 192]	654704640
+T blk.23.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.23.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.23.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.23.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.23.ffn_norm.weight	F32	[5120]	20480
+T blk.23.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.23.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.23.hc_attn_base.weight	F32	[24]	96
+T blk.23.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.23.hc_attn_scale.weight	F32	[3]	12
+T blk.23.hc_ffn_base.weight	F32	[24]	96
+T blk.23.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.23.hc_ffn_scale.weight	F32	[3]	12
+T blk.24.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.24.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.24.attn_norm.weight	F32	[5120]	20480
+T blk.24.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.24.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.24.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.24.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.24.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.24.attn_sinks.weight	F32	[64]	256
+T blk.24.exp_probs_b.bias	F32	[192]	768
+T blk.24.exp_probs_b_vl.bias	F32	[192]	768
+T blk.24.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.24.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.24.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.24.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.24.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.24.ffn_norm.weight	F32	[5120]	20480
+T blk.24.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.24.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.24.hc_attn_base.weight	F32	[24]	96
+T blk.24.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.24.hc_attn_scale.weight	F32	[3]	12
+T blk.24.hc_ffn_base.weight	F32	[24]	96
+T blk.24.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.24.hc_ffn_scale.weight	F32	[3]	12
+T blk.24.indexer.attn_q_b.weight	BF16	[1280, 4096]	10485760
+T blk.24.indexer.proj.weight	BF16	[5120, 32]	327680
+T blk.25.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.25.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.25.attn_norm.weight	F32	[5120]	20480
+T blk.25.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.25.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.25.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.25.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.25.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.25.attn_sinks.weight	F32	[64]	256
+T blk.25.exp_probs_b.bias	F32	[192]	768
+T blk.25.exp_probs_b_vl.bias	F32	[192]	768
+T blk.25.ffn_down_exps.weight	IQ2_XXS	[2304, 5120, 192]	583925760
+T blk.25.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.25.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.25.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.25.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.25.ffn_norm.weight	F32	[5120]	20480
+T blk.25.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.25.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.25.hc_attn_base.weight	F32	[24]	96
+T blk.25.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.25.hc_attn_scale.weight	F32	[3]	12
+T blk.25.hc_ffn_base.weight	F32	[24]	96
+T blk.25.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.25.hc_ffn_scale.weight	F32	[3]	12
+T blk.26.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.26.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.26.attn_norm.weight	F32	[5120]	20480
+T blk.26.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.26.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.26.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.26.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.26.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.26.attn_sinks.weight	F32	[64]	256
+T blk.26.exp_probs_b.bias	F32	[192]	768
+T blk.26.exp_probs_b_vl.bias	F32	[192]	768
+T blk.26.ffn_down_exps.weight	IQ2_XS	[2304, 5120, 192]	654704640
+T blk.26.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.26.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.26.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.26.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.26.ffn_norm.weight	F32	[5120]	20480
+T blk.26.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.26.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.26.hc_attn_base.weight	F32	[24]	96
+T blk.26.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.26.hc_attn_scale.weight	F32	[3]	12
+T blk.26.hc_ffn_base.weight	F32	[24]	96
+T blk.26.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.26.hc_ffn_scale.weight	F32	[3]	12
+T blk.27.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.27.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.27.attn_norm.weight	F32	[5120]	20480
+T blk.27.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.27.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.27.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.27.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.27.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.27.attn_sinks.weight	F32	[64]	256
+T blk.27.exp_probs_b.bias	F32	[192]	768
+T blk.27.exp_probs_b_vl.bias	F32	[192]	768
+T blk.27.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.27.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.27.ffn_gate_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.27.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.27.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.27.ffn_norm.weight	F32	[5120]	20480
+T blk.27.ffn_up_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.27.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.27.hc_attn_base.weight	F32	[24]	96
+T blk.27.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.27.hc_attn_scale.weight	F32	[3]	12
+T blk.27.hc_ffn_base.weight	F32	[24]	96
+T blk.27.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.27.hc_ffn_scale.weight	F32	[3]	12
+T blk.28.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.28.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.28.attn_norm.weight	F32	[5120]	20480
+T blk.28.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.28.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.28.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.28.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.28.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.28.attn_sinks.weight	F32	[64]	256
+T blk.28.exp_probs_b.bias	F32	[192]	768
+T blk.28.exp_probs_b_vl.bias	F32	[192]	768
+T blk.28.ffn_down_exps.weight	IQ2_XXS	[2304, 5120, 192]	583925760
+T blk.28.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.28.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.28.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.28.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.28.ffn_norm.weight	F32	[5120]	20480
+T blk.28.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.28.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.28.hc_attn_base.weight	F32	[24]	96
+T blk.28.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.28.hc_attn_scale.weight	F32	[3]	12
+T blk.28.hc_ffn_base.weight	F32	[24]	96
+T blk.28.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.28.hc_ffn_scale.weight	F32	[3]	12
+T blk.28.indexer.attn_q_b.weight	BF16	[1280, 4096]	10485760
+T blk.28.indexer.proj.weight	BF16	[5120, 32]	327680
+T blk.29.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.29.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.29.attn_norm.weight	F32	[5120]	20480
+T blk.29.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.29.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.29.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.29.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.29.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.29.attn_sinks.weight	F32	[64]	256
+T blk.29.exp_probs_b.bias	F32	[192]	768
+T blk.29.exp_probs_b_vl.bias	F32	[192]	768
+T blk.29.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.29.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.29.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.29.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.29.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.29.ffn_norm.weight	F32	[5120]	20480
+T blk.29.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.29.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.29.hc_attn_base.weight	F32	[24]	96
+T blk.29.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.29.hc_attn_scale.weight	F32	[3]	12
+T blk.29.hc_ffn_base.weight	F32	[24]	96
+T blk.29.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.29.hc_ffn_scale.weight	F32	[3]	12
+T blk.30.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.30.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.30.attn_norm.weight	F32	[5120]	20480
+T blk.30.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.30.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.30.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.30.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.30.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.30.attn_sinks.weight	F32	[64]	256
+T blk.30.exp_probs_b.bias	F32	[192]	768
+T blk.30.exp_probs_b_vl.bias	F32	[192]	768
+T blk.30.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.30.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.30.ffn_gate_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.30.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.30.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.30.ffn_norm.weight	F32	[5120]	20480
+T blk.30.ffn_up_exps.weight	IQ1_M	[5120, 2304, 192]	495452160
+T blk.30.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.30.hc_attn_base.weight	F32	[24]	96
+T blk.30.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.30.hc_attn_scale.weight	F32	[3]	12
+T blk.30.hc_ffn_base.weight	F32	[24]	96
+T blk.30.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.30.hc_ffn_scale.weight	F32	[3]	12
+T blk.31.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.31.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.31.attn_norm.weight	F32	[5120]	20480
+T blk.31.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.31.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.31.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.31.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.31.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.31.attn_sinks.weight	F32	[64]	256
+T blk.31.exp_probs_b.bias	F32	[192]	768
+T blk.31.exp_probs_b_vl.bias	F32	[192]	768
+T blk.31.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.31.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.31.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.31.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.31.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.31.ffn_norm.weight	F32	[5120]	20480
+T blk.31.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.31.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.31.hc_attn_base.weight	F32	[24]	96
+T blk.31.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.31.hc_attn_scale.weight	F32	[3]	12
+T blk.31.hc_ffn_base.weight	F32	[24]	96
+T blk.31.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.31.hc_ffn_scale.weight	F32	[3]	12
+T blk.32.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.32.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.32.attn_norm.weight	F32	[5120]	20480
+T blk.32.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.32.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.32.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.32.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.32.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.32.attn_sinks.weight	F32	[64]	256
+T blk.32.exp_probs_b.bias	F32	[192]	768
+T blk.32.exp_probs_b_vl.bias	F32	[192]	768
+T blk.32.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.32.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.32.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.32.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.32.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.32.ffn_norm.weight	F32	[5120]	20480
+T blk.32.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.32.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.32.hc_attn_base.weight	F32	[24]	96
+T blk.32.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.32.hc_attn_scale.weight	F32	[3]	12
+T blk.32.hc_ffn_base.weight	F32	[24]	96
+T blk.32.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.32.hc_ffn_scale.weight	F32	[3]	12
+T blk.32.indexer.attn_q_b.weight	BF16	[1280, 4096]	10485760
+T blk.32.indexer.proj.weight	BF16	[5120, 32]	327680
+T blk.33.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.33.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.33.attn_norm.weight	F32	[5120]	20480
+T blk.33.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.33.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.33.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.33.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.33.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.33.attn_sinks.weight	F32	[64]	256
+T blk.33.exp_probs_b.bias	F32	[192]	768
+T blk.33.exp_probs_b_vl.bias	F32	[192]	768
+T blk.33.ffn_down_exps.weight	IQ2_XS	[2304, 5120, 192]	654704640
+T blk.33.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.33.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.33.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.33.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.33.ffn_norm.weight	F32	[5120]	20480
+T blk.33.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.33.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.33.hc_attn_base.weight	F32	[24]	96
+T blk.33.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.33.hc_attn_scale.weight	F32	[3]	12
+T blk.33.hc_ffn_base.weight	F32	[24]	96
+T blk.33.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.33.hc_ffn_scale.weight	F32	[3]	12
+T blk.34.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.34.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.34.attn_norm.weight	F32	[5120]	20480
+T blk.34.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.34.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.34.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.34.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.34.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.34.attn_sinks.weight	F32	[64]	256
+T blk.34.exp_probs_b.bias	F32	[192]	768
+T blk.34.exp_probs_b_vl.bias	F32	[192]	768
+T blk.34.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.34.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.34.ffn_gate_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.34.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.34.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.34.ffn_norm.weight	F32	[5120]	20480
+T blk.34.ffn_up_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.34.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.34.hc_attn_base.weight	F32	[24]	96
+T blk.34.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.34.hc_attn_scale.weight	F32	[3]	12
+T blk.34.hc_ffn_base.weight	F32	[24]	96
+T blk.34.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.34.hc_ffn_scale.weight	F32	[3]	12
+T blk.35.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.35.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.35.attn_norm.weight	F32	[5120]	20480
+T blk.35.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.35.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.35.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.35.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.35.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.35.attn_sinks.weight	F32	[64]	256
+T blk.35.exp_probs_b.bias	F32	[192]	768
+T blk.35.exp_probs_b_vl.bias	F32	[192]	768
+T blk.35.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.35.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.35.ffn_gate_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.35.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.35.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.35.ffn_norm.weight	F32	[5120]	20480
+T blk.35.ffn_up_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.35.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.35.hc_attn_base.weight	F32	[24]	96
+T blk.35.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.35.hc_attn_scale.weight	F32	[3]	12
+T blk.35.hc_ffn_base.weight	F32	[24]	96
+T blk.35.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.35.hc_ffn_scale.weight	F32	[3]	12
+T blk.36.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.36.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.36.attn_norm.weight	F32	[5120]	20480
+T blk.36.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.36.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.36.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.36.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.36.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.36.attn_sinks.weight	F32	[64]	256
+T blk.36.exp_probs_b.bias	F32	[192]	768
+T blk.36.exp_probs_b_vl.bias	F32	[192]	768
+T blk.36.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.36.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.36.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.36.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.36.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.36.ffn_norm.weight	F32	[5120]	20480
+T blk.36.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.36.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.36.hc_attn_base.weight	F32	[24]	96
+T blk.36.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.36.hc_attn_scale.weight	F32	[3]	12
+T blk.36.hc_ffn_base.weight	F32	[24]	96
+T blk.36.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.36.hc_ffn_scale.weight	F32	[3]	12
+T blk.36.indexer.attn_q_b.weight	BF16	[1280, 4096]	10485760
+T blk.36.indexer.proj.weight	BF16	[5120, 32]	327680
+T blk.37.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.37.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.37.attn_norm.weight	F32	[5120]	20480
+T blk.37.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.37.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.37.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.37.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.37.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.37.attn_sinks.weight	F32	[64]	256
+T blk.37.exp_probs_b.bias	F32	[192]	768
+T blk.37.exp_probs_b_vl.bias	F32	[192]	768
+T blk.37.ffn_down_exps.weight	IQ1_M	[2304, 5120, 192]	495452160
+T blk.37.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.37.ffn_gate_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.37.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.37.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.37.ffn_norm.weight	F32	[5120]	20480
+T blk.37.ffn_up_exps.weight	IQ2_XXS	[5120, 2304, 192]	583925760
+T blk.37.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.37.hc_attn_base.weight	F32	[24]	96
+T blk.37.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.37.hc_attn_scale.weight	F32	[3]	12
+T blk.37.hc_ffn_base.weight	F32	[24]	96
+T blk.37.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.37.hc_ffn_scale.weight	F32	[3]	12
+T blk.38.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.38.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.38.attn_norm.weight	F32	[5120]	20480
+T blk.38.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.38.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.38.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.38.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.38.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.38.attn_sinks.weight	F32	[64]	256
+T blk.38.exp_probs_b.bias	F32	[192]	768
+T blk.38.exp_probs_b_vl.bias	F32	[192]	768
+T blk.38.ffn_down_exps.weight	IQ2_XXS	[2304, 5120, 192]	583925760
+T blk.38.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.38.ffn_gate_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.38.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.38.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.38.ffn_norm.weight	F32	[5120]	20480
+T blk.38.ffn_up_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.38.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.38.hc_attn_base.weight	F32	[24]	96
+T blk.38.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.38.hc_attn_scale.weight	F32	[3]	12
+T blk.38.hc_ffn_base.weight	F32	[24]	96
+T blk.38.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.38.hc_ffn_scale.weight	F32	[3]	12
+T blk.39.attn_kv.weight	Q8_0	[5120, 512]	2785280
+T blk.39.attn_kv_a_norm.weight	F32	[512]	2048
+T blk.39.attn_norm.weight	F32	[5120]	20480
+T blk.39.attn_output_a.weight	Q5_K	[4096, 8192]	23068672
+T blk.39.attn_output_b.weight	Q5_K	[8192, 5120]	28835840
+T blk.39.attn_q_a.weight	Q8_0	[5120, 1280]	6963200
+T blk.39.attn_q_a_norm.weight	F32	[1280]	5120
+T blk.39.attn_q_b.weight	Q5_K	[1280, 32768]	28835840
+T blk.39.attn_sinks.weight	F32	[64]	256
+T blk.39.exp_probs_b.bias	F32	[192]	768
+T blk.39.exp_probs_b_vl.bias	F32	[192]	768
+T blk.39.ffn_down_exps.weight	IQ2_XS	[2304, 5120, 192]	654704640
+T blk.39.ffn_down_shexp.weight	Q5_K	[2304, 5120]	8110080
+T blk.39.ffn_gate_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.39.ffn_gate_inp.weight	BF16	[5120, 192]	1966080
+T blk.39.ffn_gate_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.39.ffn_norm.weight	F32	[5120]	20480
+T blk.39.ffn_up_exps.weight	IQ2_XS	[5120, 2304, 192]	654704640
+T blk.39.ffn_up_shexp.weight	Q5_K	[5120, 2304]	8110080
+T blk.39.hc_attn_base.weight	F32	[24]	96
+T blk.39.hc_attn_fn.weight	F32	[20480, 24]	1966080
+T blk.39.hc_attn_scale.weight	F32	[3]	12
+T blk.39.hc_ffn_base.weight	F32	[24]	96
+T blk.39.hc_ffn_fn.weight	F32	[20480, 24]	1966080
+T blk.39.hc_ffn_scale.weight	F32	[3]	12
+T per_layer_token_embd.weight	IQ4_NL	[256, 768022850]	110595290400
+
+## quant types: type | tensors | bytes | GiB | elements | bits/weight
+BF16 | 67 | 202375168 | 0.188 | 101187584 | 16.000
+F32 | 531 | 159486400 | 0.149 | 39871600 | 32.000
+IQ1_M | 60 | 29727129600 | 27.686 | 135895449600 | 1.750
+IQ2_XS | 18 | 11784683520 | 10.975 | 40768634880 | 2.312
+IQ2_XXS | 42 | 24524881920 | 22.841 | 95126814720 | 2.062
+IQ4_NL | 1 | 110595290400 | 103.000 | 196613849600 | 4.500
+Q5_K | 244 | 5329223680 | 4.963 | 7751598080 | 5.500
+Q8_0 | 80 | 389939200 | 0.363 | 367001600 | 8.500
+total bytes 182713009888 (170.165 GiB)
+
+## tensor roles: role | type(s) | dims of first | count | bytes
+blk.*.attn_compressor_gate.weight | BF16 | [5120, 512] | 3 | 15728640
+blk.*.attn_compressor_kv.weight | BF16 | [5120, 512] | 4 | 20971520
+blk.*.attn_compressor_norm.weight | F32 | [512] | 4 | 8192
+blk.*.attn_kv.weight | Q8_0 | [5120, 512] | 40 | 111411200
+blk.*.attn_kv_a_norm.weight | F32 | [512] | 40 | 81920
+blk.*.attn_norm.weight | F32 | [5120] | 40 | 819200
+blk.*.attn_output_a.weight | Q5_K | [4096, 8192] | 40 | 922746880
+blk.*.attn_output_b.weight | Q5_K | [8192, 5120] | 40 | 1153433600
+blk.*.attn_q_a.weight | Q8_0 | [5120, 1280] | 40 | 278528000
+blk.*.attn_q_a_norm.weight | F32 | [1280] | 40 | 204800
+blk.*.attn_q_b.weight | Q5_K | [1280, 32768] | 40 | 1153433600
+blk.*.attn_sinks.weight | F32 | [64] | 40 | 10240
+blk.*.engram_gate.weight | F32 | [5120, 4] | 2 | 163840
+blk.*.engram_kv.weight | Q5_K | [6144, 25600] | 2 | 216268800
+blk.*.exp_probs_b.bias | F32 | [192] | 40 | 30720
+blk.*.exp_probs_b_vl.bias | F32 | [192] | 40 | 30720
+blk.*.ffn_down_exps.weight | IQ1_M|IQ2_XXS|IQ2_XS | [2304, 5120, 192] | 40 | 21162885120
+blk.*.ffn_down_shexp.weight | Q5_K | [2304, 5120] | 40 | 324403200
+blk.*.ffn_gate_exps.weight | IQ1_M|IQ2_XXS|IQ2_XS | [5120, 2304, 192] | 40 | 22436904960
+blk.*.ffn_gate_inp.weight | BF16 | [5120, 192] | 40 | 78643200
+blk.*.ffn_gate_shexp.weight | Q5_K | [5120, 2304] | 40 | 324403200
+blk.*.ffn_norm.weight | F32 | [5120] | 40 | 819200
+blk.*.ffn_up_exps.weight | IQ1_M|IQ2_XXS|IQ2_XS | [5120, 2304, 192] | 40 | 22436904960
+blk.*.ffn_up_shexp.weight | Q5_K | [5120, 2304] | 40 | 324403200
+blk.*.hc_attn_base.weight | F32 | [24] | 40 | 3840
+blk.*.hc_attn_fn.weight | F32 | [20480, 24] | 40 | 78643200
+blk.*.hc_attn_scale.weight | F32 | [3] | 40 | 480
+blk.*.hc_ffn_base.weight | F32 | [24] | 40 | 3840
+blk.*.hc_ffn_fn.weight | F32 | [20480, 24] | 40 | 78643200
+blk.*.hc_ffn_scale.weight | F32 | [3] | 40 | 480
+blk.*.indexer.attn_k.weight | BF16 | [512, 128] | 4 | 524288
+blk.*.indexer.attn_q_b.weight | BF16 | [1280, 4096] | 8 | 83886080
+blk.*.indexer.k_norm.weight | F32 | [128] | 4 | 2048
+blk.*.indexer.proj.weight | BF16 | [5120, 32] | 8 | 2621440
+output.weight | Q5_K | [5120, 129280] | 1 | 455065600
+output_norm.weight | F32 | [5120] | 1 | 20480
+per_layer_token_embd.weight | IQ4_NL | [256, 768022850] | 1 | 110595290400
+token_embd.weight | Q5_K | [5120, 129280] | 1 | 455065600

@@ -1,0 +1,549 @@
+# shards: 2
+#   /mnt/raid0/models/mimo-v26-flash/MiMo-V2.6-Flash-RL-Q2_K-00001-of-00002.gguf : 0 tensors, GGUF v3
+#   /mnt/raid0/models/mimo-v26-flash/MiMo-V2.6-Flash-RL-Q2_K-00002-of-00002.gguf : 472 tensors, GGUF v3
+
+## metadata (shard 1)
+general.architecture = "mimo2"
+general.type = "model"
+general.sampling.top_p = F32(0.95)
+general.sampling.temp = F32(1.0)
+general.name = "MiMo-V2.6-Flash-RL"
+general.size_label = "256x7.2B"
+general.license = "mit"
+general.tags = ["text-generation", "multimodal", "vision-language", "audio", "agent", "video-understanding", "long-context", "mimo_v2", "transformers"] (len 9)
+general.languages = ["en", "zh"] (len 2)
+mimo2.block_count = U32(48)
+mimo2.context_length = U32(1048576)
+mimo2.embedding_length = U32(4096)
+mimo2.feed_forward_length = U32(16384)
+mimo2.attention.head_count = U32(64)
+mimo2.attention.head_count_kv = [I32(4), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4)] (len 48)
+mimo2.rope.freq_base = F32(10000000.0)
+mimo2.rope.freq_base_swa = F32(10000.0)
+mimo2.expert_count = U32(256)
+mimo2.expert_used_count = U32(8)
+mimo2.expert_group_count = U32(1)
+mimo2.expert_group_used_count = U32(1)
+mimo2.expert_gating_func = U32(2)
+mimo2.attention.key_length = U32(192)
+mimo2.attention.value_length = U32(128)
+mimo2.attention.sliding_window = U32(128)
+mimo2.attention.sliding_window_pattern = [I32(0), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0)] (len 48)
+mimo2.expert_feed_forward_length = U32(2048)
+mimo2.rope.dimension_count = U32(64)
+mimo2.attention.layer_norm_rms_epsilon = F32(1e-6)
+mimo2.attention.value_scale = F32(0.707)
+tokenizer.ggml.model = "gpt2"
+tokenizer.ggml.pre = "qwen2"
+tokenizer.ggml.tokens = ["!", "\"", "#", "$", "%", "&", "'", "(", ...] (len 152576)
+tokenizer.ggml.token_type = [I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), ...] (len 152576)
+tokenizer.ggml.merges = ["Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t", "ĠĠĠĠ ĠĠĠĠ", "e r", "ĠĠ Ġ", "o n", ...] (len 151387)
+tokenizer.ggml.eos_token_id = U32(151645)
+tokenizer.ggml.padding_token_id = U32(151643)
+tokenizer.ggml.add_bos_token = Bool(false)
+tokenizer.ggml.add_eos_token = Bool(false)
+tokenizer.chat_template = "{%- macro render_value(value) -%}\n    {%- if value is string -%}\n        {{- value -}}\n    {%- else -%}\n        {{- value | tojson(ensure_ascii=False) -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro"... (3867 bytes)
+tokenizer.ggml.normalizer.nfc = Bool(true)
+tokenizer.ggml.clean_spaces = Bool(false)
+general.quantization_version = U32(2)
+general.file_type = U32(38)
+split.no = U16(0)
+split.count = U16(2)
+split.tensors.count = I32(472)
+T blk.1.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.1.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.1.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.2.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.2.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.2.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.3.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.3.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.3.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.4.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.4.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.4.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.5.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.5.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.5.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.6.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.6.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.6.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.7.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.7.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.7.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.8.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.8.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.8.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.9.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.9.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.9.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.10.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.10.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.10.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.11.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.11.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.11.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.12.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.12.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.12.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.13.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.13.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.13.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.14.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.14.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.14.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.15.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.15.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.15.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.16.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.16.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.16.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.17.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.17.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.17.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.18.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.18.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.18.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.19.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.19.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.19.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.20.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.20.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.20.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.21.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.21.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.21.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.22.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.22.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.22.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.23.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.23.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.23.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.24.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.24.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.24.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.25.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.25.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.25.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.26.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.26.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.26.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.27.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.27.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.27.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.28.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.28.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.28.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.29.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.29.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.29.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.30.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.30.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.30.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.31.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.31.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.31.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.32.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.32.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.32.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.33.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.33.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.33.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.34.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.34.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.34.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.35.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.35.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.35.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.36.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.36.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.36.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.37.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.37.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.37.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.38.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.38.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.38.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.39.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.39.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.39.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.40.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.40.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.40.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.41.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.41.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.41.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.42.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.42.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.42.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.43.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.43.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.43.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.44.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.44.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.44.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.45.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.45.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.45.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.46.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.46.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.46.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.47.ffn_down_exps.weight	MXFP4	[2048, 4096, 256]	1140850688
+T blk.47.ffn_gate_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T blk.47.ffn_up_exps.weight	Q2_K	[4096, 2048, 256]	704643072
+T output.weight	Q8_0	[4096, 152576]	664010752
+T token_embd.weight	Q8_0	[4096, 152576]	664010752
+T blk.0.attn_norm.weight	F32	[4096]	16384
+T blk.0.ffn_down.weight	Q8_0	[16384, 4096]	71303168
+T blk.0.ffn_gate.weight	Q8_0	[4096, 16384]	71303168
+T blk.0.ffn_up.weight	Q8_0	[4096, 16384]	71303168
+T blk.0.ffn_norm.weight	F32	[4096]	16384
+T blk.0.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.0.attn_qkv.weight	Q8_0	[4096, 13568]	59047936
+T blk.1.attn_norm.weight	F32	[4096]	16384
+T blk.1.exp_probs_b.bias	F32	[256]	1024
+T blk.1.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.1.ffn_norm.weight	F32	[4096]	16384
+T blk.1.attn_sinks.weight	F32	[64]	256
+T blk.1.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.1.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.10.attn_norm.weight	F32	[4096]	16384
+T blk.10.exp_probs_b.bias	F32	[256]	1024
+T blk.10.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.10.ffn_norm.weight	F32	[4096]	16384
+T blk.10.attn_sinks.weight	F32	[64]	256
+T blk.10.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.10.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.11.attn_norm.weight	F32	[4096]	16384
+T blk.11.exp_probs_b.bias	F32	[256]	1024
+T blk.11.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.11.ffn_norm.weight	F32	[4096]	16384
+T blk.11.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.11.attn_qkv.weight	Q8_0	[4096, 13568]	59047936
+T blk.12.attn_norm.weight	F32	[4096]	16384
+T blk.12.exp_probs_b.bias	F32	[256]	1024
+T blk.12.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.12.ffn_norm.weight	F32	[4096]	16384
+T blk.12.attn_sinks.weight	F32	[64]	256
+T blk.12.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.12.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.13.attn_norm.weight	F32	[4096]	16384
+T blk.13.exp_probs_b.bias	F32	[256]	1024
+T blk.13.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.13.ffn_norm.weight	F32	[4096]	16384
+T blk.13.attn_sinks.weight	F32	[64]	256
+T blk.13.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.13.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.14.attn_norm.weight	F32	[4096]	16384
+T blk.14.exp_probs_b.bias	F32	[256]	1024
+T blk.14.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.14.ffn_norm.weight	F32	[4096]	16384
+T blk.14.attn_sinks.weight	F32	[64]	256
+T blk.14.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.14.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.15.attn_norm.weight	F32	[4096]	16384
+T blk.15.exp_probs_b.bias	F32	[256]	1024
+T blk.15.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.15.ffn_norm.weight	F32	[4096]	16384
+T blk.15.attn_sinks.weight	F32	[64]	256
+T blk.15.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.15.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.16.attn_norm.weight	F32	[4096]	16384
+T blk.16.exp_probs_b.bias	F32	[256]	1024
+T blk.16.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.16.ffn_norm.weight	F32	[4096]	16384
+T blk.16.attn_sinks.weight	F32	[64]	256
+T blk.16.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.16.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.17.attn_norm.weight	F32	[4096]	16384
+T blk.17.exp_probs_b.bias	F32	[256]	1024
+T blk.17.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.17.ffn_norm.weight	F32	[4096]	16384
+T blk.17.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.17.attn_qkv.weight	Q8_0	[4096, 13568]	59047936
+T blk.18.attn_norm.weight	F32	[4096]	16384
+T blk.18.exp_probs_b.bias	F32	[256]	1024
+T blk.18.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.18.ffn_norm.weight	F32	[4096]	16384
+T blk.18.attn_sinks.weight	F32	[64]	256
+T blk.18.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.18.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.19.attn_norm.weight	F32	[4096]	16384
+T blk.19.exp_probs_b.bias	F32	[256]	1024
+T blk.19.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.19.ffn_norm.weight	F32	[4096]	16384
+T blk.19.attn_sinks.weight	F32	[64]	256
+T blk.19.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.19.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.2.attn_norm.weight	F32	[4096]	16384
+T blk.2.exp_probs_b.bias	F32	[256]	1024
+T blk.2.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.2.ffn_norm.weight	F32	[4096]	16384
+T blk.2.attn_sinks.weight	F32	[64]	256
+T blk.2.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.2.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.20.attn_norm.weight	F32	[4096]	16384
+T blk.20.exp_probs_b.bias	F32	[256]	1024
+T blk.20.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.20.ffn_norm.weight	F32	[4096]	16384
+T blk.20.attn_sinks.weight	F32	[64]	256
+T blk.20.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.20.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.21.attn_norm.weight	F32	[4096]	16384
+T blk.21.exp_probs_b.bias	F32	[256]	1024
+T blk.21.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.21.ffn_norm.weight	F32	[4096]	16384
+T blk.21.attn_sinks.weight	F32	[64]	256
+T blk.21.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.21.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.22.attn_norm.weight	F32	[4096]	16384
+T blk.22.exp_probs_b.bias	F32	[256]	1024
+T blk.22.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.22.ffn_norm.weight	F32	[4096]	16384
+T blk.22.attn_sinks.weight	F32	[64]	256
+T blk.22.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.22.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.23.attn_norm.weight	F32	[4096]	16384
+T blk.23.exp_probs_b.bias	F32	[256]	1024
+T blk.23.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.23.ffn_norm.weight	F32	[4096]	16384
+T blk.23.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.23.attn_qkv.weight	Q8_0	[4096, 13568]	59047936
+T blk.24.attn_norm.weight	F32	[4096]	16384
+T blk.24.exp_probs_b.bias	F32	[256]	1024
+T blk.24.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.24.ffn_norm.weight	F32	[4096]	16384
+T blk.24.attn_sinks.weight	F32	[64]	256
+T blk.24.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.24.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.25.attn_norm.weight	F32	[4096]	16384
+T blk.25.exp_probs_b.bias	F32	[256]	1024
+T blk.25.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.25.ffn_norm.weight	F32	[4096]	16384
+T blk.25.attn_sinks.weight	F32	[64]	256
+T blk.25.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.25.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.26.attn_norm.weight	F32	[4096]	16384
+T blk.26.exp_probs_b.bias	F32	[256]	1024
+T blk.26.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.26.ffn_norm.weight	F32	[4096]	16384
+T blk.26.attn_sinks.weight	F32	[64]	256
+T blk.26.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.26.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.27.attn_norm.weight	F32	[4096]	16384
+T blk.27.exp_probs_b.bias	F32	[256]	1024
+T blk.27.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.27.ffn_norm.weight	F32	[4096]	16384
+T blk.27.attn_sinks.weight	F32	[64]	256
+T blk.27.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.27.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.28.attn_norm.weight	F32	[4096]	16384
+T blk.28.exp_probs_b.bias	F32	[256]	1024
+T blk.28.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.28.ffn_norm.weight	F32	[4096]	16384
+T blk.28.attn_sinks.weight	F32	[64]	256
+T blk.28.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.28.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.29.attn_norm.weight	F32	[4096]	16384
+T blk.29.exp_probs_b.bias	F32	[256]	1024
+T blk.29.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.29.ffn_norm.weight	F32	[4096]	16384
+T blk.29.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.29.attn_qkv.weight	Q8_0	[4096, 13568]	59047936
+T blk.3.attn_norm.weight	F32	[4096]	16384
+T blk.3.exp_probs_b.bias	F32	[256]	1024
+T blk.3.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.3.ffn_norm.weight	F32	[4096]	16384
+T blk.3.attn_sinks.weight	F32	[64]	256
+T blk.3.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.3.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.30.attn_norm.weight	F32	[4096]	16384
+T blk.30.exp_probs_b.bias	F32	[256]	1024
+T blk.30.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.30.ffn_norm.weight	F32	[4096]	16384
+T blk.30.attn_sinks.weight	F32	[64]	256
+T blk.30.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.30.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.31.attn_norm.weight	F32	[4096]	16384
+T blk.31.exp_probs_b.bias	F32	[256]	1024
+T blk.31.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.31.ffn_norm.weight	F32	[4096]	16384
+T blk.31.attn_sinks.weight	F32	[64]	256
+T blk.31.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.31.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.32.attn_norm.weight	F32	[4096]	16384
+T blk.32.exp_probs_b.bias	F32	[256]	1024
+T blk.32.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.32.ffn_norm.weight	F32	[4096]	16384
+T blk.32.attn_sinks.weight	F32	[64]	256
+T blk.32.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.32.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.33.attn_norm.weight	F32	[4096]	16384
+T blk.33.exp_probs_b.bias	F32	[256]	1024
+T blk.33.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.33.ffn_norm.weight	F32	[4096]	16384
+T blk.33.attn_sinks.weight	F32	[64]	256
+T blk.33.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.33.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.34.attn_norm.weight	F32	[4096]	16384
+T blk.34.exp_probs_b.bias	F32	[256]	1024
+T blk.34.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.34.ffn_norm.weight	F32	[4096]	16384
+T blk.34.attn_sinks.weight	F32	[64]	256
+T blk.34.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.34.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.35.attn_norm.weight	F32	[4096]	16384
+T blk.35.exp_probs_b.bias	F32	[256]	1024
+T blk.35.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.35.ffn_norm.weight	F32	[4096]	16384
+T blk.35.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.35.attn_qkv.weight	Q8_0	[4096, 13568]	59047936
+T blk.36.attn_norm.weight	F32	[4096]	16384
+T blk.36.exp_probs_b.bias	F32	[256]	1024
+T blk.36.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.36.ffn_norm.weight	F32	[4096]	16384
+T blk.36.attn_sinks.weight	F32	[64]	256
+T blk.36.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.36.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.37.attn_norm.weight	F32	[4096]	16384
+T blk.37.exp_probs_b.bias	F32	[256]	1024
+T blk.37.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.37.ffn_norm.weight	F32	[4096]	16384
+T blk.37.attn_sinks.weight	F32	[64]	256
+T blk.37.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.37.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.38.attn_norm.weight	F32	[4096]	16384
+T blk.38.exp_probs_b.bias	F32	[256]	1024
+T blk.38.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.38.ffn_norm.weight	F32	[4096]	16384
+T blk.38.attn_sinks.weight	F32	[64]	256
+T blk.38.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.38.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.39.attn_norm.weight	F32	[4096]	16384
+T blk.39.exp_probs_b.bias	F32	[256]	1024
+T blk.39.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.39.ffn_norm.weight	F32	[4096]	16384
+T blk.39.attn_sinks.weight	F32	[64]	256
+T blk.39.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.39.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.4.attn_norm.weight	F32	[4096]	16384
+T blk.4.exp_probs_b.bias	F32	[256]	1024
+T blk.4.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.4.ffn_norm.weight	F32	[4096]	16384
+T blk.4.attn_sinks.weight	F32	[64]	256
+T blk.4.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.4.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.40.attn_norm.weight	F32	[4096]	16384
+T blk.40.exp_probs_b.bias	F32	[256]	1024
+T blk.40.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.40.ffn_norm.weight	F32	[4096]	16384
+T blk.40.attn_sinks.weight	F32	[64]	256
+T blk.40.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.40.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.41.attn_norm.weight	F32	[4096]	16384
+T blk.41.exp_probs_b.bias	F32	[256]	1024
+T blk.41.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.41.ffn_norm.weight	F32	[4096]	16384
+T blk.41.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.41.attn_qkv.weight	Q8_0	[4096, 13568]	59047936
+T blk.42.attn_norm.weight	F32	[4096]	16384
+T blk.42.exp_probs_b.bias	F32	[256]	1024
+T blk.42.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.42.ffn_norm.weight	F32	[4096]	16384
+T blk.42.attn_sinks.weight	F32	[64]	256
+T blk.42.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.42.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.43.attn_norm.weight	F32	[4096]	16384
+T blk.43.exp_probs_b.bias	F32	[256]	1024
+T blk.43.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.43.ffn_norm.weight	F32	[4096]	16384
+T blk.43.attn_sinks.weight	F32	[64]	256
+T blk.43.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.43.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.44.attn_norm.weight	F32	[4096]	16384
+T blk.44.exp_probs_b.bias	F32	[256]	1024
+T blk.44.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.44.ffn_norm.weight	F32	[4096]	16384
+T blk.44.attn_sinks.weight	F32	[64]	256
+T blk.44.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.44.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.45.attn_norm.weight	F32	[4096]	16384
+T blk.45.exp_probs_b.bias	F32	[256]	1024
+T blk.45.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.45.ffn_norm.weight	F32	[4096]	16384
+T blk.45.attn_sinks.weight	F32	[64]	256
+T blk.45.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.45.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.46.attn_norm.weight	F32	[4096]	16384
+T blk.46.exp_probs_b.bias	F32	[256]	1024
+T blk.46.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.46.ffn_norm.weight	F32	[4096]	16384
+T blk.46.attn_sinks.weight	F32	[64]	256
+T blk.46.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.46.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.47.attn_norm.weight	F32	[4096]	16384
+T blk.47.exp_probs_b.bias	F32	[256]	1024
+T blk.47.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.47.ffn_norm.weight	F32	[4096]	16384
+T blk.47.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.47.attn_qkv.weight	Q8_0	[4096, 13568]	59047936
+T blk.5.attn_norm.weight	F32	[4096]	16384
+T blk.5.exp_probs_b.bias	F32	[256]	1024
+T blk.5.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.5.ffn_norm.weight	F32	[4096]	16384
+T blk.5.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.5.attn_qkv.weight	Q8_0	[4096, 13568]	59047936
+T blk.6.attn_norm.weight	F32	[4096]	16384
+T blk.6.exp_probs_b.bias	F32	[256]	1024
+T blk.6.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.6.ffn_norm.weight	F32	[4096]	16384
+T blk.6.attn_sinks.weight	F32	[64]	256
+T blk.6.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.6.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.7.attn_norm.weight	F32	[4096]	16384
+T blk.7.exp_probs_b.bias	F32	[256]	1024
+T blk.7.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.7.ffn_norm.weight	F32	[4096]	16384
+T blk.7.attn_sinks.weight	F32	[64]	256
+T blk.7.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.7.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.8.attn_norm.weight	F32	[4096]	16384
+T blk.8.exp_probs_b.bias	F32	[256]	1024
+T blk.8.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.8.ffn_norm.weight	F32	[4096]	16384
+T blk.8.attn_sinks.weight	F32	[64]	256
+T blk.8.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.8.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.9.attn_norm.weight	F32	[4096]	16384
+T blk.9.exp_probs_b.bias	F32	[256]	1024
+T blk.9.ffn_gate_inp.weight	F32	[4096, 256]	4194304
+T blk.9.ffn_norm.weight	F32	[4096]	16384
+T blk.9.attn_sinks.weight	F32	[64]	256
+T blk.9.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.9.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T output_norm.weight	F32	[4096]	16384
+
+## quant types: type | tensors | bytes | GiB | elements | bits/weight
+F32 | 230 | 198779648 | 0.185 | 49694912 | 32.000
+MXFP4 | 47 | 53619982336 | 49.938 | 100931731456 | 4.250
+Q2_K | 94 | 66236448768 | 61.688 | 201863462912 | 2.625
+Q8_0 | 101 | 6304759808 | 5.872 | 5933891584 | 8.500
+total bytes 126359970560 (117.682 GiB)
+
+## tensor roles: role | type(s) | dims of first | count | bytes
+blk.*.attn_norm.weight | F32 | [4096] | 48 | 786432
+blk.*.attn_output.weight | Q8_0 | [8192, 4096] | 48 | 1711276032
+blk.*.attn_qkv.weight | Q8_0 | [4096, 13568] | 48 | 3051552768
+blk.*.attn_sinks.weight | F32 | [64] | 39 | 9984
+blk.*.exp_probs_b.bias | F32 | [256] | 47 | 48128
+blk.*.ffn_down.weight | Q8_0 | [16384, 4096] | 1 | 71303168
+blk.*.ffn_down_exps.weight | MXFP4 | [2048, 4096, 256] | 47 | 53619982336
+blk.*.ffn_gate.weight | Q8_0 | [4096, 16384] | 1 | 71303168
+blk.*.ffn_gate_exps.weight | Q2_K | [4096, 2048, 256] | 47 | 33118224384
+blk.*.ffn_gate_inp.weight | F32 | [4096, 256] | 47 | 197132288
+blk.*.ffn_norm.weight | F32 | [4096] | 48 | 786432
+blk.*.ffn_up.weight | Q8_0 | [4096, 16384] | 1 | 71303168
+blk.*.ffn_up_exps.weight | Q2_K | [4096, 2048, 256] | 47 | 33118224384
+output.weight | Q8_0 | [4096, 152576] | 1 | 664010752
+output_norm.weight | F32 | [4096] | 1 | 16384
+token_embd.weight | Q8_0 | [4096, 152576] | 1 | 664010752

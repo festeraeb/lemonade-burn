@@ -1,0 +1,110 @@
+# shards: 1
+#   /mnt/raid0/models/mimo-v26-flash/mtp-MiMo-V2.6-Flash-RL-Q8_0.gguf : 39 tensors, GGUF v3
+
+## metadata (shard 1)
+general.architecture = "mimo2"
+general.type = "model"
+general.sampling.top_p = F32(0.95)
+general.sampling.temp = F32(1.0)
+general.name = "MiMo-V2.6-Flash-RL"
+general.size_label = "2.2B"
+general.license = "mit"
+general.tags = ["text-generation", "multimodal", "vision-language", "audio", "agent", "video-understanding", "long-context", "mimo_v2", "transformers"] (len 9)
+general.languages = ["en", "zh"] (len 2)
+mimo2.block_count = U32(51)
+mimo2.context_length = U32(1048576)
+mimo2.embedding_length = U32(4096)
+mimo2.feed_forward_length = U32(16384)
+mimo2.attention.head_count = U32(64)
+mimo2.attention.head_count_kv = [I32(4), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8), I32(8), I32(8), I32(4), I32(8), I32(8), I32(8)] (len 51)
+mimo2.rope.freq_base = F32(10000000.0)
+mimo2.rope.freq_base_swa = F32(10000.0)
+mimo2.expert_count = U32(256)
+mimo2.expert_used_count = U32(8)
+mimo2.expert_group_count = U32(1)
+mimo2.expert_group_used_count = U32(1)
+mimo2.expert_gating_func = U32(2)
+mimo2.attention.key_length = U32(192)
+mimo2.attention.value_length = U32(128)
+mimo2.attention.sliding_window = U32(128)
+mimo2.attention.sliding_window_pattern = [I32(0), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1), I32(1), I32(1), I32(0), I32(1), I32(1), I32(1)] (len 51)
+mimo2.expert_feed_forward_length = U32(2048)
+mimo2.rope.dimension_count = U32(64)
+mimo2.attention.layer_norm_rms_epsilon = F32(1e-6)
+mimo2.attention.value_scale = F32(0.707)
+mimo2.nextn_predict_layers = U32(3)
+tokenizer.ggml.model = "gpt2"
+tokenizer.ggml.pre = "qwen2"
+tokenizer.ggml.tokens = ["!", "\"", "#", "$", "%", "&", "'", "(", ...] (len 152576)
+tokenizer.ggml.token_type = [I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), I32(1), ...] (len 152576)
+tokenizer.ggml.merges = ["Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t", "ĠĠĠĠ ĠĠĠĠ", "e r", "ĠĠ Ġ", "o n", ...] (len 151387)
+tokenizer.ggml.eos_token_id = U32(151645)
+tokenizer.ggml.padding_token_id = U32(151643)
+tokenizer.ggml.add_bos_token = Bool(false)
+tokenizer.ggml.add_eos_token = Bool(false)
+tokenizer.chat_template = "{%- macro render_value(value) -%}\n    {%- if value is string -%}\n        {{- value -}}\n    {%- else -%}\n        {{- value | tojson(ensure_ascii=False) -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro"... (3867 bytes)
+tokenizer.ggml.normalizer.nfc = Bool(true)
+tokenizer.ggml.clean_spaces = Bool(false)
+general.quantization_version = U32(2)
+general.file_type = U32(7)
+T output.weight	Q8_0	[4096, 152576]	664010752
+T output_norm.weight	F32	[4096]	16384
+T token_embd.weight	Q8_0	[4096, 152576]	664010752
+T blk.48.attn_norm.weight	F32	[4096]	16384
+T blk.48.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.48.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.48.attn_sinks.weight	F32	[64]	256
+T blk.48.ffn_down.weight	Q8_0	[16384, 4096]	71303168
+T blk.48.ffn_gate.weight	Q8_0	[4096, 16384]	71303168
+T blk.48.ffn_norm.weight	F32	[4096]	16384
+T blk.48.ffn_up.weight	Q8_0	[4096, 16384]	71303168
+T blk.48.layer_output_norm.weight	F32	[4096]	16384
+T blk.48.nextn.eh_proj.weight	Q8_0	[8192, 4096]	35651584
+T blk.48.nextn.enorm.weight	F32	[4096]	16384
+T blk.48.nextn.hnorm.weight	F32	[4096]	16384
+T blk.49.attn_norm.weight	F32	[4096]	16384
+T blk.49.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.49.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.49.attn_sinks.weight	F32	[64]	256
+T blk.49.ffn_down.weight	Q8_0	[16384, 4096]	71303168
+T blk.49.ffn_gate.weight	Q8_0	[4096, 16384]	71303168
+T blk.49.ffn_norm.weight	F32	[4096]	16384
+T blk.49.ffn_up.weight	Q8_0	[4096, 16384]	71303168
+T blk.49.layer_output_norm.weight	F32	[4096]	16384
+T blk.49.nextn.eh_proj.weight	Q8_0	[8192, 4096]	35651584
+T blk.49.nextn.enorm.weight	F32	[4096]	16384
+T blk.49.nextn.hnorm.weight	F32	[4096]	16384
+T blk.50.attn_norm.weight	F32	[4096]	16384
+T blk.50.attn_output.weight	Q8_0	[8192, 4096]	35651584
+T blk.50.attn_qkv.weight	Q8_0	[4096, 14848]	64618496
+T blk.50.attn_sinks.weight	F32	[64]	256
+T blk.50.ffn_down.weight	Q8_0	[16384, 4096]	71303168
+T blk.50.ffn_gate.weight	Q8_0	[4096, 16384]	71303168
+T blk.50.ffn_norm.weight	F32	[4096]	16384
+T blk.50.ffn_up.weight	Q8_0	[4096, 16384]	71303168
+T blk.50.layer_output_norm.weight	F32	[4096]	16384
+T blk.50.nextn.eh_proj.weight	Q8_0	[8192, 4096]	35651584
+T blk.50.nextn.enorm.weight	F32	[4096]	16384
+T blk.50.nextn.hnorm.weight	F32	[4096]	16384
+
+## quant types: type | tensors | bytes | GiB | elements | bits/weight
+F32 | 19 | 262912 | 0.000 | 65728 | 32.000
+Q8_0 | 20 | 2377515008 | 2.214 | 2237661184 | 8.500
+total bytes 2377777920 (2.214 GiB)
+
+## tensor roles: role | type(s) | dims of first | count | bytes
+blk.*.attn_norm.weight | F32 | [4096] | 3 | 49152
+blk.*.attn_output.weight | Q8_0 | [8192, 4096] | 3 | 106954752
+blk.*.attn_qkv.weight | Q8_0 | [4096, 14848] | 3 | 193855488
+blk.*.attn_sinks.weight | F32 | [64] | 3 | 768
+blk.*.ffn_down.weight | Q8_0 | [16384, 4096] | 3 | 213909504
+blk.*.ffn_gate.weight | Q8_0 | [4096, 16384] | 3 | 213909504
+blk.*.ffn_norm.weight | F32 | [4096] | 3 | 49152
+blk.*.ffn_up.weight | Q8_0 | [4096, 16384] | 3 | 213909504
+blk.*.layer_output_norm.weight | F32 | [4096] | 3 | 49152
+blk.*.nextn.eh_proj.weight | Q8_0 | [8192, 4096] | 3 | 106954752
+blk.*.nextn.enorm.weight | F32 | [4096] | 3 | 49152
+blk.*.nextn.hnorm.weight | F32 | [4096] | 3 | 49152
+output.weight | Q8_0 | [4096, 152576] | 1 | 664010752
+output_norm.weight | F32 | [4096] | 1 | 16384
+token_embd.weight | Q8_0 | [4096, 152576] | 1 | 664010752

@@ -20,8 +20,10 @@ pub mod kernels_f32x;
 pub mod kernels_i8;
 pub mod iq_grids;
 pub mod reader;
+pub mod split;
 pub mod types;
 
 pub use kernels::{matvec_f32, QuantMat};
 pub use reader::{Gguf, GgufError, MetaValue, TensorInfo};
+pub use split::GgufSet;
 pub use types::GgmlType;
