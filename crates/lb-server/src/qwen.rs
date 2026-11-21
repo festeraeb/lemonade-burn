@@ -49,7 +49,8 @@ fn prefill_min() -> usize {
 }
 
 /// Rows per prefill chunk (`LB_QW_PREFILL_CHUNK`; 0 = automatic 64..1024). A smaller chunk lowers the device temporaries, which matters when the weights nearly fill the cards.
-/// Env, else the smallest `LB_QW_PREFILL_CHUNK` any stage card's profile gives (P100: 256, measured 2026-11-16), else 0.
+/// Env, else the smallest `LB_QW_PREFILL_CHUNK` any stage card's profile gives (none since 2026-11-21: the P100's 256 was dropped, auto
+/// measured 1.4x faster with no OOM after the Q8 dedup; docs/P100_KERNEL_TUNING.md), else 0.
 fn prefill_chunk(pipe: &Pipeline) -> usize {
     pipe.knob_min("LB_QW_PREFILL_CHUNK").and_then(|v| v.parse().ok()).unwrap_or(0)
 }

@@ -490,7 +490,8 @@ mod tests {
         let s = ProfileSet::builtin();
         let r = Resolved::from_profile(&cuda((6, 0), "Tesla P100-PCIE-16GB"), s.matching(&cuda((6, 0), "Tesla P100-PCIE-16GB")));
         assert_eq!(r.profile_id.as_deref(), Some("nvidia-p100"));
-        assert_eq!(r.var_with("LB_QW_PREFILL_CHUNK", &no_env).as_deref(), Some("256"));
+        assert_eq!(r.var_with("LB_QW_PREFILL_CHUNK", &no_env), None);
+        assert_eq!(r.var_with("LB_QW_Q6_LG", &no_env).as_deref(), Some("1"));
         assert_eq!(r.var_with("LB_MTP_DEPTH", &no_env).as_deref(), Some("1"));
     }
 
@@ -527,15 +528,17 @@ mod tests {
         let s = ProfileSet::builtin();
         let k = cuda((6, 0), "Tesla P100");
         let r = Resolved::from_profile(&k, s.matching(&k));
-        let env = |n: &str| (n == "LB_QW_PREFILL_CHUNK").then(|| "0".to_string());
-        assert_eq!(r.var_with("LB_QW_PREFILL_CHUNK", &env).as_deref(), Some("0"));
-        assert_eq!(r.var_with("LB_QW_PREFILL_CHUNK", &no_env).as_deref(), Some("256"));
-        // a knob the profile does not set falls through to the caller's default
+        let env = |n: &str| (n == "LB_PREFILL_UBATCH").then(|| "512".to_string());
+        assert_eq!(r.var_with("LB_PREFILL_UBATCH", &env).as_deref(), Some("512"));
+        assert_eq!(r.var_with("LB_PREFILL_UBATCH", &no_env).as_deref(), Some("2048"));
+        assert_eq!(r.var_with("LB_QW_ATTN_SPLIT", &no_env).as_deref(), Some("1"));
+        // a knob the profile does not set falls through to the caller's default (the P100 prefill chunk is auto since 2026-11-21)
         assert_eq!(r.var_with("LB_Q4_MATH", &no_env), None);
+        assert_eq!(r.var_with("LB_QW_PREFILL_CHUNK", &no_env), None);
         let rows = r.report_with(&env);
         let find = |n: &str| rows.iter().find(|x| x.name == n).unwrap().clone();
-        assert_eq!(find("LB_QW_PREFILL_CHUNK").source, Source::Env);
-        assert_eq!(find("LB_QW_PREFILL_CHUNK").value, "0");
+        assert_eq!(find("LB_PREFILL_UBATCH").source, Source::Env);
+        assert_eq!(find("LB_PREFILL_UBATCH").value, "512");
         assert_eq!(find("LB_MTP_DEPTH").source, Source::Profile);
         assert_eq!(find("LB_Q4_MATH").source, Source::Default);
         assert_eq!(find("LB_Q4_MATH").value, "f32");
@@ -592,13 +595,14 @@ mod tests {
         let s = ProfileSet::builtin();
         let p100 = |_: ()| Resolved::from_profile(&cuda((6, 0), "P100"), s.matching(&cuda((6, 0), "P100")));
         let t2060 = Resolved::from_profile(&cuda((7, 5), "RTX 2060"), s.matching(&cuda((7, 5), "RTX 2060")));
-        // the 2060 + two P100 seat: only the P100 profiles set a chunk, so 256
+        // the 2060 + two P100 seat: only the P100 profiles set the prefill ubatch, so theirs
         let cards = [t2060.clone(), p100(()), p100(())];
-        assert_eq!(min_knob_with(&cards, "LB_QW_PREFILL_CHUNK", &no_env).as_deref(), Some("256"));
+        assert_eq!(min_knob_with(&cards, "LB_PREFILL_UBATCH", &no_env).as_deref(), Some("2048"));
         // env wins over every card
-        assert_eq!(min_knob_with(&cards, "LB_QW_PREFILL_CHUNK", &|_| Some("512".into())).as_deref(), Some("512"));
-        // no card sets it
-        assert_eq!(min_knob_with(&[t2060], "LB_QW_PREFILL_CHUNK", &no_env), None);
+        assert_eq!(min_knob_with(&cards, "LB_PREFILL_UBATCH", &|_| Some("512".into())).as_deref(), Some("512"));
+        // no card sets it (the qwen35 prefill chunk: auto on every card since 2026-11-21)
+        assert_eq!(min_knob_with(&[t2060], "LB_PREFILL_UBATCH", &no_env), None);
+        assert_eq!(min_knob_with(&cards, "LB_QW_PREFILL_CHUNK", &no_env), None);
         assert_eq!(min_knob_with(&[], "LB_QW_PREFILL_CHUNK", &no_env), None);
     }
 
